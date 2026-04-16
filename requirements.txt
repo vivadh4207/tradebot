@@ -1,0 +1,34 @@
+# Core
+numpy>=1.26
+pandas>=2.1
+scipy>=1.11
+pytz>=2024.1
+python-dateutil>=2.8
+
+# Data + config
+pyyaml>=6.0
+python-dotenv>=1.0
+
+# Stats / modeling
+statsmodels>=0.14
+
+# Brokers (optional - alpaca only needed for paper/live)
+alpaca-py>=0.21
+
+# Market data fallbacks
+yfinance>=0.2.40
+requests>=2.31
+
+# Utilities
+structlog>=24.1
+
+# Storage (CockroachDB / Postgres-wire)
+psycopg[binary]>=3.2
+
+# Dashboard
+fastapi>=0.110
+uvicorn[standard]>=0.29
+
+# Testing
+pytest>=8.0
+pytest-asyncio>=0.23

@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS launchd agent: runs the tradebot paper loop continuously, restarts
+  on crash, survives reboots. More robust than cron for the main loop.
+  The bot itself handles market-open/close and the daily halt, so it's safe
+  to let it run 24/7.
+
+  INSTALL:
+    1) Edit the two <string> values below (repo path, Python path) if needed.
+    2) Copy to ~/Library/LaunchAgents/:
+         cp deploy/launchd/com.tradebot.paper.plist ~/Library/LaunchAgents/
+    3) Load and start:
+         launchctl load  ~/Library/LaunchAgents/com.tradebot.paper.plist
+         launchctl start com.tradebot.paper
+    4) Status:
+         launchctl list | grep tradebot
+    5) Tail logs:
+         tail -f /Users/vivekadhikari/Documents/Claude/Projects/tradebot/logs/tradebot.out
+
+  UNLOAD:
+         launchctl unload ~/Library/LaunchAgents/com.tradebot.paper.plist
+
+  NB: launchd will NOT restart a job that exits >= 10 times in 10s
+  (it considers that a crash loop). Fix the root cause in that case.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.tradebot.paper</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/vivekadhikari/Documents/Claude/Projects/tradebot</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/vivekadhikari/Documents/Claude/Projects/tradebot/.venv/bin/python</string>
+    <string>/Users/vivekadhikari/Documents/Claude/Projects/tradebot/scripts/run_paper.py</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    <key>TZ</key>
+    <string>America/New_York</string>
+  </dict>
+
+  <!-- Keep alive across crashes and reboots. -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- If the bot exits too fast, don't hot-loop restart. -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <!-- stdout/stderr land in the repo's logs/ dir. -->
+  <key>StandardOutPath</key>
+  <string>/Users/vivekadhikari/Documents/Claude/Projects/tradebot/logs/tradebot.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/vivekadhikari/Documents/Claude/Projects/tradebot/logs/tradebot.err</string>
+</dict>
+</plist>

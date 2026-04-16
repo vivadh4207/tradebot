@@ -1,0 +1,204 @@
+# ===== Account =====
+account:
+  paper_starting_equity: 10000.0  # USD, for paper sim
+  max_risk_per_trade_pct: 0.01    # Kelly-lite cap
+  max_daily_loss_pct: 0.02        # halt entries if breached
+  max_open_positions: 5
+
+# ===== Universe (top 10 liquid US names) =====
+universe:
+  - SPY
+  - QQQ
+  - IWM
+  - AAPL
+  - MSFT
+  - NVDA
+  - TSLA
+  - META
+  - AMZN
+  - GOOGL
+  - AAOI
+  - AMD
+  - APLD
+  - INTC
+  - AVGO
+  - ASML
+  - LRCX
+  - MU
+  - TSM
+  - BABA
+  - BIDU
+  - PDD
+  - JD
+  - SHOP
+  - CRM
+  - ORCL
+  - IBM
+  - CSCO
+  - NFLX
+  - DIS
+  - BAC
+  - JPM
+  - WFC
+  - C
+  - GS
+  - MS  
+  - VZ
+  - T
+  - V
+  - MA
+  - PYPL
+  - ADBE
+  - CRM
+  - NOW 
+  - ZM
+  - DOCU
+  - TWLO
+  - UBER
+  - LYFT  
+  - ABNB
+  - BKNG
+  - EXPE
+  - MAR
+  - RCL
+  - CCL
+  - NCLH
+  - DAL
+  - LUV
+  - AAL
+  - UAL
+  - AXP
+  - VXX
+  - UVXY
+  - TQQQ
+  - SQQQ
+  - SOXL
+  - SPXL
+  - SPXS
+  - TECL
+  - TZA
+  - FAS
+  - FAZ
+  - QLD
+  - QID
+  - LABU
+  - LABD
+  - SSO
+  - SRS
+  - XLF
+  - XLE
+  - XLY
+  - XLC
+  - XLI
+  - XLB
+  - XLU
+  - XBI
+  - XHE
+  - XME
+  - XRT
+  - XSD
+  - XOP
+  - XHB
+  - XUR
+  - XLF
+  - XLE
+  - XLY
+  - XLC
+  - XLI
+  - XLB
+  - XLU
+  - XBI
+  - XHE
+  - XME
+  - XRT
+  - XSD
+  - XOP
+  - XHB
+  - XUR 
+
+# ===== Session (US Eastern) =====
+session:
+  market_open:  "09:30"
+  market_close: "16:00"
+  no_new_entries_after: "15:30"
+  eod_force_close: "15:45"
+
+# ===== VIX gates =====
+vix:
+  halt_above: 40.0
+  no_short_premium_above: 30.0
+  no_0dte_long_below: 12.0
+
+# ===== IV rank gates =====
+iv_rank:
+  block_sell_below: 0.30
+  block_buy_above: 0.70
+
+# ===== Signal =====
+signal:
+  min_confidence: 0.65
+  momentum_bars: 5
+  momentum_slope_long: 0.0001   # 0.01%
+  momentum_slope_short: -0.0001
+
+# ===== Execution =====
+execution:
+  min_volume_confirmation: 1.2   # current bar >= 1.2x avg
+  max_spread_pct_etf: 0.05
+  max_spread_pct_stock: 0.10
+  min_open_interest: 500
+  min_today_option_volume: 100
+  max_0dte_per_day: 50
+  order_ttl_seconds: 5
+
+# ===== Position sizing =====
+sizing:
+  kelly_fraction_cap: 0.25   # quarter-Kelly, capped at 5% of equity
+  kelly_hard_cap_pct: 0.05
+  max_contracts_0dte: 5
+  max_contracts_multiday: 10
+
+# ===== Exit engine =====
+exits:
+  profit_target_short_dte_pct: 0.35  # 0DTE/1DTE
+  profit_target_multi_dte_pct: 0.50  # 2+ DTE
+  stop_loss_short_dte_pct: 0.20
+  stop_loss_multi_dte_pct: 0.30
+  fast_thread_interval_sec: 5
+  main_loop_interval_sec: 180
+  hard_profit_cap_pct: 1.50
+  max_consecutive_holds: 3
+  claude_hold_conf_min: 0.70
+
+# ===== MI + Edge Score =====
+mi_edge:
+  block_below_combined_score: -5
+
+# ===== Catalyst calendar (earnings + FDA) =====
+catalysts:
+  enabled: true
+  lookahead_days: 14                 # how far ahead to fetch per refresh
+  static_yaml: config/catalysts.yaml # manual overrides (FDA, one-offs)
+
+# ===== News filter =====
+news:
+  enabled: true
+  lookback_hours: 2                  # how far back AlpacaNewsProvider pulls
+  cache_ttl_seconds: 300             # re-pull per symbol every 5 min
+  block_score: 0.50                  # block directional trades when |score| >= 0.50
+  premium_harvest_block_score: 0.75  # require a bigger shock to block premium-harvest
+
+# ===== Broker =====
+broker:
+  name: paper             # paper | alpaca
+  slippage_bps: 2         # 2 bps simulated slippage per leg
+  commission_per_option: 0.0
+  commission_per_share: 0.0
+
+# ===== Storage (trade journal) =====
+storage:
+  backend: cockroach              # sqlite | cockroach
+  cockroach_dsn_env: COCKROACH_DSN   # name of env var holding the connection string
+
+# ===== Live trading master switch =====
+live_trading: false       # Must be true AND broker != paper to route real orders

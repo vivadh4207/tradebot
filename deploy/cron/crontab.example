@@ -1,0 +1,50 @@
+# tradebot cron schedule — all times ET (handled by TZ= below).
+#
+# INSTALL (Mac or Linux):
+#   1) Edit the TRADEBOT path below to your absolute repo path.
+#   2) crontab /absolute/path/to/deploy/cron/crontab.example
+#      (or: crontab -e  and paste the contents)
+#   3) Verify:  crontab -l
+#   4) Tail logs:  tail -f $TRADEBOT/logs/tradebot.out
+#
+# IMPORTANT on macOS: give cron full-disk access in
+#   System Settings → Privacy & Security → Full Disk Access → add `cron`
+# otherwise it can't read files inside ~/Documents/...
+#
+# NB: cron does not source your shell rc. Anything in .zshrc (e.g. aliases)
+# will not apply. That's why we use absolute paths and the tradebotctl wrapper.
+
+TZ=America/New_York
+TRADEBOT=/ABSOLUTE/PATH/TO/tradebot
+CTL=$TRADEBOT/scripts/tradebotctl.sh
+
+# ---------------- live loop (Mon–Fri) ----------------
+
+# 7:00 ET Mon-Fri → refresh earnings + FDA catalyst calendar BEFORE the bot starts
+0  7  * * 1-5   $CTL catalysts > $TRADEBOT/logs/catalysts.$(date +\%Y\%m\%d).log 2>&1
+
+# 9:25 ET Mon-Fri → start the paper loop (first tick runs around 9:30)
+25 9  * * 1-5   $CTL start >> $TRADEBOT/logs/cron.out 2>&1
+
+# 16:05 ET Mon-Fri → stop. The EOD-sweep already flat-closes everything at 15:45
+# inside the bot; this is just tidy shutdown.
+5  16 * * 1-5   $CTL stop  >> $TRADEBOT/logs/cron.out 2>&1
+
+# ---------------- nightly (Mon–Fri evening) ----------------
+
+# 18:00 ET Mon–Fri → recompute priors from the last 30 days of realized trades
+0 18 * * 1-5    $CTL priors --days 30 --min-trades 30 >> $TRADEBOT/logs/priors.$(date +\%Y\%m\%d).log 2>&1
+
+# 22:00 ET Mon–Fri → walk-forward summary, 8 most recent windows
+0 22 * * 1-5    $CTL walkforward --max-windows 8 >> $TRADEBOT/logs/walkforward.$(date +\%Y\%m\%d).log 2>&1
+
+# ---------------- weekly ----------------
+
+# Sunday 20:00 ET → longer walk-forward report (quarterly-window sizes)
+0 20 * * 0      $CTL walkforward --train-days 365 --test-days 63 --max-windows 12 >> $TRADEBOT/logs/walkforward_weekly.$(date +\%Y\%m\%d).log 2>&1
+
+# ---------------- safety ----------------
+
+# Every hour during market hours: if PID file is stale but process gone, clear it.
+# The wrapper is idempotent so a stray `start` won't spawn a duplicate.
+0,30 9-15 * * 1-5 $CTL status > /dev/null 2>&1 || true
