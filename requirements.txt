@@ -28,6 +28,10 @@ psycopg[binary]>=3.2
 # Dashboard
 fastapi>=0.110
 uvicorn[standard]>=0.29
+httpx>=0.27                   # required by FastAPI TestClient + async HTTP
+
+# Config schema validation
+pydantic>=2.0
 
 # Testing
 pytest>=8.0

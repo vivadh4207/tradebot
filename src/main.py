@@ -23,6 +23,9 @@ from .core.types import Signal, Order, Side, OptionRight
 from .brokers.paper import PaperBroker
 from .brokers.quote_validator import QuoteValidator
 from .brokers.slippage_model import StochasticCostModel, LinearCostModel, MarketContext
+from .brokers.auto_calibrating_model import (
+    AutoCalibratingCostModel, start_calibration_scheduler,
+)
 from .risk.drawdown_guard import DrawdownGuard
 from .risk.vol_scaling import vol_scale
 from .data.market_data import SyntheticDataAdapter, AlpacaDataAdapter, MarketDataAdapter
@@ -122,6 +125,11 @@ def _build_journal_from_settings(settings: Settings) -> Optional[TradeJournal]:
 
 class TradeBot:
     def __init__(self, settings: Settings):
+        # Pre-init attributes that later blocks conditionally reference so
+        # we never hit AttributeError when a block runs before another sets it.
+        self._auto_cost_model = None
+        self._autocal_mode = "manual"
+
         self.s = settings
         self.clock = MarketClock(
             market_open=settings.get("session.market_open"),
@@ -133,6 +141,10 @@ class TradeBot:
         self.chain_provider = _build_chain_provider(settings)
         self.journal = _build_journal_from_settings(settings)
         self.notifier: Notifier = build_notifier()
+        # Late-bind notifier to the auto-calibrator so it can push alerts
+        # when realized vs. predicted slippage diverges meaningfully.
+        if self._auto_cost_model is not None:
+            self._auto_cost_model.notifier = self.notifier
         self.news = _build_news_sentiment(settings)
         self.econ_calendar = EconomicCalendar()
         self.catalyst_calendar: CatalystCalendar = build_default_catalyst_calendar(
@@ -145,17 +157,47 @@ class TradeBot:
         # Stochastic makes backtest Sharpe match live Sharpe; linear overstates.
         model_type = str(settings.get("broker.cost_model", "stochastic")).lower()
         if model_type == "stochastic":
-            slip_model = StochasticCostModel(
+            base_model = StochasticCostModel(
                 base_half_spread_mult=float(settings.get("broker.half_spread_mult", 1.0)),
                 size_impact_coef=float(settings.get("broker.size_impact_coef", 0.25)),
                 vix_impact_coef=float(settings.get("broker.vix_impact_coef", 0.015)),
                 random_noise_bps=float(settings.get("broker.slip_noise_bps", 0.5)),
                 min_slippage_bps=float(settings.get("broker.slip_floor_bps", 0.5)),
             )
+            # Auto-calibration: 'hourly' (most reactive), 'daily', 'manual'.
+            self._autocal_mode = str(
+                settings.get("broker.auto_calibrate", "daily")
+            ).lower()
+            if self._autocal_mode in ("hourly", "daily"):
+                slip_model = AutoCalibratingCostModel(
+                    inner=base_model,
+                    calibration_path=str(settings.get(
+                        "broker.calibration_path",
+                        "logs/slippage_calibration.jsonl",
+                    )),
+                    history_path=str(settings.get(
+                        "broker.calibration_history",
+                        "logs/calibration_history.jsonl",
+                    )),
+                    min_samples=int(settings.get("broker.calibration_min_samples", 30)),
+                    max_step_per_cycle=float(
+                        settings.get("broker.calibration_max_step", 0.30)
+                    ),
+                    max_drift_from_baseline=float(
+                        settings.get("broker.calibration_max_drift", 2.0)
+                    ),
+                    notifier=None,  # attached after notifier init below
+                )
+                self._auto_cost_model = slip_model
+            else:
+                slip_model = base_model
+                self._auto_cost_model = None
         else:
             slip_model = LinearCostModel(
                 slippage_bps=float(settings.get("broker.slippage_bps", 2.0))
             )
+            self._autocal_mode = "manual"
+            self._auto_cost_model = None
         self.broker = PaperBroker(
             starting_equity=settings.paper_equity,
             slippage_bps=settings.get("broker.slippage_bps", 2),
@@ -700,6 +742,17 @@ class TradeBot:
 
         t = threading.Thread(target=self.fast_loop, name="fast_exit", daemon=True)
         t.start()
+
+        # Kick off the auto-calibration scheduler if enabled.
+        cal_thread = None
+        if self._auto_cost_model is not None and self._autocal_mode in ("hourly", "daily"):
+            cal_thread = start_calibration_scheduler(
+                self._auto_cost_model,
+                mode=self._autocal_mode,
+                stop_event=self._stop,
+            )
+            log.info("calibration_scheduler_started", mode=self._autocal_mode)
+
         try:
             self.main_loop()
         except KeyboardInterrupt:
@@ -707,6 +760,8 @@ class TradeBot:
         finally:
             self._stop.set()
             t.join(timeout=2)
+            if cal_thread is not None:
+                cal_thread.join(timeout=2)
             # Best-effort flatten on shutdown — fail-soft so a broken broker
             # doesn't hang the exit path.
             try:

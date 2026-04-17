@@ -11,15 +11,25 @@ import pytest
 
 
 def test_tradebot_instantiates_stochastic_cost_model(tmp_path, monkeypatch):
-    """TradeBot.__init__ must attach a StochasticCostModel to its broker."""
+    """TradeBot.__init__ must attach a StochasticCostModel to its broker.
+
+    When `broker.auto_calibrate` is `hourly` or `daily` the model is wrapped
+    in `AutoCalibratingCostModel`; either way the inner model must be a
+    StochasticCostModel.
+    """
     monkeypatch.chdir(Path(__file__).resolve().parents[1])
     from src.main import TradeBot
     from src.core.config import load_settings
     from src.brokers.slippage_model import StochasticCostModel
+    from src.brokers.auto_calibrating_model import AutoCalibratingCostModel
     s = load_settings()
     bot = TradeBot(s)
-    assert bot.broker._slippage_model is not None
-    assert isinstance(bot.broker._slippage_model, StochasticCostModel)
+    model = bot.broker._slippage_model
+    assert model is not None
+    if isinstance(model, AutoCalibratingCostModel):
+        assert isinstance(model._inner, StochasticCostModel)
+    else:
+        assert isinstance(model, StochasticCostModel)
 
 
 def test_tradebot_has_drawdown_guard_wired(monkeypatch):

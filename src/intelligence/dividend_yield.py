@@ -87,6 +87,10 @@ class DividendYieldProvider:
         return float(y)
 
     def _fetch(self, symbol: str) -> Optional[float]:
+        # Fast-exit in test / CI environments so we don't hang for 60s+
+        # on every symbol when there's no network.
+        if os.getenv("TRADEBOT_NO_NETWORK") == "1":
+            return None
         try:
             import yfinance as yf
         except ImportError:

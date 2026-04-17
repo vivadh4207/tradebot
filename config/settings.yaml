@@ -184,6 +184,16 @@ broker:
   slip_noise_bps: 0.5
   slip_floor_bps: 0.5
   snapshot_path: logs/broker_state.json
+  # Auto-calibration: 'hourly' | 'daily' | 'manual'
+  # - hourly: tighter loop, max 10% step per cycle
+  # - daily:  safer, max 30% step per cycle
+  # - manual: no auto-tuning; run scripts/calibrate_slippage.py manually
+  auto_calibrate: daily
+  calibration_path: logs/slippage_calibration.jsonl
+  calibration_history: logs/calibration_history.jsonl
+  calibration_min_samples: 30     # skip auto-tuning below this
+  calibration_max_step: 0.30      # never move a constant more than this per cycle
+  calibration_max_drift: 2.0      # never drift more than 2x from baseline (all cycles)
 
 # ===== Regime classifier =====
 regime:

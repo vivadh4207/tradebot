@@ -58,6 +58,13 @@ CTL=$TRADEBOT/scripts/tradebotctl.sh
 # Every 15 min during market hours → resolve LSTM predictions whose horizon elapsed
 */15 9-16 * * 1-5  $CTL resolve-ml > $TRADEBOT/logs/resolve_ml.out 2>&1
 
+# 16:30 ET Mon-Fri → daily EOD snapshot (trades, slippage keep/tune, attribution)
+30 16 * * 1-5   $CTL daily-report --days 1 >> $TRADEBOT/logs/daily_report.$(date +\%Y\%m\%d).log 2>&1
+
+# 17:00 ET Mon-Fri → weekly slippage calibration report (human-review; auto-cal
+# still runs inside the bot on its own schedule every hour / day)
+0  17 * * 1-5   $CTL calibrate --days 7 >> $TRADEBOT/logs/calibrate.$(date +\%Y\%m\%d).log 2>&1
+
 # 19:00 ET Mon-Fri → LSTM calibration report (post-resolve)
 0 19 * * 1-5    $CTL analyze-ml --days 14 > $TRADEBOT/logs/ml_analysis.$(date +\%Y\%m\%d).log 2>&1
 

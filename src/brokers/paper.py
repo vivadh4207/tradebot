@@ -15,6 +15,17 @@ from datetime import datetime, timezone
 from ..core.types import Order, Fill, Position, Side
 from .base import BrokerAdapter, AccountState
 
+# Lazy cache of the calibration logger so we don't instantiate one per fill.
+_SLIPPAGE_LOGGER = None
+
+
+def _get_slippage_logger(path: str):
+    global _SLIPPAGE_LOGGER
+    if _SLIPPAGE_LOGGER is None or getattr(_SLIPPAGE_LOGGER, "path", None) != path:
+        from ..analytics.slippage_calibration import SlippageLogger
+        _SLIPPAGE_LOGGER = SlippageLogger(path)
+    return _SLIPPAGE_LOGGER
+
 
 class PaperBroker(BrokerAdapter):
     def __init__(self, starting_equity: float = 10_000.0,
@@ -54,6 +65,8 @@ class PaperBroker(BrokerAdapter):
     def submit(self, order: Order) -> Optional[Fill]:
         if order.limit_price is None:
             return None
+        cost_for_log = None
+        ctx_for_log = None
         if self._slippage_model is not None:
             ctx = self._last_market_ctx.get(order.symbol)
             if ctx is None:
@@ -67,6 +80,8 @@ class PaperBroker(BrokerAdapter):
                 )
             cost = self._slippage_model.fill(order, ctx)
             fill_price = cost.executed_price
+            cost_for_log = cost
+            ctx_for_log = ctx
         else:
             slip = order.limit_price * self._slippage_bps / 10_000.0
             fill_price = order.limit_price + (slip if order.side == Side.BUY else -slip)
@@ -78,6 +93,7 @@ class PaperBroker(BrokerAdapter):
         # loop on slow DB I/O. The fill object is immutable at this point so
         # there's no data race even across threads.
         self._log_fill(fill)
+        self._log_slippage_calibration(fill, cost_for_log, ctx_for_log)
         self._snapshot_if_configured()
         return fill
 
@@ -152,6 +168,34 @@ class PaperBroker(BrokerAdapter):
             self._journal.record_fill(fill)
         except Exception:
             pass   # never let journaling kill the trade loop
+
+    def _log_slippage_calibration(self, fill: Fill, cost, ctx) -> None:
+        """Append a calibration row for this fill so the auto-tuner / weekly
+        report can reason about predicted-vs-observed slippage."""
+        if cost is None or ctx is None:
+            return
+        try:
+            from ..analytics.slippage_calibration import SlippageLogger
+            # One global logger at the default path; swap via env if needed.
+            import os as _os
+            path = _os.getenv("TRADEBOT_SLIPPAGE_LOG",
+                                "logs/slippage_calibration.jsonl")
+            lg = _get_slippage_logger(path)
+            lg.record(
+                symbol=fill.order.symbol,
+                side=fill.order.side.value,
+                qty=int(fill.order.qty),
+                is_option=bool(fill.order.is_option),
+                limit_price=float(fill.order.limit_price or 0.0),
+                executed_price=float(fill.price),
+                predicted_bps=float(cost.slippage_bps),
+                components=dict(cost.components or {}),
+                mid=float(ctx.mid),
+                vix=float(ctx.vix),
+                tag=str(fill.order.tag or ""),
+            )
+        except Exception:
+            pass   # calibration is advisory, never let it kill a fill
 
     def _log_trade(self, pos: Position, exit_fill: Fill, closed_qty: int, realized: float) -> None:
         if self._journal is None:

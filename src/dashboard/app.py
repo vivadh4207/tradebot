@@ -463,6 +463,71 @@ def backtest_runs(limit: int = Query(50, ge=1, le=500)):
     return {"runs": runs}
 
 
+@app.get("/api/calibration", response_class=JSONResponse)
+def calibration(days: int = Query(7, ge=1, le=90)):
+    """Slippage calibration stats + most recent auto-calibration cycles."""
+    from pathlib import Path
+    from src.analytics.slippage_calibration import load_recent, analyze
+    s, root = _settings()
+    cal_path = s.get("broker.calibration_path",
+                      str(root / "logs" / "slippage_calibration.jsonl"))
+    hist_path = s.get("broker.calibration_history",
+                       str(root / "logs" / "calibration_history.jsonl"))
+    if not Path(cal_path).is_absolute():
+        cal_path = str(root / cal_path)
+    if not Path(hist_path).is_absolute():
+        hist_path = str(root / hist_path)
+
+    rows = load_recent(cal_path, days=days)
+    stats = analyze(rows)
+    stats_dict = None
+    if stats is not None:
+        stats_dict = {
+            "n": stats.n,
+            "mean_predicted_bps": round(stats.mean_predicted, 3),
+            "mean_observed_bps": round(stats.mean_observed, 3),
+            "median_observed_bps": round(stats.median_observed, 3),
+            "p95_observed_bps": round(stats.p95_observed, 3),
+            "p99_observed_bps": round(stats.p99_observed, 3),
+            "ratio": round(stats.mean_ratio, 3),
+            "per_component_mean": {k: round(v, 3) for k, v in stats.per_component_mean.items()},
+            "per_symbol_mean": {k: round(v, 3) for k, v in stats.per_symbol_mean.items()},
+            "days_covered": round(stats.days_covered, 2),
+            "keep_or_tune": (
+                "keep" if stats.n >= 30 and 0.8 <= stats.mean_ratio <= 1.2
+                else ("tune_up" if stats.mean_ratio > 1.2
+                      else ("tune_down" if 0 < stats.mean_ratio < 0.8 else "insufficient"))
+            ),
+        }
+    # Auto-calibration history tail
+    history = []
+    p = Path(hist_path)
+    if p.exists():
+        try:
+            for line in p.read_text().splitlines()[-50:][::-1]:
+                try:
+                    history.append(json.loads(line))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    return {"stats": stats_dict, "auto_history": history, "lookback_days": days}
+
+
+@app.get("/api/daily_report", response_class=JSONResponse)
+def daily_report():
+    """Read the most recent daily EOD snapshot (written by scripts/daily_report.py)."""
+    from pathlib import Path
+    s, root = _settings()
+    p = root / "logs" / "daily_report.json"
+    if not p.exists():
+        return {"message": "no daily report yet — run scripts/daily_report.py"}
+    try:
+        return json.loads(p.read_text())
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/api/attribution", response_class=JSONResponse)
 def attribution(days: int = Query(30, ge=1, le=365)):
     """Per-entry-tag performance attribution. Maps entry_tag → win rate, mean pnl,
