@@ -281,6 +281,11 @@ class TradeBot:
                 slippage_model=slip_model,
                 alpaca_broker=alpaca_mirror_broker,
             )
+            # Inject a quote callback so reconcile can fetch live option
+            # bid/ask before sending close orders. Prevents blind $0.01
+            # closes that either don't fill or dump positions at garbage
+            # prices.
+            self.broker._close_quote_fn = self._option_quote_for_close
             log.info("broker", kind="paper+alpaca_mirror")
         else:
             self.broker = PaperBroker(
@@ -526,6 +531,55 @@ class TradeBot:
         avg_win = max(0.005, min(0.10, avg_win))
         avg_loss = max(0.005, min(0.10, avg_loss))
         return (win_rate, avg_win, avg_loss)
+
+    def _option_quote_for_close(self, occ_symbol: str):
+        """Return (bid, ask) for a specific OCC option symbol or None.
+        Used by the mirror broker to price its close orders correctly.
+
+        Parses the OCC symbol to get underlying / strike / expiry /
+        right, fetches the current chain, and returns the matching
+        contract's bid/ask. Returns None on any failure — callers
+        interpret "no quote" as "skip the close, don't blind-dump".
+        """
+        try:
+            from .data.options_chain_alpaca import _parse_occ
+        except Exception:
+            _parse_occ = None
+        if _parse_occ is None:
+            return None
+        # OCC format: UNDER + YYMMDD + C/P + STRIKE*1000 padded to 8
+        # Extract underlying by scanning until first digit.
+        i = 0
+        while i < len(occ_symbol) and not occ_symbol[i].isdigit():
+            i += 1
+        underlying = occ_symbol[:i]
+        parts = _parse_occ(occ_symbol, underlying)
+        if parts is None:
+            return None
+        expiry_d, right, strike = parts
+        spot = self.data.latest_price(underlying)
+        if spot is None or spot <= 0:
+            return None
+        try:
+            from datetime import date as _d
+            dte = max(1, (expiry_d - _d.today()).days)
+            chain = self.chain_provider.chain(
+                underlying, float(spot), target_dte=int(dte),
+            )
+        except Exception:
+            return None
+        for c in chain:
+            if c.symbol == occ_symbol:
+                if c.bid > 0 and c.ask > 0:
+                    return (float(c.bid), float(c.ask))
+                return None
+            # fallback match by strike/right/expiry in case OCC symbol
+            # format differs slightly between feeds
+            if (c.strike == strike and c.right == right
+                    and c.expiry == expiry_d
+                    and c.bid > 0 and c.ask > 0):
+                return (float(c.bid), float(c.ask))
+        return None
 
     def _build_mark_prices(self, positions) -> Dict[str, float]:
         """Build {position.symbol → mark_price} for an arbitrary list of

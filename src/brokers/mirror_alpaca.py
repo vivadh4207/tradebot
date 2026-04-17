@@ -133,17 +133,37 @@ class MirrorAlpacaBroker(PaperBroker):
             qty = abs(int(ap.qty))
             if qty <= 0:
                 continue
-            # Alpaca holds a position we don't. Close it at market.
-            # side is opposite of what the position represents:
-            # if Alpaca shows long (qty>0), we need to SELL to close.
+
+            # Alpaca holds a position we don't. Close it at a
+            # QUOTE-DRIVEN limit — using $0.01 doesn't fill (nobody
+            # crosses that spread) OR if it did, it'd fill at terrible
+            # prices that destroy the account. Same rule your broker
+            # applies: a close limit must be realistic relative to the
+            # current bid/ask.
+            #
+            # Need to fetch the contract's live quote. We use the
+            # Alpaca TradingClient which can't pull option quotes
+            # directly, so we try our data providers via the optional
+            # `self._close_quote_fn` injected by main.py. If no quote
+            # is available, skip — don't dump positions blindly.
+            close_limit = self._close_limit_for(ap, sym)
+            if close_limit is None:
+                result["errors"] += 1
+                _log.warning(
+                    "alpaca_reconcile_skip_no_quote symbol=%s qty=%d "
+                    "(no live quote + refusing to submit blind close)",
+                    sym, qty,
+                )
+                continue
+            # Determine side: short (qty<0) → BUY to close; long (qty>0)
+            # → SELL to close. AlpacaBroker.positions() now returns
+            # qty with correct sign (short positions negated via the
+            # side field).
             side = Side.SELL if ap.qty > 0 else Side.BUY
             close = Order(
                 symbol=sym, side=side, qty=qty,
                 is_option=bool(ap.is_option),
-                # Use a conservative limit that'll almost certainly
-                # fill — 0.01 for a close (sell at any non-zero bid)
-                # works because Alpaca paper will cross the spread.
-                limit_price=0.01,
+                limit_price=close_limit,
                 tif="DAY",      # options don't support IOC
                 tag="reconcile_zombie_close",
             )
@@ -151,8 +171,9 @@ class MirrorAlpacaBroker(PaperBroker):
                 self._alpaca.submit(close)
                 result["reconciled"] += 1
                 _log.info(
-                    "alpaca_reconcile_zombie_closed symbol=%s qty=%d side=%s",
-                    sym, qty, side.value,
+                    "alpaca_reconcile_zombie_closed symbol=%s qty=%d "
+                    "side=%s limit=$%.2f",
+                    sym, qty, side.value, close_limit,
                 )
             except Exception as e:                      # noqa: BLE001
                 result["errors"] += 1
@@ -161,6 +182,37 @@ class MirrorAlpacaBroker(PaperBroker):
                     sym, e,
                 )
         return result
+
+    def _close_limit_for(self, ap_position, sym: str) -> Optional[float]:
+        """Pick a realistic close limit from the live options quote.
+        Returns None if no quote is available (caller skips the close).
+
+        Strategy:
+          - BUY-to-close a short:  bid + 80% of spread  (pay close to ask)
+          - SELL-to-close a long:  ask - 80% of spread  (accept near bid)
+        Both cross the spread aggressively to ensure fill but never go
+        to $0.01 on a contract with real market value.
+        """
+        quote_fn = getattr(self, "_close_quote_fn", None)
+        if quote_fn is None:
+            return None
+        try:
+            quote = quote_fn(sym)    # expect (bid, ask) or None
+        except Exception as e:       # noqa: BLE001
+            _log.warning("close_quote_fn_failed symbol=%s err=%s", sym, e)
+            return None
+        if not quote:
+            return None
+        bid, ask = quote
+        if bid is None or ask is None or bid <= 0 or ask <= 0 or ask < bid:
+            return None
+        spread = ask - bid
+        # Direction: if Alpaca has qty>0 we need to SELL → limit near bid
+        # (accept market). If qty<0 short → BUY → limit near ask.
+        if ap_position.qty > 0:
+            return round(max(0.01, ask - 0.80 * spread), 2)   # ~bid+20% of spread, SELL
+        else:
+            return round(bid + 0.80 * spread, 2)              # ~ask-20% of spread, BUY
 
     # --- internal ---
     def _mirror_worker(self) -> None:
