@@ -316,16 +316,25 @@ class TradeBot:
             from .brokers.mirror_alpaca import MirrorAlpacaBroker
             if isinstance(self.broker, MirrorAlpacaBroker):
                 summary = self.broker.reconcile_with_alpaca()
-                if summary.get("reconciled", 0) > 0 or summary.get("errors", 0) > 0:
+                reconciled = summary.get("reconciled", 0)
+                errors = summary.get("errors", 0)
+                # Log to file always (useful for audit), but Discord
+                # notify only when we ACTUALLY cleaned something up.
+                # Errors-only cases (0 reconciled, N errors) happen on
+                # every startup when zombies are expired/unclosable —
+                # notifying would spam Discord with useless noise.
+                if reconciled > 0 or errors > 0:
                     log.info("alpaca_reconcile", **summary)
+                if reconciled > 0:
                     self.notifier.notify(
-                        f"Closed {summary['reconciled']} zombie position(s) "
-                        f"on Alpaca paper (errors: {summary['errors']})",
-                        title="reconcile", level="warn",
+                        f"Closed {reconciled} zombie position(s) on Alpaca paper.",
+                        title="reconcile", level="info",
                         meta={
-                            "reconciled": summary["reconciled"],
-                            "errors": summary["errors"],
-                            "symbols": ", ".join(summary["alpaca_only_symbols"][:10]),
+                            "reconciled": reconciled,
+                            "errors": errors,
+                            "symbols": ", ".join(
+                                summary["alpaca_only_symbols"][:10]
+                            ),
                         },
                     )
         except Exception as e:                           # noqa: BLE001

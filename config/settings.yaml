@@ -9,7 +9,15 @@ strategy_mode: wheel
 
 # Wheel-specific config (used only when strategy_mode=wheel)
 wheel:
-  universe: [SPY, QQQ]           # trade only these 2 for MVP
+  # Tiered universe — expensive names first (for big accounts), cheap
+  # names as fallback (affordable at $10-20k equity). Wheel runner
+  # walks this list in order and picks the first affordable name.
+  #   SPY ($720), QQQ ($640) → need $60-70k collateral per CSP
+  #   DIA ($575)              → ~$55k
+  #   AMD ($170), AAPL ($230) → ~$18-23k (mid-tier)
+  #   BAC ($45), HOOD ($50)   → ~$4-5k  (works on $10k account)
+  #   INTC ($22), F ($12), T ($22) → ~$1-3k (small-account friendly)
+  universe: [SPY, QQQ, DIA, AMD, AAPL, BAC, HOOD, INTC, T]
   target_dte: 35                 # aim for 30-45 DTE puts
   target_delta: 0.30             # 30-delta = ~3% OTM
   profit_target_pct: 0.50        # close when we've captured 50% of premium
@@ -20,7 +28,11 @@ wheel:
 
 # ===== Account =====
 account:
-  paper_starting_equity: 10000.0  # USD, for paper sim
+  # Match Alpaca paper's default ($100k). Wheel on SPY/QQQ requires
+  # ~$70k collateral per CSP — a $10k paper account can't do the
+  # strategy. Setting equal to Alpaca paper so local book and Alpaca
+  # mirror report consistent cash.
+  paper_starting_equity: 100000.0  # USD, for paper sim
   max_risk_per_trade_pct: 0.01    # Kelly-lite cap
   # Daily-loss circuit breaker. Set high (0.50 = 50%) to effectively
   # disable — losses are controlled per-trade via tight stops instead.
