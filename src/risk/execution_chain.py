@@ -49,6 +49,9 @@ class ExecutionContext:
     news_score: float = 0.0           # -1..+1, 0 = no news or neutral
     news_label: str = "neutral"       # 'negative' | 'neutral' | 'positive'
     news_rationale: str = ""          # short, loggable
+    # Recent price bars (last ~20-80) — used by the momentum-confirmation
+    # filter to verify the underlying actually moved in signal direction.
+    recent_bars: list = None          # type: ignore[assignment]
 
 
 class ExecutionChain:
@@ -222,6 +225,72 @@ class ExecutionChain:
             return FilterResult(True, f"news_{ctx.news_label}:{s:+.2f}", advisory=True)
         return FilterResult(True, "news_neutral_or_none", advisory=True)
 
+    def f16_vwap_alignment(self, ctx: ExecutionContext) -> FilterResult:
+        """Reject trades fighting the intraday VWAP trend.
+
+        A bullish directional bet (long call) should not enter when the
+        spot is *below* VWAP — that means the session is trending down
+        and we'd be buying strength that isn't there. Conversely for
+        bearish (long put) below-VWAP entries are preferred.
+
+        Disabled when execution.vwap_alignment_enabled=false (default:
+        true).
+        """
+        if not bool(self._s.get("execution", {}).get(
+                "vwap_alignment_enabled", True)):
+            return FilterResult(True, "vwap_align_disabled", advisory=True)
+        if ctx.vwap <= 0 or ctx.spot <= 0:
+            return FilterResult(True, "vwap_align_na", advisory=True)
+        direction = (ctx.signal.meta.get("direction") or "").lower()
+        diff_pct = (ctx.spot - ctx.vwap) / ctx.vwap
+        if direction == "bullish" and diff_pct < 0:
+            return FilterResult(
+                False,
+                f"vwap_align_wrong_side: bullish but spot {diff_pct:+.2%} vs VWAP",
+            )
+        if direction == "bearish" and diff_pct > 0:
+            return FilterResult(
+                False,
+                f"vwap_align_wrong_side: bearish but spot {diff_pct:+.2%} vs VWAP",
+            )
+        return FilterResult(True, f"vwap_align_ok: {diff_pct:+.2%}")
+
+    def f17_momentum_confirmation(self, ctx: ExecutionContext) -> FilterResult:
+        """Require the underlying to have already moved in the signal
+        direction over the last few bars. Blocks "entering on noise"
+        signals where the model's score is positive but price action
+        hasn't confirmed.
+
+        Reads ctx.recent_bars (populated by main.py when available).
+        Requires last-N-bar return >= min move threshold with correct sign.
+        """
+        if not bool(self._s.get("execution", {}).get(
+                "momentum_confirmation_enabled", True)):
+            return FilterResult(True, "momentum_conf_disabled", advisory=True)
+        bars = getattr(ctx, "recent_bars", None) or []
+        if len(bars) < 5:
+            return FilterResult(True, "momentum_conf_na", advisory=True)
+        direction = (ctx.signal.meta.get("direction") or "").lower()
+        k = 5
+        start = bars[-k].open
+        end = bars[-1].close
+        if start <= 0:
+            return FilterResult(True, "momentum_conf_na", advisory=True)
+        move = (end - start) / start
+        min_move = float(self._s.get("execution", {}).get(
+            "momentum_confirmation_min_move", 0.002))  # 0.2% over 5 bars
+        if direction == "bullish" and move < min_move:
+            return FilterResult(
+                False,
+                f"momentum_weak: +{move:.3%} < +{min_move:.1%} (5-bar move)",
+            )
+        if direction == "bearish" and move > -min_move:
+            return FilterResult(
+                False,
+                f"momentum_weak: {move:+.3%} > -{min_move:.1%} (5-bar move)",
+            )
+        return FilterResult(True, f"momentum_ok: {move:+.3%}")
+
     # ---------- runner ----------
     def run(self, ctx: ExecutionContext) -> List[FilterResult]:
         filters: List[Callable[[ExecutionContext], FilterResult]] = [
@@ -233,6 +302,7 @@ class ExecutionChain:
             self.f11_spread_validator, self.f12_open_interest,
             self.f13_0dte_cap, self.f14_mi_edge_gate,
             self.f15_news_filter,
+            self.f16_vwap_alignment, self.f17_momentum_confirmation,
         ]
         results: List[FilterResult] = []
         for f in filters:

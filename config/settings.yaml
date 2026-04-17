@@ -94,7 +94,20 @@ execution:
   min_today_option_volume: 100
   max_0dte_per_day: 50
   order_ttl_seconds: 5
-  target_dte: 7              # DTE to pick from the options chain (1 = next-day expiry)
+  # DTE strategy. Fixed (target_dte) OR diversified (target_dte_pool).
+  # If target_dte_pool is a non-empty list, each entry randomly picks
+  # a DTE from it — lets us compare which DTE bucket wins over time.
+  target_dte: 7
+  target_dte_pool: [0, 1, 7, 14, 30]
+  # Entry spread aggressiveness. 0.00 = pay bid (won't fill), 1.00 =
+  # pay ask, 0.30 = bid + 30% of spread (aggressive buyer, saves ~70%
+  # of spread vs crossing ask).
+  entry_spread_pct: 0.30
+  # Pattern/momentum gates — require underlying to have moved in
+  # signal direction before entering. Set *_enabled=false to disable.
+  vwap_alignment_enabled: true
+  momentum_confirmation_enabled: true
+  momentum_confirmation_min_move: 0.002   # 0.2% over last 5 bars
 
 # ===== Position sizing =====
 sizing:
@@ -209,7 +222,10 @@ ml:
 # ===== Regime-aware ensemble =====
 ensemble:
   enabled: true
-  min_weighted_confidence: 0.70      # sum of weighted confidences required to emit
+  # Raised from 0.70 → 0.85: fewer entries, but each one has much
+  # higher cross-signal agreement. Operator feedback: too many weak
+  # trades were being opened.
+  min_weighted_confidence: 0.85
   dominance_ratio: 1.5               # dominant / opposing score required
   log_decisions: true                # every tick-per-symbol with >=1 signal → journal
   # Regime × signal-source weight overrides. Comment out to use DEFAULT_WEIGHTS

@@ -924,6 +924,7 @@ class TradeBot:
             econ_blackout=econ_blackout,
             news_score=news_score, news_label=news_label,
             news_rationale=news_rationale,
+            recent_bars=bars[-20:],   # momentum filter needs last ~20 bars
         )
         results = self.exec_chain.run(ectx)
         if not ExecutionChain.decided_pass(results):
@@ -951,7 +952,17 @@ class TradeBot:
         else:
             right = OptionRight.CALL
 
-        target_dte = int(self.s.get("execution.target_dte", 1))
+        # DTE diversification — pick from a pool so we can A/B which DTE
+        # bucket actually wins. 0DTE moves fast (high theta, high
+        # convexity); 30DTE moves slow (low theta, needs direction).
+        # The bot journals which DTE each fill used, so `analyze_ml` or
+        # `attribute_pnl` can slice performance by DTE after ~50 trades.
+        _dte_pool = self.s.get("execution.target_dte_pool", None) or []
+        if _dte_pool:
+            import random as _random
+            target_dte = int(_random.choice(_dte_pool))
+        else:
+            target_dte = int(self.s.get("execution.target_dte", 1))
         chain = self.chain_provider.chain(sig.symbol, spot, target_dte=target_dte)
         # Liquid-strike picker: prefer contracts with real OI + volume
         # within 5% of spot. Prevents buying far-OTM illiquid trash
@@ -1057,8 +1068,21 @@ class TradeBot:
         # Directional bet on the underlying is expressed as LONG options:
         # bullish → BUY CALL, bearish → BUY PUT. We don't sell premium here;
         # that's a separate strategy that would need explicit configuration.
-        # Limit: cross the ask slightly so the fill is near-certain.
-        limit = round(contract.ask * 1.02, 2)
+        #
+        # Limit pricing — don't just pay the ask. Starting at
+        #   bid + 30%-of-spread
+        # means we're still an aggressive buyer (more likely to fill
+        # before market walks away) but save ~70% of the spread cost.
+        # If the paper broker's fill simulator won't fill at this price,
+        # we'll see it reject and can relax later. On real Alpaca paper
+        # the simulator generally fills at-limit if the order sits, so
+        # this works. Operator asked: "optimize bid/ask entry, don't
+        # just enter at full ask."
+        spread = max(0.0, contract.ask - contract.bid)
+        aggressiveness = float(self.s.get("execution.entry_spread_pct", 0.30))
+        limit = round(contract.bid + spread * aggressiveness, 2)
+        if limit <= 0:
+            limit = round(contract.ask * 0.98, 2)   # fallback if bid=0
         order = Order(symbol=contract.symbol, side=Side.BUY, qty=n,
                       is_option=True, limit_price=limit,
                       tag=f"entry:{sig.source}:{sig.symbol}")

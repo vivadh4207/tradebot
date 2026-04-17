@@ -38,30 +38,103 @@ class NullNotifier(Notifier):
 
 
 def build_notifier() -> Notifier:
-    """Pick a notifier based on env:
-    - DISCORD_WEBHOOK_URL present → Discord
-    - SLACK_WEBHOOK_URL present   → Slack
-    - else                        → NullNotifier
+    """Pick a notifier based on env.
+
+    Single-channel mode (legacy):
+      - DISCORD_WEBHOOK_URL present → all events go there
+      - SLACK_WEBHOOK_URL present   → all events go there
+      - else                        → NullNotifier
+
+    Multi-channel mode (recommended): set additional env vars to route
+    by event type. Missing channels fall back to DISCORD_WEBHOOK_URL.
+      - DISCORD_WEBHOOK_URL_TRADES      → entry / exit fills
+      - DISCORD_WEBHOOK_URL_CATALYSTS   → earnings / FDA events
+      - DISCORD_WEBHOOK_URL_ALERTS      → HALT / shutdown / watchdog
+      - DISCORD_WEBHOOK_URL_CALIBRATION → slippage calibration drift
+      - DISCORD_WEBHOOK_URL             → everything else (startup, EOD)
 
     Defensive cleanup: strip whitespace *and* surrounding quotes from the
     env value. A leading space or quote-wrapped URL in .env silently
-    breaks urllib.request, and the WebhookNotifier's error path is
-    non-fatal — so the bot happily runs with broken alerts unless we
-    catch it here.
+    breaks urllib.request.
     """
     from .webhook import WebhookNotifier
 
     def _clean(val: str) -> str:
         v = (val or "").strip()
-        # Strip a single layer of surrounding quotes if present.
         if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
             v = v[1:-1].strip()
         return v
 
-    dsc = _clean(os.getenv("DISCORD_WEBHOOK_URL", ""))
+    default_dsc = _clean(os.getenv("DISCORD_WEBHOOK_URL", ""))
     slk = _clean(os.getenv("SLACK_WEBHOOK_URL", ""))
-    if dsc:
-        return WebhookNotifier(url=dsc, flavor="discord")
+
+    # Check for any per-channel overrides. Each optional; missing →
+    # falls back to default (or to Null if no default either).
+    per_channel = {
+        "trades":      _clean(os.getenv("DISCORD_WEBHOOK_URL_TRADES", "")),
+        "catalysts":   _clean(os.getenv("DISCORD_WEBHOOK_URL_CATALYSTS", "")),
+        "alerts":      _clean(os.getenv("DISCORD_WEBHOOK_URL_ALERTS", "")),
+        "calibration": _clean(os.getenv("DISCORD_WEBHOOK_URL_CALIBRATION", "")),
+    }
+    any_per_channel = any(per_channel.values())
+
+    if default_dsc and any_per_channel:
+        # Multi-channel routing
+        channels = {"default": WebhookNotifier(url=default_dsc, flavor="discord")}
+        for ch, url in per_channel.items():
+            if url:
+                channels[ch] = WebhookNotifier(url=url, flavor="discord")
+        return MultiChannelNotifier(channels)
+
+    if default_dsc:
+        return WebhookNotifier(url=default_dsc, flavor="discord")
     if slk:
         return WebhookNotifier(url=slk, flavor="slack")
     return NullNotifier()
+
+
+# ------------------------------------------------------------- routing
+# Maps event titles to a channel name. Matching is case-insensitive on
+# the title keyword. First match wins. Unmatched → "default".
+_TITLE_TO_CHANNEL = {
+    "trades":      {"entry", "exit"},
+    "catalysts":   {"catalysts", "catalyst"},
+    "alerts":      {"halt", "shutdown", "watchdog",
+                     "news block", "reconcile"},
+    "calibration": {"calibration"},
+}
+
+
+class MultiChannelNotifier(Notifier):
+    """Route notify() calls to one of several WebhookNotifiers based on
+    the `title` kwarg. Falls back to the `default` channel for any
+    unrouted title or when the target channel isn't configured.
+
+    Designed for Discord multi-channel setups where you want entry/exit
+    fills in one channel, catalysts in another, and alerts in a third —
+    without flooding a single channel."""
+
+    def __init__(self, channels: dict):
+        """`channels` = {channel_name: Notifier}. Must include key "default"."""
+        assert "default" in channels, "MultiChannelNotifier requires a 'default' channel"
+        self._channels = channels
+
+    def _pick(self, title: str) -> Notifier:
+        t = (title or "").lower().strip()
+        for chan, keywords in _TITLE_TO_CHANNEL.items():
+            if t in keywords and chan in self._channels:
+                return self._channels[chan]
+        return self._channels["default"]
+
+    def notify(self, text: str, *, level: str = "info", title: str = "",
+                meta=None) -> None:
+        self._pick(title).notify(text, level=level, title=title, meta=meta)
+
+    def close(self) -> None:
+        """Close every underlying WebhookNotifier's queue."""
+        for n in self._channels.values():
+            if hasattr(n, "close"):
+                try:
+                    n.close()
+                except Exception:
+                    pass

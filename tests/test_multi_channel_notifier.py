@@ -1,0 +1,109 @@
+"""Ensure multi-channel routing sends each title to the right webhook.
+
+Locks in the operator-requested behavior: entry/exit → TRADES channel,
+catalysts → CATALYSTS channel, HALT/watchdog → ALERTS channel,
+everything else → default.
+"""
+from __future__ import annotations
+
+from src.notify.base import MultiChannelNotifier, Notifier
+
+
+class _CapturingNotifier(Notifier):
+    """Records every notify() call instead of sending HTTP."""
+    def __init__(self, name: str):
+        self.name = name
+        self.calls = []
+
+    def notify(self, text, *, level="info", title="", meta=None):
+        self.calls.append((title, text, level, meta))
+
+
+def _build(includes=("default", "trades", "catalysts", "alerts", "calibration")):
+    """Return a MultiChannelNotifier with only the named channels present."""
+    channels = {name: _CapturingNotifier(name) for name in includes}
+    return MultiChannelNotifier(channels), channels
+
+
+# ---------- routing ----------
+def test_entry_goes_to_trades_channel():
+    mc, chans = _build()
+    mc.notify("BUY 3 × CALL NVDA", title="entry")
+    assert len(chans["trades"].calls) == 1
+    assert chans["trades"].calls[0][0] == "entry"
+    # default stayed empty
+    assert not chans["default"].calls
+
+
+def test_exit_goes_to_trades_channel():
+    mc, chans = _build()
+    mc.notify("CLOSE 3 × CALL NVDA → +30%", title="exit")
+    assert len(chans["trades"].calls) == 1
+
+
+def test_catalysts_goes_to_catalysts_channel():
+    mc, chans = _build()
+    mc.notify("12 catalysts", title="catalysts")
+    assert len(chans["catalysts"].calls) == 1
+    assert not chans["trades"].calls
+
+
+def test_halt_goes_to_alerts_channel():
+    mc, chans = _build()
+    mc.notify("Daily loss breach", title="HALT", level="error")
+    assert len(chans["alerts"].calls) == 1
+
+
+def test_watchdog_goes_to_alerts_channel():
+    mc, chans = _build()
+    mc.notify("tradebot CRASHED rc=1", title="watchdog", level="error")
+    assert len(chans["alerts"].calls) == 1
+
+
+def test_calibration_goes_to_calibration_channel():
+    mc, chans = _build()
+    mc.notify("ratio=1.67 adjusted 2 constants", title="calibration")
+    assert len(chans["calibration"].calls) == 1
+
+
+def test_reconcile_goes_to_alerts_channel():
+    mc, chans = _build()
+    mc.notify("Closed 3 zombies on Alpaca", title="reconcile")
+    assert len(chans["alerts"].calls) == 1
+
+
+def test_unknown_title_falls_back_to_default():
+    mc, chans = _build()
+    mc.notify("some random event", title="something_weird")
+    assert len(chans["default"].calls) == 1
+    assert not chans["trades"].calls
+
+
+def test_missing_channel_falls_back_to_default():
+    """If we're configured without the trades channel, entry/exit routes
+    to default instead of disappearing."""
+    mc, chans = _build(includes=("default",))  # only default configured
+    mc.notify("BUY CALL NVDA", title="entry")
+    # entry would normally go to trades — but trades isn't configured,
+    # so falls through to default
+    assert len(chans["default"].calls) == 1
+
+
+def test_close_method_closes_all_underlying():
+    """Ensure close() propagates to every subchannel."""
+    closed = []
+
+    class _Closeable(Notifier):
+        def __init__(self, name):
+            self.name = name
+        def notify(self, text, *, level="info", title="", meta=None):
+            pass
+        def close(self):
+            closed.append(self.name)
+
+    mc = MultiChannelNotifier({
+        "default": _Closeable("default"),
+        "trades":  _Closeable("trades"),
+    })
+    mc.close()
+    assert set(closed) == {"default", "trades"}
