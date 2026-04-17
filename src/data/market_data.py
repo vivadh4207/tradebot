@@ -37,10 +37,49 @@ class MarketDataAdapter(abc.ABC):
         return bars[-1].close if bars else None
 
 
-class SyntheticDataAdapter(MarketDataAdapter):
-    """Deterministic GBM-ish bar generator. Used by backtests + dry runs.
+# Realistic per-symbol starting prices so the synthetic fallback produces
+# sensible spots when Alpaca is unreachable. Values approximate 2026 mid-year
+# closes; updated when the universe changes. Missing symbols fall through to
+# a hash-derived default so we don't concentrate everything at $500.
+_SYMBOL_START_PRICE: Dict[str, float] = {
+    # Index + broad-market ETFs
+    "SPY": 560.0, "QQQ": 490.0, "IWM": 225.0, "DIA": 445.0,
+    "VOO": 510.0, "VTI": 280.0, "IVV": 560.0,
+    # Sector SPDRs
+    "XLF": 48.0, "XLE": 95.0, "XLK": 230.0, "XLV": 150.0,
+    "XLY": 205.0, "XLC": 95.0, "XLI": 140.0, "XLB": 95.0,
+    "XLU": 78.0, "XLP": 80.0, "XBI": 96.0, "XHE": 120.0,
+    "XME": 70.0, "XRT": 80.0, "XSD": 265.0, "XOP": 150.0,
+    "XHB": 115.0, "XUR": 48.0,
+    # Mega-cap tech
+    "AAPL": 230.0, "MSFT": 440.0, "NVDA": 900.0, "GOOGL": 180.0,
+    "META": 570.0, "AMZN": 195.0, "TSLA": 260.0,
+    # Other single names (rough 2026 estimates)
+    "AAOI": 40.0, "AMD": 170.0, "APLD": 12.0, "INTC": 22.0,
+    "AVGO": 1700.0, "ASML": 950.0, "LRCX": 900.0, "MU": 120.0,
+    "TSM": 205.0, "BABA": 90.0, "BIDU": 95.0, "PDD": 140.0,
+    "JD": 35.0, "SHOP": 105.0, "CRM": 310.0, "ORCL": 160.0,
+    "IBM": 225.0, "CSCO": 55.0, "NFLX": 720.0, "DIS": 105.0,
+    "BAC": 45.0, "JPM": 240.0, "WFC": 70.0, "C": 75.0,
+    "GS": 520.0, "MS": 115.0, "VZ": 42.0, "T": 22.0,
+    "V": 305.0, "MA": 510.0, "PYPL": 72.0, "ADBE": 480.0,
+    "NOW": 970.0, "ZM": 80.0, "DOCU": 70.0, "TWLO": 80.0,
+    "UBER": 78.0, "LYFT": 15.0, "ABNB": 150.0, "BKNG": 5000.0,
+    "EXPE": 190.0, "MAR": 280.0, "RCL": 245.0, "CCL": 25.0,
+    "NCLH": 22.0, "DAL": 55.0, "LUV": 32.0, "AAL": 13.0,
+    "UAL": 85.0, "AXP": 290.0, "HOOD": 48.0,
+}
 
-    No network required. Reproducible via seed per symbol.
+
+class SyntheticDataAdapter(MarketDataAdapter):
+    """Deterministic GBM-ish bar generator. Used by backtests + dry runs,
+    and as the fallback when AlpacaDataAdapter can't reach the network.
+
+    Per-symbol starting prices come from _SYMBOL_START_PRICE so every
+    ticker ends up in the right order of magnitude. Missing symbols fall
+    through to a hash-derived default. Without this, every symbol
+    drifted near the same 500.0 default and the bot thought NFLX and
+    LUV both traded at $500 — broke strike selection completely.
     """
 
     def __init__(self, seed: int = 42, annualized_vol: float = 0.20,
@@ -48,8 +87,18 @@ class SyntheticDataAdapter(MarketDataAdapter):
         self._seed = seed
         self._vol = annualized_vol
         self._drift = drift
-        self._start_price = start_price
+        self._default_start_price = start_price
         self._cache: Dict[str, List[Bar]] = {}
+
+    def _start_for(self, symbol: str) -> float:
+        sym = (symbol or "").upper()
+        mapped = _SYMBOL_START_PRICE.get(sym)
+        if mapped is not None:
+            return mapped
+        # Hash-derived fallback: spread unknown symbols across [$20, $200]
+        # deterministically so they don't all collide near the default.
+        h = sum(ord(c) for c in sym) % 180
+        return 20.0 + float(h)
 
     def _symbol_seed(self, symbol: str) -> int:
         return self._seed + (sum(ord(c) for c in symbol) % 1000)
@@ -69,7 +118,8 @@ class SyntheticDataAdapter(MarketDataAdapter):
         n = max(limit, 200)
         shocks = rng.standard_normal(n)
         log_returns = mu_step + sigma_step * shocks
-        prices = self._start_price * np.exp(np.cumsum(log_returns))
+        # Per-symbol realistic starting price (not a flat 500 default).
+        prices = self._start_for(symbol) * np.exp(np.cumsum(log_returns))
 
         end = end or datetime.now(tz=ET)
         bars: List[Bar] = []
@@ -125,6 +175,10 @@ class AlpacaDataAdapter(MarketDataAdapter):
                  timeframe_minutes: int = 1,
                  end: Optional[datetime] = None) -> List[Bar]:
         if not self._client:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "alpaca_bars_no_client_falling_back symbol=%s", symbol
+            )
             return self._fallback.get_bars(symbol, limit=limit,
                                            timeframe_minutes=timeframe_minutes, end=end)
         try:
@@ -137,6 +191,16 @@ class AlpacaDataAdapter(MarketDataAdapter):
                                    start=start, end=end, limit=limit)
             resp = self._client.get_stock_bars(req)
             bars_raw = resp.data.get(symbol, []) if hasattr(resp, "data") else []
+            if not bars_raw:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "alpaca_bars_empty_falling_back symbol=%s start=%s end=%s "
+                    "(usually means: market data subscription missing, outside "
+                    "RTH for this symbol, or symbol not covered by IEX feed)",
+                    symbol, start, end,
+                )
+                return self._fallback.get_bars(symbol, limit=limit,
+                                               timeframe_minutes=timeframe_minutes, end=end)
             out: List[Bar] = []
             for b in bars_raw:
                 out.append(Bar(
@@ -147,7 +211,11 @@ class AlpacaDataAdapter(MarketDataAdapter):
                     vwap=float(getattr(b, "vwap", 0.0)) or None,
                 ))
             return out[-limit:]
-        except Exception:
+        except Exception as e:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "alpaca_bars_error_falling_back symbol=%s err=%s", symbol, e,
+            )
             return self._fallback.get_bars(symbol, limit=limit,
                                            timeframe_minutes=timeframe_minutes, end=end)
 

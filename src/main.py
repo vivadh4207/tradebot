@@ -860,15 +860,18 @@ class TradeBot:
                 self.s.get("execution.max_strike_dist_pct", 0.05)
             ),
         )
-        # Reject only when we have HARD evidence of illiquidity. The
-        # Alpaca snapshot endpoint frequently omits OI/volume — treating
-        # all-zero as "definitely illiquid" would refuse every trade.
-        # Concrete illiquid signals we DO enforce:
-        #   - no contract at all
-        #   - zero bid OR zero ask (stale / no market)
-        #   - partial OI/vol data that fails the min floor when ONE of
-        #     them is non-zero (i.e. provider is reporting it and it's
-        #     genuinely low)
+        # Reject only when we have HARD evidence of an unusable contract.
+        # Three concrete reject cases:
+        #   (a) no contract, or zero bid/ask — stale / no market
+        #   (b) partial OI/vol data that fails the floor when one side
+        #       is non-zero (provider IS reporting, and it's genuinely low)
+        #   (c) strike distance > max_strike_dist_pct — tier-3 fallback
+        #       inside find_atm_liquid may return a far strike when
+        #       neither liquid nor quote-only tiers found anything
+        #       within the distance cap. For a tiny account this shows
+        #       up as deep-ITM puts that cost $100+/share — Kelly can't
+        #       afford them, everything sizes to zero, nothing trades.
+        max_dist = float(self.s.get("execution.max_strike_dist_pct", 0.05))
         if contract is None or contract.bid <= 0 or contract.ask <= 0:
             log.info(
                 "entry_skip_no_liquid_strike",
@@ -877,6 +880,18 @@ class TradeBot:
                 picked_oi=(contract.open_interest if contract else None),
                 picked_vol=(contract.today_volume if contract else None),
                 reason="no_bid_ask",
+            )
+            return
+        # Enforce distance cap universally (was only enforced inside the
+        # liquid/quote-only tiers, not the tier-3 fallback).
+        strike_dist = abs(contract.strike - spot) / max(spot, 1e-9)
+        if strike_dist > max_dist:
+            log.info(
+                "entry_skip_strike_too_far",
+                symbol=sig.symbol, source=sig.source, right=right.value,
+                picked_strike=contract.strike, spot=round(spot, 2),
+                dist_pct=round(strike_dist * 100, 2),
+                max_pct=round(max_dist * 100, 2),
             )
             return
         partial = contract.open_interest > 0 or contract.today_volume > 0
@@ -891,10 +906,6 @@ class TradeBot:
                 reason="below_min_liquidity",
             )
             return
-        # If we got here with OI=0 AND vol=0, liquidity is unknown
-        # (provider didn't populate). Log it so operators can see what
-        # assumptions the bot is making; still proceed with the trade
-        # since bid/ask are real.
         if not partial:
             log.info(
                 "entry_liquidity_unknown",

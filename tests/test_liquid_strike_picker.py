@@ -142,6 +142,37 @@ def test_tier1_still_beats_tier2_when_both_available():
     assert picked.strike == 103.0  # tier-1 wins, closer tier-2 loses
 
 
+def test_tier3_nearest_still_subject_to_caller_distance_check():
+    """Tier-3 fallback in find_atm_liquid is `find_atm`, which has NO
+    distance cap. A thin chain where the closest strike is 50% from spot
+    will be returned by tier-3. Caller (main.py _try_enter) must reject
+    when `abs(strike - spot)/spot > max_strike_dist_pct`, else the bot
+    buys deep-ITM puts that cost $100+/share and Kelly sizes to zero.
+
+    This test documents that tier-3 does NOT enforce distance; the
+    caller is responsible for the final guard (covered by the
+    entry_skip_strike_too_far log path in main.py)."""
+    spot = 100.0
+    chain = [
+        # Every contract is deep ITM or OTM — closest is 155 strike
+        _mk("T_155", 155.0, OptionRight.PUT, oi=100, vol=20, bid=55.0, ask=57.0),
+        _mk("T_160", 160.0, OptionRight.PUT, oi=100, vol=20, bid=60.0, ask=62.0),
+    ]
+    picked = SyntheticOptionsChain.find_atm_liquid(
+        chain, spot, OptionRight.PUT,
+        min_oi=500, min_today_volume=100,
+        max_strike_dist_pct=0.05,
+    )
+    # Tier-3 returns SOMETHING — callers must enforce distance themselves
+    assert picked is not None
+    # The returned strike is outside 5% distance — caller will reject
+    dist_pct = abs(picked.strike - spot) / spot
+    assert dist_pct > 0.05, (
+        f"expected thin-chain picks to land outside the 5% cap; got "
+        f"dist={dist_pct:.1%}"
+    )
+
+
 def test_only_considers_correct_right():
     spot = 100.0
     chain = [
