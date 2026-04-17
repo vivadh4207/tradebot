@@ -72,33 +72,13 @@ class VixProbe:
 
     @staticmethod
     def _try_alpaca() -> Optional[float]:
-        key = os.getenv("ALPACA_API_KEY_ID", "").strip()
-        secret = os.getenv("ALPACA_API_SECRET_KEY", "").strip()
-        if not (key and secret) or key.startswith("your_"):
-            return None
-        try:
-            from alpaca.data.historical import StockHistoricalDataClient
-            from alpaca.data.requests import StockLatestQuoteRequest
-            client = StockHistoricalDataClient(key, secret)
-            # Alpaca surfaces VIX under ^VIX via some feeds; try VIX plain too.
-            for sym in ("^VIX", "VIX"):
-                try:
-                    resp = client.get_stock_latest_quote(
-                        StockLatestQuoteRequest(symbol_or_symbols=sym)
-                    )
-                    q = resp.get(sym) if isinstance(resp, dict) else None
-                    if q is None:
-                        continue
-                    bid = float(getattr(q, "bid_price", 0) or 0)
-                    ask = float(getattr(q, "ask_price", 0) or 0)
-                    mid = (bid + ask) / 2 if (bid > 0 and ask > 0) else max(bid, ask)
-                    if mid > 0:
-                        return mid
-                except Exception:
-                    continue
-            return None
-        except Exception:
-            return None
+        # NOTE: Alpaca's stock data endpoint does NOT serve `^VIX` (an index,
+        # not a stock). Their `/v1beta1/indicators/vix` endpoint exists but is
+        # not exposed by alpaca-py's current SDK surface. Leaving this as a
+        # deliberate no-op keeps the source-order explicit: Alpaca → yfinance
+        # → fallback, where Alpaca is expected to miss for VIX specifically.
+        # If Alpaca later ships an index-quote SDK method, wire it here.
+        return None
 
     @staticmethod
     def _try_yfinance() -> Optional[float]:

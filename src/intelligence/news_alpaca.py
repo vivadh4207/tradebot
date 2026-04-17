@@ -23,7 +23,11 @@ class AlpacaNewsProvider(NewsProvider):
         try:
             from alpaca.data.historical.news import NewsClient
             self._client = NewsClient(api_key, api_secret)
-        except Exception:
+        except Exception as _e:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "alpaca_news_client_init_failed: %s", _e
+            )
             self._client = None
 
     def fetch(self, symbol: str) -> List[NewsItem]:
@@ -37,7 +41,11 @@ class AlpacaNewsProvider(NewsProvider):
                 limit=self._page_limit, include_content=False,
             )
             resp = self._client.get_news(req)
-        except Exception:
+        except Exception as _e:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "alpaca_news_fetch_failed symbol=%s err=%s", symbol, _e
+            )
             return []
 
         # alpaca-py returns a NewsSet-like object with .data or a list

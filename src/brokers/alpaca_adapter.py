@@ -5,13 +5,77 @@ are missing. Paper endpoint is default.
 
 GUARDRAIL: requires settings.live_trading == True to route anything other
 than paper orders. This is checked one level up in the orchestrator.
+
+Every network call is wrapped in exponential-backoff retry so that
+transient Alpaca 429 / 5xx responses don't kill the main loop. After the
+max retry budget we log and surface the error to the caller.
 """
 from __future__ import annotations
 
-from typing import List, Optional
+import logging
+import random
+import time
+from typing import Any, Callable, List, Optional
 
 from ..core.types import Order, Fill, Position, Side
 from .base import BrokerAdapter, AccountState
+
+
+_log = logging.getLogger(__name__)
+
+# Retry tuning. Alpaca defaults to ~200 req/min; conservative backoff here.
+_RETRY_MAX_ATTEMPTS = 5
+_RETRY_BASE_DELAY = 1.0   # seconds
+_RETRY_MAX_DELAY = 30.0
+
+
+def _is_retriable(exc: BaseException) -> bool:
+    """Decide whether an Alpaca/REST exception is worth retrying.
+
+    Retriable: 429 (rate limit), 5xx, connection errors, timeouts.
+    NOT retriable: 4xx other than 429 (bad request, auth failure, etc.).
+    """
+    # alpaca-py raises APIError subclass with status_code
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        msg = str(exc).lower()
+        if any(x in msg for x in ("timeout", "connection", "reset by peer",
+                                   "429", "service unavailable", "bad gateway")):
+            return True
+        return False
+    try:
+        status = int(status)
+    except Exception:
+        return False
+    if status == 429:
+        return True
+    if 500 <= status < 600:
+        return True
+    return False
+
+
+def _with_retry(fn: Callable[[], Any], *, op: str,
+                 max_attempts: int = _RETRY_MAX_ATTEMPTS) -> Any:
+    """Exponential-backoff wrapper with full jitter."""
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn()
+        except Exception as e:                           # noqa: BLE001
+            last_exc = e
+            if not _is_retriable(e) or attempt == max_attempts:
+                _log.warning("alpaca_%s_failed_final attempt=%d err=%s",
+                              op, attempt, e)
+                raise
+            delay = min(_RETRY_MAX_DELAY, _RETRY_BASE_DELAY * (2 ** (attempt - 1)))
+            delay *= random.uniform(0.5, 1.5)           # full jitter
+            _log.info("alpaca_%s_retry attempt=%d delay=%.1fs err=%s",
+                      op, attempt, delay, e)
+            time.sleep(delay)
+    # should not reach here, but defensively re-raise
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("alpaca_retry_unreachable")
 
 
 class AlpacaBroker(BrokerAdapter):
@@ -27,27 +91,32 @@ class AlpacaBroker(BrokerAdapter):
         self._paper = paper
 
     def account(self) -> AccountState:
-        a = self._client.get_account()
-        return AccountState(
-            equity=float(a.equity),
-            cash=float(a.cash),
-            buying_power=float(a.buying_power),
-            day_pnl=float(getattr(a, "day_pnl", 0.0) or 0.0),
-            total_pnl=0.0,
-        )
+        def _call():
+            a = self._client.get_account()
+            return AccountState(
+                equity=float(a.equity),
+                cash=float(a.cash),
+                buying_power=float(a.buying_power),
+                day_pnl=float(getattr(a, "day_pnl", 0.0) or 0.0),
+                total_pnl=0.0,
+            )
+        return _with_retry(_call, op="account")
 
     def positions(self) -> List[Position]:
         from ..core.types import Position as Pos
-        out: List[Position] = []
-        for p in self._client.get_all_positions():
-            out.append(Pos(
-                symbol=p.symbol,
-                qty=int(float(p.qty)),
-                avg_price=float(p.avg_entry_price),
-                is_option=False,  # alpaca options are a separate feed
-                multiplier=1,
-            ))
-        return out
+
+        def _call():
+            out: List[Position] = []
+            for p in self._client.get_all_positions():
+                out.append(Pos(
+                    symbol=p.symbol,
+                    qty=int(float(p.qty)),
+                    avg_price=float(p.avg_entry_price),
+                    is_option=False,  # alpaca options are a separate feed
+                    multiplier=1,
+                ))
+            return out
+        return _with_retry(_call, op="positions")
 
     def submit(self, order: Order) -> Optional[Fill]:
         from alpaca.trading.requests import LimitOrderRequest
@@ -62,11 +131,20 @@ class AlpacaBroker(BrokerAdapter):
             side=side, time_in_force=tif,
             limit_price=float(order.limit_price or 0),
         )
-        self._client.submit_order(req)
+
+        def _call():
+            self._client.submit_order(req)
+
+        _with_retry(_call, op="submit")
         return None  # rely on webhook/poll for fills
 
     def cancel_all(self) -> None:
-        self._client.cancel_orders()
+        _with_retry(lambda: self._client.cancel_orders(), op="cancel_all")
 
-    def flatten_all(self) -> None:
-        self._client.close_all_positions(cancel_orders=True)
+    def flatten_all(self, mark_prices=None) -> None:
+        # `mark_prices` accepted for adapter-interface compatibility but
+        # unused here — Alpaca closes at market on its side.
+        _with_retry(
+            lambda: self._client.close_all_positions(cancel_orders=True),
+            op="flatten_all",
+        )

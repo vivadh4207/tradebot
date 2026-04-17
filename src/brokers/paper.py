@@ -8,6 +8,7 @@ round-trip is persisted (SQLite by default, CockroachDB when wired).
 """
 from __future__ import annotations
 
+import threading
 from typing import Dict, List, Optional
 from datetime import datetime, timezone
 
@@ -30,15 +31,19 @@ class PaperBroker(BrokerAdapter):
         self._comm_share = commission_per_share
         self._positions: Dict[str, Position] = {}
         self._journal = journal                    # optional TradeJournal
+        # RLock so the same thread can re-enter (e.g. submit() → _apply() → journal callbacks)
+        self._lock = threading.RLock()
 
     # --- adapter interface ---
     def account(self) -> AccountState:
-        return AccountState(equity=self._equity, cash=self._cash,
-                            buying_power=max(self._cash, 0.0),
-                            day_pnl=self._day_pnl, total_pnl=self._total_pnl)
+        with self._lock:
+            return AccountState(equity=self._equity, cash=self._cash,
+                                buying_power=max(self._cash, 0.0),
+                                day_pnl=self._day_pnl, total_pnl=self._total_pnl)
 
     def positions(self) -> List[Position]:
-        return list(self._positions.values())
+        with self._lock:
+            return list(self._positions.values())
 
     def submit(self, order: Order) -> Optional[Fill]:
         if order.limit_price is None:
@@ -47,20 +52,33 @@ class PaperBroker(BrokerAdapter):
         fill_price = order.limit_price + (slip if order.side == Side.BUY else -slip)
         fee = (self._comm_option if order.is_option else self._comm_share) * order.qty
         fill = Fill(order=order, price=fill_price, qty=order.qty, fee=fee)
-        self._apply(fill)
+        with self._lock:
+            self._apply(fill)
+        # Journal writes happen OUTSIDE the lock to avoid blocking the fast-exit
+        # loop on slow DB I/O. The fill object is immutable at this point so
+        # there's no data race even across threads.
         self._log_fill(fill)
         return fill
 
     def cancel_all(self) -> None:
         return
 
-    def flatten_all(self) -> None:
-        for sym, pos in list(self._positions.items()):
+    def flatten_all(self, mark_prices: Optional[Dict[str, float]] = None) -> None:
+        """Close every open position. Uses `mark_prices[symbol]` if provided,
+        else falls back to avg_price (zero-slippage close).
+
+        Thread-safe: snapshots positions atomically, then submits sequentially.
+        """
+        mark_prices = mark_prices or {}
+        with self._lock:
+            snap = list(self._positions.items())
+        for sym, pos in snap:
             side = Side.SELL if pos.qty > 0 else Side.BUY
+            px = float(mark_prices.get(sym, pos.avg_price))
             closing = Order(
                 symbol=sym, side=side, qty=abs(pos.qty),
                 is_option=pos.is_option,
-                limit_price=pos.avg_price, tif="IOC", tag="eod_force_close",
+                limit_price=px, tif="IOC", tag="eod_force_close",
             )
             self.submit(closing)
 
@@ -141,19 +159,21 @@ class PaperBroker(BrokerAdapter):
             pass
 
     def mark_to_market(self, prices: Dict[str, float]) -> None:
-        unreal = 0.0
-        for sym, pos in self._positions.items():
-            p = prices.get(sym, pos.avg_price)
-            unreal += pos.qty * (p - pos.avg_price) * pos.multiplier
-        self._equity = self._cash + unreal
+        with self._lock:
+            unreal = 0.0
+            for sym, pos in self._positions.items():
+                p = prices.get(sym, pos.avg_price)
+                unreal += pos.qty * (p - pos.avg_price) * pos.multiplier
+            self._equity = self._cash + unreal
+            eq, cash, day = self._equity, self._cash, self._day_pnl
         if self._journal is not None:
             try:
                 self._journal.record_equity(
-                    datetime.now(tz=timezone.utc),
-                    self._equity, self._cash, self._day_pnl,
+                    datetime.now(tz=timezone.utc), eq, cash, day,
                 )
             except Exception:
                 pass
 
     def reset_day(self) -> None:
-        self._day_pnl = 0.0
+        with self._lock:
+            self._day_pnl = 0.0

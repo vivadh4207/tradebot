@@ -12,6 +12,12 @@
 Description=tradebot paper loop
 After=network-online.target
 Wants=network-online.target
+# Stop restarting after 3 crashes in 60s so we don't hammer the broker /
+# scramble the journal. After this limit systemd leaves the unit failed
+# and you investigate manually.
+StartLimitBurst=3
+StartLimitIntervalSec=60
+StartLimitAction=none
 
 [Service]
 Type=simple
@@ -21,6 +27,9 @@ WorkingDirectory=/opt/tradebot
 EnvironmentFile=/opt/tradebot/.env
 Environment=TZ=America/New_York
 ExecStart=/opt/tradebot/.venv/bin/python scripts/run_paper.py
+# Give the bot up to 30s to flatten + flush journal on SIGTERM before SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=30
 Restart=on-failure
 RestartSec=10
 StandardOutput=append:/opt/tradebot/logs/tradebot.out

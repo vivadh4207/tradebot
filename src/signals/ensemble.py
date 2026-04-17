@@ -112,16 +112,21 @@ class EnsembleCoordinator:
         contribs: List[Contribution] = []
         by_direction: Dict[str, List[Tuple[Signal, float]]] = defaultdict(list)
 
+        directionless = 0
         for sig in signals:
             direction = str(sig.meta.get("direction", "")).strip()
-            if not direction:
-                continue
             w = float(reg_weights.get(sig.source, 1.0))
-            weighted = sig.confidence * w
+            # Record every signal as a contribution for observability, even
+            # those without a usable direction. Only directed ones contribute
+            # to by_direction scoring.
             contribs.append(Contribution(
-                source=sig.source, direction=direction,
+                source=sig.source, direction=direction or "(none)",
                 raw_confidence=float(sig.confidence), weight=w,
             ))
+            if not direction:
+                directionless += 1
+                continue
+            weighted = sig.confidence * w
             by_direction[direction].append((sig, weighted))
 
         if not by_direction:

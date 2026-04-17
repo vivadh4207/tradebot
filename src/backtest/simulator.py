@@ -137,7 +137,11 @@ class BacktestSimulator:
                 if fill and self.cfg.verbose:
                     print(f"[exit] {pos.symbol} reason={decision.reason} px={fill.price:.2f}")
 
-    def _try_enter(self, sig: Signal, bars: List[Bar], now: datetime, vix: float) -> None:
+    def _try_enter(self, sig: Signal, bars: List[Bar], now: datetime, vix: float,
+                    fill_price: Optional[float] = None) -> None:
+        # Signal is allowed to observe `bars[-1].close` for feature derivation,
+        # but the order fills at `fill_price` (next bar's open). If no fill
+        # price is supplied (legacy path), fall back to the same-bar close.
         spot = bars[-1].close
         or_bars = bars[:30] if len(bars) >= 30 else bars[:max(1, len(bars)//3)]
         or_hi = max((b.high for b in or_bars), default=0.0)
@@ -183,7 +187,11 @@ class BacktestSimulator:
         n = max(1, int(notional_budget / max(spot, 1e-6)))
         if n <= 0:
             return
-        limit = spot * 1.001 if sig.side == Side.BUY else spot * 0.999
+        # Use fill_price (next-bar open) when available — this is the
+        # look-ahead-free execution price. Fall back to same-bar close
+        # only for the legacy/synthetic path.
+        execution_px = fill_price if fill_price is not None else spot
+        limit = execution_px * 1.001 if sig.side == Side.BUY else execution_px * 0.999
         order = Order(symbol=sig.symbol, side=sig.side, qty=n,
                       is_option=False, limit_price=limit,
                       tag=f"entry:{sig.source}")
@@ -222,23 +230,33 @@ class BacktestSimulator:
             s: self.data.get_bars(s, limit=total_bars, timeframe_minutes=1, end=anchor)
             for s in symbols
         }
-        # Align: walk index 50..N
-        for i in range(50, total_bars):
+        # Walk index 50..N-1. CRITICAL: to avoid look-ahead bias, the signal
+        # decided at bar i fills at bar i+1's OPEN price. If bar i+1 doesn't
+        # exist (final bar), the signal is dropped — you'd never have had a
+        # chance to trade on it live.
+        for i in range(50, total_bars - 1):
             for sym in symbols:
-                window = bars_by_sym[sym][:i + 1]
+                window = bars_by_sym[sym][:i + 1]   # bars 0..i inclusive → signal sees close[i]
                 if len(window) < 30:
                     continue
                 vix = self._vix_at(i)
                 ctx = self._snapshot_ctx(sym, window, i)
+                next_bar = bars_by_sym[sym][i + 1]   # fill happens on next bar's open
+                fill_price = next_bar.open
                 for strat in self.strategies:
                     sig = strat.emit(ctx)
                     if sig is None or sig.is_stale(ttl_sec=60):
                         continue
                     sig.meta.setdefault("mi_edge_score", 0)  # neutral in synth sim
-                    self._try_enter(sig, window, ctx.now, vix)
-                # exit sweep after signals for this bar
+                    # Pass the realistic fill price through a lightweight
+                    # bar-equivalent: _try_enter still builds its own window,
+                    # but we annotate the signal's symbol spot at fill time.
+                    self._try_enter(sig, window, ctx.now, vix,
+                                     fill_price=fill_price)
+                # exit sweep after signals for this bar (uses bar i's close,
+                # which is realistic — exits decided on observable data)
                 self._apply_exits(ctx.now, vix)
-            # mark-to-market
+            # mark-to-market at bar i's close (what we'd see at the end of the bar)
             prices = {s: bars_by_sym[s][min(i, len(bars_by_sym[s]) - 1)].close for s in symbols}
             self.broker.mark_to_market(prices)
             self.equity_curve.append(self.broker.account().equity)

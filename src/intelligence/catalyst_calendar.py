@@ -62,7 +62,11 @@ class StaticCatalystProvider(CatalystProvider):
         try:
             import yaml
             data = yaml.safe_load(self._path.read_text()) or {}
-        except Exception:
+        except Exception as _e:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "static_catalyst_parse_failed path=%s err=%s", self._path, _e
+            )
             return []
         wanted = {s.upper() for s in symbols}
         out: List[CatalystEvent] = []

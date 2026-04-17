@@ -57,8 +57,21 @@ class PortfolioRiskManager:
             return False, "portfolio_gamma_limit"
         if abs(g["vega"]) > self.max_vega:
             return False, "portfolio_vega_limit"
+        # Theta: `max_theta` is a negative floor (e.g. -500 $/day). We block
+        # when the portfolio's daily theta is more negative than this floor.
+        # abs(theta) lets us catch any direction that exceeds the magnitude.
         if g["theta"] < self.max_theta:
             return False, "portfolio_theta_bleed"
+        # Notional check — previously unused. Sum of option notional
+        # (qty × price × 100) + equity notional must stay under pct × equity.
+        notional = 0.0
+        for p in combined:
+            if p.is_option:
+                notional += abs(p.qty) * max(p.avg_price, 0.0) * p.multiplier
+            else:
+                notional += abs(p.qty) * spot
+        if notional > self.max_notional_pct * equity and equity > 0:
+            return False, f"portfolio_notional_limit: {notional:.2f}>{self.max_notional_pct * equity:.2f}"
         return True, "ok"
 
     def stress(self, positions: List[Position], spot: float,

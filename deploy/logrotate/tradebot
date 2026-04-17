@@ -1,0 +1,33 @@
+# Drop this into /etc/logrotate.d/tradebot on Linux hosts running the bot
+# under systemd with StandardOutput=append:/.../tradebot.out.
+#
+# Rotates daily, keeps 14 days, compresses, truncates in-place so the open
+# fd stays valid. Does NOT reload systemd (no signal needed — append mode
+# with `copytruncate` survives).
+/home/orin/tradebot/logs/tradebot.out
+/home/orin/tradebot/logs/tradebot.err
+/opt/tradebot/logs/tradebot.out
+/opt/tradebot/logs/tradebot.err
+{
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su root root
+    create 0640 root root
+}
+
+/home/orin/tradebot/logs/dashboard.out
+/home/orin/tradebot/logs/dashboard.err
+{
+    daily
+    rotate 7
+    compress
+    missingok
+    notifempty
+    copytruncate
+    su root root
+}

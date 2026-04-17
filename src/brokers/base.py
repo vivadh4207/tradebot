@@ -34,5 +34,10 @@ class BrokerAdapter(abc.ABC):
     def cancel_all(self) -> None: ...
 
     @abc.abstractmethod
-    def flatten_all(self) -> None:
-        """Force-close all open positions (EOD sweep)."""
+    def flatten_all(self, mark_prices: Optional[dict] = None) -> None:
+        """Force-close all open positions (EOD sweep).
+
+        `mark_prices` is an optional {symbol: price} hint used by simulated
+        brokers to close at the last observed price. Live brokers ignore it
+        and close at market.
+        """

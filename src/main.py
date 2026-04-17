@@ -226,7 +226,17 @@ class TradeBot:
 
     def fast_loop(self) -> None:
         interval = float(self.s.get("exits.fast_thread_interval_sec", 5))
+        kill_file = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "KILL",
+        )
         while not self._stop.is_set():
+            # Cooperative kill check — needs to be here too, not just main_loop.
+            # At a 5s cadence we react within ~5s even if main_loop is blocked.
+            if os.path.exists(kill_file):
+                log.warning("kill_switch_seen_fast", path=kill_file)
+                self._stop.set()
+                break
             try:
                 for pos in list(self.broker.positions()):
                     price = self.data.latest_price(pos.underlying or pos.symbol) or pos.avg_price
@@ -293,12 +303,40 @@ class TradeBot:
         # Only post after close to avoid spamming between ticks pre-open
         if not self.clock.should_eod_force_close(now):
             return
+        # 1. Force-close any open positions using the most recent bar close for
+        #    each symbol — avoids the zero-slippage `avg_price` close.
+        open_before = list(self.broker.positions())
+        if open_before:
+            log.info("eod_flatten_start", n=len(open_before))
+            mark_prices = {}
+            for p in open_before:
+                underlying = p.underlying or p.symbol
+                last = self.data.latest_price(underlying)
+                if last is not None:
+                    mark_prices[p.symbol] = last
+            try:
+                self.broker.flatten_all(mark_prices=mark_prices)
+            except Exception as e:                 # noqa: BLE001
+                log.error("eod_flatten_error", err=str(e))
+                self.notifier.notify(f"EOD flatten error: {e}",
+                                     level="error", title="HALT")
+            # Verify
+            remaining = self.broker.positions()
+            if remaining:
+                log.error("eod_flatten_incomplete",
+                          remaining=[p.symbol for p in remaining])
+                self.notifier.notify(
+                    f"EOD flatten INCOMPLETE — {len(remaining)} positions "
+                    f"remain. Reconcile manually.",
+                    level="error", title="HALT",
+                )
+
+        # 2. Emit summary
         acct = self.broker.account()
-        open_pos = len(self.broker.positions())
         self.notifier.notify(
             f"EOD {today}: equity={acct.equity:.2f} "
             f"day_pnl={acct.day_pnl:+.2f} total_pnl={acct.total_pnl:+.2f} "
-            f"open_positions={open_pos}",
+            f"flattened={len(open_before)}",
             title="daily",
         )
         self._last_daily_summary_date = today
@@ -462,6 +500,30 @@ class TradeBot:
             log.error("live_trading_blocked_in_main_of_default_build — remove guard explicitly")
             return
         configure_logging("INFO")
+
+        # SIGTERM / SIGINT handler so `systemctl stop` and Ctrl-C give us a
+        # chance to flush the journal and trigger an EOD flatten.
+        import signal as _signal
+
+        def _shutdown(signum, _frame):
+            name = {_signal.SIGTERM: "SIGTERM", _signal.SIGINT: "SIGINT"}.get(
+                signum, f"signal={signum}"
+            )
+            log.warning("shutdown_signal", signal=name)
+            try:
+                self.notifier.notify(f"{name} received — flattening + flushing",
+                                     level="warn", title="shutdown")
+            except Exception:
+                pass
+            self._stop.set()
+
+        try:
+            _signal.signal(_signal.SIGTERM, _shutdown)
+            _signal.signal(_signal.SIGINT, _shutdown)
+        except ValueError:
+            # Not on the main thread (e.g. called from a test runner) — skip.
+            pass
+
         t = threading.Thread(target=self.fast_loop, name="fast_exit", daemon=True)
         t.start()
         try:
@@ -471,6 +533,20 @@ class TradeBot:
         finally:
             self._stop.set()
             t.join(timeout=2)
+            # Best-effort flatten on shutdown — fail-soft so a broken broker
+            # doesn't hang the exit path.
+            try:
+                open_now = list(self.broker.positions())
+                if open_now:
+                    log.warning("shutdown_flatten", n=len(open_now))
+                    mark = {}
+                    for p in open_now:
+                        last = self.data.latest_price(p.underlying or p.symbol)
+                        if last is not None:
+                            mark[p.symbol] = last
+                    self.broker.flatten_all(mark_prices=mark)
+            except Exception as e:                    # noqa: BLE001
+                log.error("shutdown_flatten_error", err=str(e))
 
 
 def main() -> None:

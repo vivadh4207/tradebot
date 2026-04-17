@@ -114,7 +114,11 @@ class AlpacaDataAdapter(MarketDataAdapter):
         try:
             from alpaca.data.historical import StockHistoricalDataClient
             self._client = StockHistoricalDataClient(api_key, api_secret)
-        except Exception:
+        except Exception as _e:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "alpaca_data_client_init_failed: %s", _e
+            )
             self._client = None
 
     def get_bars(self, symbol: str, *, limit: int = 200,

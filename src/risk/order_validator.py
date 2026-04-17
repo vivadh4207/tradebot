@@ -58,11 +58,15 @@ class OrderValidator:
         price = round_option_price(price) if order.is_option else round(price, 2)
         order.limit_price = price
 
-        # budget check: max(buying_power/open_slots, buying_power * max_pct_bp)
+        # Budget check. Intent: per-trade cost must fit within BOTH the per-slot
+        # allocation AND the hard cap on any single position.
+        #   per_slot  = buying_power / open_slots   (fair share if all slots used)
+        #   hard_cap  = buying_power * max_pct_bp   (never more than this on one trade)
+        # Previous version used max() which defeated the hard cap when open_slots=1.
         slots = max(open_slots, 1)
         per_slot = buying_power / slots
         hard_cap = buying_power * self.max_pct_bp
-        budget = max(per_slot, hard_cap)
+        budget = min(per_slot, hard_cap) if slots > 1 else hard_cap
         mul = 100 if order.is_option else 1
         cost = price * order.qty * mul
         if cost > budget:

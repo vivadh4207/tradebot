@@ -35,6 +35,18 @@ class TaggedProfileEvaluator:
         if dte == 0 and now.time() >= time(15, 50):
             return ExitDecision(True, "0dte_time_stop", layer=2)
 
+        # Pin-risk: 0DTE option that's within ~0.25% of its strike at 15:45 ET
+        # can be assigned overnight if we leave it on. Flatten proactively.
+        if (dte == 0 and now.time() >= time(15, 45)
+                and pos.is_option and pos.strike is not None and spot > 0):
+            dist_pct = abs(spot - pos.strike) / spot
+            if dist_pct <= 0.0025:
+                return ExitDecision(
+                    True,
+                    f"pin_risk_0dte:dist={dist_pct:.4f}",
+                    layer=2,
+                )
+
         if dte <= 1 and now.time() >= time(14, 0) and abs(pnl) < flat_pnl_abs_threshold:
             return ExitDecision(True, f"theta_decay_flat_pnl:{pnl:.2%}", layer=2)
 

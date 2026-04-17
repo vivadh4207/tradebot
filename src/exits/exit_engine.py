@@ -62,19 +62,16 @@ class ExitEngine:
         if tagged and tagged.should_close:
             return tagged
 
-        # Layer 3: Auto stops (set at entry on Position.auto_profit_target / auto_stop_loss)
-        if pos.auto_profit_target is not None and pos.auto_stop_loss is not None:
-            if pos.is_long:
-                if current_price >= pos.auto_profit_target:
-                    # Allow Claude hold check before closing (handled at layer 4)
-                    pass
-                if current_price <= pos.auto_stop_loss:
-                    return ExitDecision(True, "layer3_auto_stop", layer=3)
-            else:
-                if current_price <= pos.auto_profit_target:
-                    pass
-                if current_price >= pos.auto_stop_loss:
-                    return ExitDecision(True, "layer3_auto_stop", layer=3)
+        # Layer 3: Auto stop-loss PRICES only. By design we do NOT close on the
+        # profit-target price here — we re-evaluate it at Layer 4 so the
+        # momentum-boost + Claude-hold logic can extend the target first.
+        # The auto_profit_target field is still used elsewhere (logs, exit
+        # analytics) but intentionally does not close at this layer.
+        if pos.auto_stop_loss is not None:
+            if pos.is_long and current_price <= pos.auto_stop_loss:
+                return ExitDecision(True, "layer3_auto_stop", layer=3)
+            if (not pos.is_long) and current_price >= pos.auto_stop_loss:
+                return ExitDecision(True, "layer3_auto_stop", layer=3)
 
         # Layer 4: Global profit target (with momentum boost + optional Claude hold check)
         pnl = pos.unrealized_pnl_pct(current_price)
