@@ -303,11 +303,12 @@ class TradeBot:
             if restored > 0:
                 log.info("broker_state_restored", n_positions=restored,
                          path=snap_path)
-                self.notifier.notify(
-                    f"Restored {restored} position(s) from snapshot. "
-                    f"Review vs broker before trading.",
-                    level="warn", title="startup",
-                )
+                if bool(self.s.get("notifier.startup_notify", False)):
+                    self.notifier.notify(
+                        f"Restored {restored} position(s) from snapshot. "
+                        f"Review vs broker before trading.",
+                        level="warn", title="startup",
+                    )
         except Exception as e:                           # noqa: BLE001
             log.warning("broker_snapshot_restore_failed", err=str(e))
 
@@ -330,7 +331,8 @@ class TradeBot:
                 # notifying would spam Discord with useless noise.
                 if reconciled > 0 or errors > 0:
                     log.info("alpaca_reconcile", **summary)
-                if reconciled > 0:
+                if reconciled > 0 and bool(self.s.get(
+                        "notifier.reconcile_notify", False)):
                     self.notifier.notify(
                         f"Closed {reconciled} zombie position(s) on Alpaca paper.",
                         title="reconcile", level="info",
@@ -657,19 +659,20 @@ class TradeBot:
                 # Previous version truncated to 8 in a one-line text
                 # dump which made "23 catalysts" produce an unreadable
                 # string.
-                meta = {}
-                for e in events[:24]:     # Discord embed field cap
-                    key = f"{e.symbol} {e.event_type}"
-                    meta[key] = str(e.when)
-                if len(events) > 24:
-                    meta["_footer"] = f"{len(events) - 24} more not shown"
-                self.notifier.notify(
-                    f"{len(events)} upcoming catalysts in the next "
-                    f"{int(self.s.get('catalysts.lookahead_days', 14))} days",
-                    title="catalysts",
-                    level="info",
-                    meta=meta,
-                )
+                if bool(self.s.get("notifier.catalysts_notify", False)):
+                    meta = {}
+                    for e in events[:24]:     # Discord embed field cap
+                        key = f"{e.symbol} {e.event_type}"
+                        meta[key] = str(e.when)
+                    if len(events) > 24:
+                        meta["_footer"] = f"{len(events) - 24} more not shown"
+                    self.notifier.notify(
+                        f"{len(events)} upcoming catalysts in the next "
+                        f"{int(self.s.get('catalysts.lookahead_days', 14))} days",
+                        title="catalysts",
+                        level="info",
+                        meta=meta,
+                    )
         except Exception as e:   # noqa: BLE001
             log.warning("catalyst_refresh_failed", err=str(e))
 
@@ -1046,6 +1049,39 @@ class TradeBot:
                 log.warning("news_sentiment_error", symbol=sig.symbol, err=str(e))
         econ_blackout = self.econ_calendar.in_blackout(bars[-1].ts, symbol=sig.symbol)
         vix_now = self.vix_probe.value()
+
+        # Pick the contract FIRST (before the filter chain) so filters
+        # f11 (spread), f12 (open interest), f18 (scalp viability) can
+        # inspect the actual contract. Previously we picked AFTER filters
+        # ran, which meant contract-dependent filters were advisory-pass
+        # for every trade.
+        from .core.types import OptionContract, OptionRight
+        from .data.options_chain import SyntheticOptionsChain
+        meta_dir = sig.meta.get("direction") if isinstance(sig.meta, dict) else None
+        if sig.option_right is not None:
+            right = sig.option_right
+        elif meta_dir == "bearish":
+            right = OptionRight.PUT
+        else:
+            right = OptionRight.CALL
+
+        _dte_pool = self.s.get("execution.target_dte_pool", None) or []
+        if _dte_pool:
+            import random as _random
+            target_dte = int(_random.choice(_dte_pool))
+        else:
+            target_dte = int(self.s.get("execution.target_dte", 7))
+        chain = self.chain_provider.chain(sig.symbol, spot, target_dte=target_dte)
+        min_oi = int(self.s.get("execution.min_open_interest", 100))
+        min_tv = int(self.s.get("execution.min_today_option_volume", 50))
+        contract = SyntheticOptionsChain.find_atm_liquid(
+            chain, spot, right,
+            min_oi=min_oi, min_today_volume=min_tv,
+            max_strike_dist_pct=float(
+                self.s.get("execution.max_strike_dist_pct", 0.05)
+            ),
+        )
+
         ectx = ExecutionContext(
             signal=sig, now=bars[-1].ts,
             account_equity=acct.equity, day_pnl=acct.day_pnl,
@@ -1059,6 +1095,7 @@ class TradeBot:
             news_score=news_score, news_label=news_label,
             news_rationale=news_rationale,
             recent_bars=bars[-20:],   # momentum filter needs last ~20 bars
+            contract=contract,        # f11/f12/f18 need this
         )
         results = self.exec_chain.run(ectx)
         if not ExecutionChain.decided_pass(results):
@@ -1076,41 +1113,7 @@ class TradeBot:
         # For the ensemble path, `sig.side` is BUY for bullish entries
         # across the board (we always long the option, not short it).
         # The dominant_direction on the underlying decides right.
-        from .core.types import OptionContract, OptionRight
-        from .data.options_chain import SyntheticOptionsChain
-        meta_dir = sig.meta.get("direction") if isinstance(sig.meta, dict) else None
-        if sig.option_right is not None:
-            right = sig.option_right
-        elif meta_dir == "bearish":
-            right = OptionRight.PUT
-        else:
-            right = OptionRight.CALL
-
-        # DTE diversification — pick from a pool so we can A/B which DTE
-        # bucket actually wins. 0DTE moves fast (high theta, high
-        # convexity); 30DTE moves slow (low theta, needs direction).
-        # The bot journals which DTE each fill used, so `analyze_ml` or
-        # `attribute_pnl` can slice performance by DTE after ~50 trades.
-        _dte_pool = self.s.get("execution.target_dte_pool", None) or []
-        if _dte_pool:
-            import random as _random
-            target_dte = int(_random.choice(_dte_pool))
-        else:
-            target_dte = int(self.s.get("execution.target_dte", 1))
-        chain = self.chain_provider.chain(sig.symbol, spot, target_dte=target_dte)
-        # Liquid-strike picker: prefer contracts with real OI + volume
-        # within 5% of spot. Prevents buying far-OTM illiquid trash
-        # just because it happens to be the nearest contract the chain
-        # returned.
-        min_oi = int(self.s.get("execution.min_open_interest", 500))
-        min_tv = int(self.s.get("execution.min_today_option_volume", 100))
-        contract = SyntheticOptionsChain.find_atm_liquid(
-            chain, spot, right,
-            min_oi=min_oi, min_today_volume=min_tv,
-            max_strike_dist_pct=float(
-                self.s.get("execution.max_strike_dist_pct", 0.05)
-            ),
-        )
+        # Contract already picked before the filter chain — skip duplicate pick.
         # Reject only when we have HARD evidence of an unusable contract.
         # Three concrete reject cases:
         #   (a) no contract, or zero bid/ask — stale / no market
@@ -1186,6 +1189,47 @@ class TradeBot:
         kelly_n = n
         # Apply vol scaling + drawdown guard multiplier AFTER Kelly sizing
         n = int(round(n * vol_mult * self._dd_size_multiplier))
+
+        # Operator policy override: default 1 contract per entry per
+        # ticker. Scale up to `max_qty_if_strong` only when ALL of the
+        # scale-up conditions are met:
+        #   - delta in tight sweet-spot [scalp_delta_scale_min, scale_max]
+        #   - underlying 5-bar move >= scalp_scale_min_underlying_move
+        #   - current bar volume >= scalp_scale_min_volume_multiple × avg
+        # Otherwise: buy 1 contract, regardless of Kelly.
+        default_qty = int(self.s.get("execution.default_qty_per_entry", 1))
+        max_strong = int(self.s.get("execution.max_qty_if_strong", 3))
+        delta_lo = float(self.s.get("execution.scalp_delta_scale_min", 0.40))
+        delta_hi = float(self.s.get("execution.scalp_delta_scale_max", 0.55))
+        mv_min = float(self.s.get("execution.scalp_scale_min_underlying_move", 0.005))
+        vol_mult_min = float(self.s.get("execution.scalp_scale_min_volume_multiple", 2.0))
+        # Read delta stashed by f18 (abs value, 0.0 if IV unknown).
+        delta_val = float(getattr(ectx, "contract_delta", 0.0) or 0.0)
+        # 5-bar underlying move in signal direction:
+        direction = (sig.meta.get("direction") or "").lower() if isinstance(sig.meta, dict) else ""
+        move_pct = 0.0
+        if len(bars) >= 5 and bars[-5].open > 0:
+            move_pct = (bars[-1].close - bars[-5].open) / bars[-5].open
+            if direction == "bearish":
+                move_pct = -move_pct    # flip sign for bearish
+        # Current bar volume multiple:
+        avg_vol_20 = sum(b.volume for b in bars[-20:]) / 20 if len(bars) >= 20 else 0
+        vol_ratio = (bars[-1].volume / avg_vol_20) if avg_vol_20 > 0 else 0
+        strong_momentum = (
+            delta_lo <= delta_val <= delta_hi
+            and move_pct >= mv_min
+            and vol_ratio >= vol_mult_min
+        )
+        if strong_momentum:
+            n = min(n if n > 0 else default_qty, max_strong)
+            qty_reason = (f"strong: delta={delta_val:.2f} "
+                           f"move={move_pct:+.2%} vol={vol_ratio:.1f}x")
+        else:
+            n = default_qty
+            qty_reason = (f"default_1: delta={delta_val:.2f} "
+                           f"move={move_pct:+.2%} vol={vol_ratio:.1f}x")
+        log.info("qty_policy", symbol=sig.symbol, qty=n, reason=qty_reason)
+
         if n <= 0:
             # Surface WHY. This is the silent-drop that was invisible: Kelly
             # returns 0 when the priors imply negative EV, vol_scale clips
@@ -1217,9 +1261,24 @@ class TradeBot:
         limit = round(contract.bid + spread * aggressiveness, 2)
         if limit <= 0:
             limit = round(contract.ask * 0.98, 2)   # fallback if bid=0
+        # Rich entry rationale — one-line JSON-ish string captured in
+        # the order tag (and thus the trade journal). Gives the
+        # operator full "why did the bot do this" audit per trade for
+        # model-tuning later. Stored compactly to fit within the tag
+        # column; dashboard parses key=value pairs back out.
+        rationale = (
+            f"entry|src={sig.source}|sym={sig.symbol}|right={contract.right.value}"
+            f"|strike={contract.strike}|dte={target_dte}|delta={delta_val:.2f}"
+            f"|iv={contract.iv:.2f}|regime={regime or '?'}"
+            f"|sig_score={round(float(sig.confidence or 0), 3)}"
+            f"|5bar_move={move_pct:+.3%}|vol_ratio={vol_ratio:.1f}x"
+            f"|spot={spot:.2f}|vwap={vwap:.2f}"
+            f"|bid={contract.bid:.2f}|ask={contract.ask:.2f}"
+            f"|qty_policy={qty_reason}|limit={limit:.2f}"
+        )
         order = Order(symbol=contract.symbol, side=Side.BUY, qty=n,
                       is_option=True, limit_price=limit,
-                      tag=f"entry:{sig.source}:{sig.symbol}")
+                      tag=rationale)
         v = self.validator.validate(order, contract, acct.buying_power,
                                     self.s.get("account.max_open_positions", 5))
         if not v.ok:
@@ -1274,12 +1333,22 @@ class TradeBot:
                     "side": f"{contract.right.value.upper()} (long)",
                     "strike": contract.strike,
                     "expiry": contract.expiry.isoformat() if contract.expiry else "—",
+                    "dte": target_dte,
                     "qty": n,
                     "fill_px": round(float(fill.price), 4),
                     "cost_usd": round(n * fill.price * 100, 2),
+                    "delta": round(delta_val, 3) if delta_val else "—",
+                    "iv": round(contract.iv, 3) if contract.iv else "—",
+                    "regime": str(regime or "—"),
+                    "5bar_move": f"{move_pct:+.2%}",
+                    "vol_ratio": f"{vol_ratio:.1f}x",
+                    "spot": round(float(spot), 2),
+                    "vwap": round(float(vwap), 2),
+                    "sig_score": round(float(sig.confidence or 0), 3),
                     "auto_PT": f"${auto_pt}",
                     "auto_SL": f"${auto_sl}",
                     "source": sig.source,
+                    "qty_policy": qty_reason,
                     "_footer": f"OCC {contract.symbol}",
                 },
             )
@@ -1299,11 +1368,12 @@ class TradeBot:
             backend = self.s.get("storage.backend", "sqlite")
             schema = self.s.get("storage.cockroach_schema", "tradebot") if backend != "sqlite" else ""
             mode = "LIVE" if self.s.live_trading else "paper"
-            self.notifier.notify(
-                f"tradebot started — {mode}, broker={self.s.get('broker.name','paper')}"
-                + (f", schema={schema}" if schema else ""),
-                level="info", title="startup",
-            )
+            if bool(self.s.get("notifier.startup_notify", False)):
+                self.notifier.notify(
+                    f"tradebot started — {mode}, broker={self.s.get('broker.name','paper')}"
+                    + (f", schema={schema}" if schema else ""),
+                    level="info", title="startup",
+                )
         except Exception:
             pass
 

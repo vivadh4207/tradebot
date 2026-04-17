@@ -230,6 +230,19 @@ catalysts:
   lookahead_days: 14                 # how far ahead to fetch per refresh
   static_yaml: config/catalysts.yaml # manual overrides (FDA, one-offs)
 
+# ===== Notifier noise control =====
+# Per-event Discord toggles. Operator preference: only trading events
+# (entries, exits, halts, watchdog crashes, errors) should ping Discord.
+# Operational chatter (startup, catalyst daily list, zombie reconcile)
+# stays in the log file only — visible via `tradebotctl logs` or the
+# dashboard, but doesn't spam the channels on every watchdog restart.
+notifier:
+  startup_notify: false       # "tradebot started — paper, broker=..."
+  catalysts_notify: false     # daily "23 upcoming catalysts" summary
+  reconcile_notify: false     # "closed N zombie positions on Alpaca"
+  # Fill/exit/HALT/watchdog/error notifications remain ON unconditionally
+  # — those are real trading/ops events.
+
 # ===== News filter =====
 news:
   enabled: true
