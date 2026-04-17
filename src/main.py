@@ -635,9 +635,14 @@ class TradeBot:
             self._halted_today = True
             log.warning("daily_loss_halt", day_pnl=acct.day_pnl, cap=cap)
             self.notifier.notify(
-                f"Daily loss halt hit: day_pnl={acct.day_pnl:.2f} "
-                f"equity={acct.equity:.2f}. No new entries today.",
-                level="warn", title="HALT",
+                f"Daily loss cap breached — no new entries for the rest of today.",
+                level="error", title="HALT",
+                meta={
+                    "day_pnl": f"${acct.day_pnl:+,.2f}",
+                    "equity": f"${acct.equity:,.2f}",
+                    "cap": f"-${cap:,.2f}",
+                    "dd_from_peak": f"{(1 - acct.equity/max(self._peak_equity, 1e-9)) * 100:.2f}%",
+                },
             )
             return
         # Tiered drawdown guard: reduces size multiplier or HALTS if DD
@@ -695,11 +700,19 @@ class TradeBot:
 
         # 2. Emit summary
         acct = self.broker.account()
+        level = "success" if acct.day_pnl >= 0 else "error" if acct.day_pnl <= -abs(self.s.max_daily_loss_pct * acct.equity) else "warn"
         self.notifier.notify(
-            f"EOD {today}: equity={acct.equity:.2f} "
-            f"day_pnl={acct.day_pnl:+.2f} total_pnl={acct.total_pnl:+.2f} "
-            f"flattened={len(open_before)}",
+            f"End of session {today}. {len(open_before)} positions flattened.",
             title="daily",
+            level=level,
+            meta={
+                "equity": f"${acct.equity:,.2f}",
+                "day_pnl": f"${acct.day_pnl:+,.2f}",
+                "day_pct": f"{(acct.day_pnl/max(acct.equity-acct.day_pnl, 1e-9))*100:+.2f}%",
+                "total_pnl": f"${acct.total_pnl:+,.2f}",
+                "flattened": len(open_before),
+                "cash": f"${acct.cash:,.2f}",
+            },
         )
         self._last_daily_summary_date = today
         # roll the daily halt state at the end of day
@@ -1012,8 +1025,23 @@ class TradeBot:
                       qty=n, price=fill.price, src=sig.source,
                       auto_pt=auto_pt, auto_sl=auto_sl)
             self.notifier.notify(
-                f"{sig.symbol} {sig.side.value} x{n} @ {fill.price:.2f} src={sig.source}",
+                f"BUY {n} × {contract.right.value.upper()} {sig.symbol} "
+                f"{contract.strike} @ ${fill.price:.2f}",
                 title="entry",
+                level="success",
+                meta={
+                    "symbol": sig.symbol,
+                    "side": f"{contract.right.value.upper()} (long)",
+                    "strike": contract.strike,
+                    "expiry": contract.expiry.isoformat() if contract.expiry else "—",
+                    "qty": n,
+                    "fill_px": round(float(fill.price), 4),
+                    "cost_usd": round(n * fill.price * 100, 2),
+                    "auto_PT": f"${auto_pt}",
+                    "auto_SL": f"${auto_sl}",
+                    "source": sig.source,
+                    "_footer": f"OCC {contract.symbol}",
+                },
             )
 
     def run(self) -> None:

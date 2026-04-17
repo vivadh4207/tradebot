@@ -3,21 +3,37 @@ from __future__ import annotations
 
 import abc
 import os
-from typing import Optional
+from typing import Any, Dict, Optional
 
 
 class Notifier(abc.ABC):
-    """Push short status messages to a human channel."""
+    """Push short status messages to a human channel.
+
+    The `meta` kwarg carries structured event data the notifier can use
+    to render richer output (Discord embed, Slack block kit, etc.).
+    Plain-text callers can ignore it; rich callers pass an ordered
+    mapping of field-name → value and the notifier lays them out
+    consistently.
+    """
 
     @abc.abstractmethod
-    def notify(self, text: str, *, level: str = "info", title: str = "") -> None:
-        """Send a message. level in {info, warn, error}. Must not raise."""
+    def notify(self, text: str, *, level: str = "info", title: str = "",
+                meta: Optional[Dict[str, Any]] = None) -> None:
+        """Send a message.
+
+        Args:
+          text:  short summary (plain text, used as a fallback / preview)
+          level: "info" | "warn" | "error" | "success" — drives color + emoji
+          title: optional short title shown in bold at top of the card
+          meta:  optional {field_name: value} dict rendered as a field list
+        """
 
 
 class NullNotifier(Notifier):
     """No-op. Used when no webhook is configured or during tests."""
 
-    def notify(self, text: str, *, level: str = "info", title: str = "") -> None:
+    def notify(self, text: str, *, level: str = "info", title: str = "",
+                meta: Optional[Dict[str, Any]] = None) -> None:
         return
 
 
