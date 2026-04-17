@@ -819,8 +819,8 @@ async function refresh() {
       `<td>${fmt(t.entry_price)}</td><td>${fmt(t.exit_price)}</td>`+
       `<td class="${cls(t.pnl)}">${fmt(t.pnl)}</td>`+
       `<td class="${cls(t.pnl_pct)}">${t.pnl_pct!==null ? (t.pnl_pct*100).toFixed(2)+'%' : ''}</td>`+
-      `<td class="mut">${t.entry_tag ?? ''}</td>`+
-      `<td class="mut">${t.exit_reason ?? ''}</td>`;
+      `<td class="mut">${t.entry_tag || ''}</td>`+
+      `<td class="mut">${t.exit_reason || ''}</td>`;
     tb.appendChild(row);
   });
   renderEnsemble(en);
@@ -906,7 +906,7 @@ function renderHealth(h) {
     ['live trading', h.live_trading ? '🔴 LIVE' : 'paper'],
     ['last tick', ts(h.last_equity_snapshot)],
     ['last trade close', ts(h.last_trade_close)],
-    ['open positions', (h.broker_open_positions ?? 0)],
+    ['open positions', (h.broker_open_positions == null ? 0 : h.broker_open_positions)],
     ['broker cash', h.broker_cash === null ? '—' : '$'+Number(h.broker_cash).toFixed(2)],
     ['day pnl', h.broker_day_pnl === null ? '—' :
         `<span class="${h.broker_day_pnl>=0?'pos':'neg'}">${h.broker_day_pnl>=0?'+':''}${Number(h.broker_day_pnl).toFixed(2)}</span>`],
@@ -933,11 +933,11 @@ function renderOpenPositions(p) {
       `<td class="${pos.qty>0?'pos':'neg'}">${pos.qty}</td>`+
       `<td>${fmt(pos.avg_price)}</td>`+
       `<td class="mut">${pos.is_option?(pos.right||'opt'):'stk'}</td>`+
-      `<td class="mut">${pos.strike??'—'}</td>`+
-      `<td class="mut">${pos.expiry??'—'}</td>`+
+      `<td class="mut">${pos.strike == null ? '—' : pos.strike}</td>`+
+      `<td class="mut">${pos.expiry == null ? '—' : pos.expiry}</td>`+
       `<td>${fmt(pos.auto_profit_target)}</td>`+
       `<td>${fmt(pos.auto_stop_loss)}</td>`+
-      `<td class="mut">${pos.consecutive_holds??0}</td>`+
+      `<td class="mut">${pos.consecutive_holds == null ? 0 : pos.consecutive_holds}</td>`+
       `<td><span class="chip">${pos.entry_tag||'—'}</span></td>`;
     tb.appendChild(row);
   });
@@ -1133,7 +1133,7 @@ function renderLoopInsights(wd, cal) {
       const row = document.createElement('tr');
       row.innerHTML =
         `<td class="mut">${(h.ts||'').replace('T',' ').slice(0,19)}</td>`+
-        `<td>${h.n_fills ?? ''}</td>`+
+        `<td>${h.n_fills == null ? '' : h.n_fills}</td>`+
         `<td style="color:${color}">${ratio !== undefined ? ratio.toFixed(2) : ''}</td>`+
         `<td class="mut" style="max-width:340px;white-space:normal;">${changeTxt}</td>`;
       calTb.appendChild(row);
@@ -1147,7 +1147,7 @@ async function refreshLogs() {
   const r = await fetch(url).then(r=>r.json()).catch(()=>null);
   const view = document.getElementById('log-view');
   if (!r || r.missing) { view.textContent = '(no log file)'; return; }
-  view.textContent = (r.lines || []).join('\n') || '(empty)';
+  view.textContent = (r.lines || []).join('\\n') || '(empty)';
   view.scrollTop = view.scrollHeight;
 }
 document.getElementById('log-grep').addEventListener('keyup', e => {
@@ -1157,8 +1157,8 @@ document.getElementById('log-refresh').addEventListener('click', refreshLogs);
 
 document.getElementById('days').addEventListener('change', refresh);
 refresh(); refreshLogs();
-setInterval(refresh, 60_000);
-setInterval(refreshLogs, 15_000);
+setInterval(refresh, 60000);
+setInterval(refreshLogs, 15000);
 </script>
 </body></html>
 """
