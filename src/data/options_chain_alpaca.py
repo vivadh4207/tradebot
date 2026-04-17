@@ -67,8 +67,37 @@ class AlpacaOptionsChain(OptionsChainProvider):
                 expiry_d, right, strike = parts
                 bid = float(getattr(getattr(snap, "latest_quote", None), "bid_price", 0) or 0)
                 ask = float(getattr(getattr(snap, "latest_quote", None), "ask_price", 0) or 0)
-                oi = int(getattr(snap, "open_interest", 0) or 0)
-                tv = int(getattr(snap, "day_volume", 0) or 0)
+                # Alpaca's OptionsSnapshot exposes OI / volume under
+                # several names depending on SDK version. Try each.
+                # If every attempt returns 0, the data is genuinely
+                # missing from this snapshot (the /options/snapshots
+                # endpoint doesn't always include OI — /options/bars
+                # or /options/quotes can be needed). Downstream code
+                # treats all-zero as "liquidity unknown" rather than
+                # "definitely illiquid" to avoid refusing every trade.
+                def _first_nonzero(*names):
+                    for n in names:
+                        try:
+                            v = getattr(snap, n, None)
+                            if v:
+                                return v
+                        except Exception:
+                            continue
+                    return 0
+                oi_raw = _first_nonzero(
+                    "open_interest", "openInterest", "oi", "open_int"
+                )
+                # day_volume path — check top-level and nested under
+                # daily_bar (some SDK versions).
+                tv_raw = _first_nonzero(
+                    "day_volume", "dayVolume", "daily_volume", "volume"
+                )
+                if not tv_raw:
+                    db = getattr(snap, "daily_bar", None)
+                    if db is not None:
+                        tv_raw = getattr(db, "volume", 0) or 0
+                oi = int(oi_raw or 0)
+                tv = int(tv_raw or 0)
                 parsed.append(OptionContract(
                     symbol=occ_symbol, underlying=underlying,
                     strike=strike, expiry=expiry_d, right=right,

@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS launchd agent for the read-only dashboard (FastAPI + uvicorn).
+  Mirrors the main bot's watchdog pattern — KeepAlive + RunAtLoad so
+  the dashboard comes up at login and restarts on crash.
+
+  Installed via:
+    scripts/tradebotctl.sh dashboard-install
+  Paths get rewritten by the installer script to match the user's
+  checkout, so the hardcoded /Users/vivekadhikari paths below are only
+  the defaults.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.tradebot.dashboard</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/vivekadhikari/Documents/Claude/Projects/tradebot</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/vivekadhikari/Documents/Claude/Projects/tradebot/.venv/bin/python</string>
+    <string>/Users/vivekadhikari/Documents/Claude/Projects/tradebot/scripts/run_dashboard.py</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    <key>TZ</key>
+    <string>America/New_York</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/vivekadhikari/Documents/Claude/Projects/tradebot/logs/dashboard.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/vivekadhikari/Documents/Claude/Projects/tradebot/logs/dashboard.err</string>
+</dict>
+</plist>

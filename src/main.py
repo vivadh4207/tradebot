@@ -143,8 +143,15 @@ def _build_news_sentiment(settings: Settings) -> Optional[CachedNewsSentiment]:
 
 
 def _build_journal_from_settings(settings: Settings) -> Optional[TradeJournal]:
-    backend = settings.get("storage.backend", "sqlite")
+    # Test harness / ops override: TRADEBOT_STORAGE_BACKEND forces
+    # sqlite mode for tests so pytest runs never INSERT into the
+    # production Cockroach tables.
+    backend = (os.getenv("TRADEBOT_STORAGE_BACKEND", "").strip()
+               or settings.get("storage.backend", "sqlite"))
     sqlite_path = settings.get("storage.sqlite_path", "logs/tradebot.sqlite")
+    _sandbox = os.getenv("TRADEBOT_SANDBOX_LOGS", "").strip()
+    if _sandbox and backend == "sqlite":
+        sqlite_path = os.path.join(_sandbox, "tradebot.sqlite")
     dsn_env = settings.get("storage.cockroach_dsn_env", "COCKROACH_DSN")
     schema = settings.get("storage.cockroach_schema", "tradebot")
     try:
@@ -192,6 +199,11 @@ class TradeBot:
         )
         self._refresh_catalysts()
         snap_path = settings.get("broker.snapshot_path", "logs/broker_state.json")
+        # Test harness: conftest.py sets TRADEBOT_SANDBOX_LOGS to a tmp
+        # dir to keep tests from touching the real logs/ directory.
+        _sandbox = os.getenv("TRADEBOT_SANDBOX_LOGS", "").strip()
+        if _sandbox:
+            snap_path = os.path.join(_sandbox, "broker_state.json")
         # Cost model: stochastic (recommended) or linear (legacy).
         # Stochastic makes backtest Sharpe match live Sharpe; linear overstates.
         model_type = str(settings.get("broker.cost_model", "stochastic")).lower()
@@ -551,7 +563,11 @@ class TradeBot:
         interval = float(self.s.get("exits.main_loop_interval_sec", 180))
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         kill_file = os.path.join(repo_root, "KILL")
-        heartbeat_file = os.path.join(repo_root, "logs", "heartbeat.txt")
+        # Tests redirect heartbeat writes so they don't collide with a
+        # real running watchdog on the same machine.
+        _sandbox = os.getenv("TRADEBOT_SANDBOX_LOGS", "").strip()
+        heartbeat_file = (os.path.join(_sandbox, "heartbeat.txt") if _sandbox
+                           else os.path.join(repo_root, "logs", "heartbeat.txt"))
         os.makedirs(os.path.dirname(heartbeat_file), exist_ok=True)
         while not self._stop.is_set():
             # Heartbeat: the watchdog reads this and restarts us if it goes
@@ -831,11 +847,60 @@ class TradeBot:
 
         target_dte = int(self.s.get("execution.target_dte", 1))
         chain = self.chain_provider.chain(sig.symbol, spot, target_dte=target_dte)
-        contract = SyntheticOptionsChain.find_atm(chain, spot, right)
-        if contract is None:
-            log.info("entry_skip_no_contract", symbol=sig.symbol,
-                      source=sig.source, right=right.value)
+        # Liquid-strike picker: prefer contracts with real OI + volume
+        # within 5% of spot. Prevents buying far-OTM illiquid trash
+        # just because it happens to be the nearest contract the chain
+        # returned.
+        min_oi = int(self.s.get("execution.min_open_interest", 500))
+        min_tv = int(self.s.get("execution.min_today_option_volume", 100))
+        contract = SyntheticOptionsChain.find_atm_liquid(
+            chain, spot, right,
+            min_oi=min_oi, min_today_volume=min_tv,
+            max_strike_dist_pct=float(
+                self.s.get("execution.max_strike_dist_pct", 0.05)
+            ),
+        )
+        # Reject only when we have HARD evidence of illiquidity. The
+        # Alpaca snapshot endpoint frequently omits OI/volume — treating
+        # all-zero as "definitely illiquid" would refuse every trade.
+        # Concrete illiquid signals we DO enforce:
+        #   - no contract at all
+        #   - zero bid OR zero ask (stale / no market)
+        #   - partial OI/vol data that fails the min floor when ONE of
+        #     them is non-zero (i.e. provider is reporting it and it's
+        #     genuinely low)
+        if contract is None or contract.bid <= 0 or contract.ask <= 0:
+            log.info(
+                "entry_skip_no_liquid_strike",
+                symbol=sig.symbol, source=sig.source, right=right.value,
+                picked_strike=(contract.strike if contract else None),
+                picked_oi=(contract.open_interest if contract else None),
+                picked_vol=(contract.today_volume if contract else None),
+                reason="no_bid_ask",
+            )
             return
+        partial = contract.open_interest > 0 or contract.today_volume > 0
+        if partial and (contract.open_interest < min_oi
+                         or contract.today_volume < min_tv):
+            log.info(
+                "entry_skip_no_liquid_strike",
+                symbol=sig.symbol, source=sig.source, right=right.value,
+                picked_strike=contract.strike,
+                picked_oi=contract.open_interest,
+                picked_vol=contract.today_volume,
+                reason="below_min_liquidity",
+            )
+            return
+        # If we got here with OI=0 AND vol=0, liquidity is unknown
+        # (provider didn't populate). Log it so operators can see what
+        # assumptions the bot is making; still proceed with the trade
+        # since bid/ask are real.
+        if not partial:
+            log.info(
+                "entry_liquidity_unknown",
+                symbol=sig.symbol, picked_strike=contract.strike,
+                bid=contract.bid, ask=contract.ask,
+            )
         # Regime passes through via sig.meta when the ensemble emitted it;
         # otherwise None → sizer leaves size untouched.
         regime = sig.meta.get("regime") if isinstance(sig.meta, dict) else None

@@ -118,13 +118,26 @@ class AlpacaBroker(BrokerAdapter):
             return out
         return _with_retry(_call, op="positions")
 
-    def submit(self, order: Order) -> Optional[Fill]:
+    def submit(self, order: Order, **_ignored) -> Optional[Fill]:
+        """Submit to Alpaca. `**_ignored` absorbs the PaperBroker's
+        extended kwargs (`contract=`, `auto_profit_target=`,
+        `auto_stop_loss=`) so this adapter can be used as a drop-in
+        target by MirrorAlpacaBroker without signature drift."""
         from alpaca.trading.requests import LimitOrderRequest
         from alpaca.trading.enums import OrderSide, TimeInForce
 
-        tif = {
-            "DAY": TimeInForce.DAY, "IOC": TimeInForce.IOC, "GTC": TimeInForce.GTC,
-        }.get(order.tif, TimeInForce.DAY)
+        # Alpaca options trading rejects IOC / GTC / OPG / CLS with
+        # error 42210000 "order_time_in_force provided not supported
+        # for options trading". Only DAY is accepted. Our exit engine
+        # and flatten_all submit orders with tif=IOC (intentional for
+        # fast cancellation on the paper side) — coerce to DAY for
+        # the Alpaca mirror so closes aren't silently rejected.
+        if order.is_option:
+            tif = TimeInForce.DAY
+        else:
+            tif = {
+                "DAY": TimeInForce.DAY, "IOC": TimeInForce.IOC, "GTC": TimeInForce.GTC,
+            }.get(order.tif, TimeInForce.DAY)
         side = OrderSide.BUY if order.side == Side.BUY else OrderSide.SELL
         req = LimitOrderRequest(
             symbol=order.symbol, qty=order.qty,

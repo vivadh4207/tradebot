@@ -71,6 +71,58 @@ class SyntheticOptionsChain(OptionsChainProvider):
         return rights[0]
 
     @staticmethod
+    def find_atm_liquid(contracts: List[OptionContract], spot: float,
+                         right: OptionRight,
+                         min_oi: int = 500,
+                         min_today_volume: int = 100,
+                         max_strike_dist_pct: float = 0.05) -> Optional[OptionContract]:
+        """Like find_atm but filters for real tradable liquidity.
+
+        Three tiers:
+          (1) Fully-liquid: OI >= min_oi AND volume >= min_today_volume
+              AND non-zero bid/ask AND strike within max_strike_dist_pct.
+          (2) Quote-only: bid > 0 AND ask > 0 AND strike within distance,
+              BUT OI and volume are BOTH zero (provider didn't report).
+              Treated as "liquidity unknown" — pickable when no tier-1
+              exists. Common with Alpaca's snapshot endpoint which
+              doesn't populate OI reliably.
+          (3) Nearest: whatever the chain's find_atm returns. Caller
+              should treat this as advisory-only and typically skip.
+
+        The tier-2 fallback is what makes the bot actually trade when
+        Alpaca's OI data is missing — otherwise we'd reject every single
+        contract despite a valid bid/ask being visible.
+        """
+        def _within(c):
+            return abs(c.strike - spot) / max(spot, 1e-9) <= max_strike_dist_pct
+        tier1 = [
+            c for c in contracts
+            if c.right == right
+            and c.open_interest >= min_oi
+            and c.today_volume >= min_today_volume
+            and _within(c)
+            and c.bid > 0 and c.ask > 0
+        ]
+        if tier1:
+            tier1.sort(key=lambda c: abs(c.strike - spot))
+            return tier1[0]
+        # Tier 2: has a real quote (both sides > 0), within distance,
+        # OI/volume unknown (all zeros). Better than blind-nearest.
+        tier2 = [
+            c for c in contracts
+            if c.right == right
+            and _within(c)
+            and c.bid > 0 and c.ask > 0
+            and c.open_interest == 0 and c.today_volume == 0
+        ]
+        if tier2:
+            tier2.sort(key=lambda c: abs(c.strike - spot))
+            return tier2[0]
+        # Tier 3: nothing usable — let find_atm return raw nearest so
+        # callers can log what they got and bail.
+        return SyntheticOptionsChain.find_atm(contracts, spot, right)
+
+    @staticmethod
     def find_otm(contracts: List[OptionContract], spot: float,
                  right: OptionRight, otm_pct: float = 0.05) -> Optional[OptionContract]:
         rights = [c for c in contracts if c.right == right]

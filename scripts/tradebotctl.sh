@@ -29,6 +29,11 @@ LAUNCHD_LABEL="com.tradebot.paper"
 LAUNCHD_SRC_PLIST="$ROOT/deploy/launchd/${LAUNCHD_LABEL}.plist"
 LAUNCHD_INSTALLED_PLIST="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
 
+# launchd dashboard agent (separate from the bot watchdog).
+DASHBOARD_LABEL="com.tradebot.dashboard"
+DASHBOARD_SRC_PLIST="$ROOT/deploy/launchd/${DASHBOARD_LABEL}.plist"
+DASHBOARD_INSTALLED_PLIST="$HOME/Library/LaunchAgents/${DASHBOARD_LABEL}.plist"
+
 mkdir -p "$ROOT/logs"
 
 # .env is intentionally NOT sourced here. Shell parsing is fragile with
@@ -145,6 +150,73 @@ cmd_watchdog_uninstall() {
   fi
 }
 
+cmd_dashboard_install() {
+  if [[ "$(uname)" != "Darwin" ]]; then
+    echo "dashboard-install is macOS-only (uses launchd)."
+    return 2
+  fi
+  if [[ ! -f "$DASHBOARD_SRC_PLIST" ]]; then
+    echo "source plist missing: $DASHBOARD_SRC_PLIST"
+    return 1
+  fi
+  mkdir -p "$(dirname "$DASHBOARD_INSTALLED_PLIST")"
+  tmp_plist="$(mktemp)"
+  awk -v new_root="$ROOT" -v new_py="$PY" '
+    {
+      gsub("/Users/vivekadhikari/Documents/Claude/Projects/tradebot/.venv/bin/python", new_py);
+      gsub("/Users/vivekadhikari/Documents/Claude/Projects/tradebot", new_root);
+      print;
+    }
+  ' "$DASHBOARD_SRC_PLIST" > "$tmp_plist"
+  mv "$tmp_plist" "$DASHBOARD_INSTALLED_PLIST"
+  launchctl unload "$DASHBOARD_INSTALLED_PLIST" 2>/dev/null || true
+  if launchctl load "$DASHBOARD_INSTALLED_PLIST"; then
+    echo "dashboard installed + loaded: $DASHBOARD_INSTALLED_PLIST"
+    echo "access:   http://127.0.0.1:8000"
+    echo "status:   tradebotctl dashboard-status"
+    echo "logs:     tail -f $ROOT/logs/dashboard.out"
+  else
+    echo "launchctl load failed — see logs/dashboard.err"
+    return 1
+  fi
+}
+
+cmd_dashboard_uninstall() {
+  if [[ "$(uname)" != "Darwin" ]]; then
+    echo "dashboard-uninstall is macOS-only."
+    return 2
+  fi
+  if [[ -f "$DASHBOARD_INSTALLED_PLIST" ]]; then
+    launchctl unload "$DASHBOARD_INSTALLED_PLIST" 2>/dev/null || true
+    rm -f "$DASHBOARD_INSTALLED_PLIST"
+    echo "dashboard unloaded + removed"
+  else
+    echo "not installed"
+  fi
+}
+
+cmd_dashboard_status() {
+  if [[ "$(uname)" != "Darwin" ]]; then
+    echo "dashboard-status is macOS-only."
+    return 2
+  fi
+  local entry; entry="$(launchctl list 2>/dev/null | awk -v l="$DASHBOARD_LABEL" '$3 == l')"
+  if [[ -z "$entry" ]]; then
+    echo "dashboard: not loaded"
+    echo "install:  tradebotctl dashboard-install"
+    return 0
+  fi
+  local pid status
+  pid="$(awk '{print $1}' <<< "$entry")"
+  status="$(awk '{print $2}' <<< "$entry")"
+  if [[ "$pid" == "-" ]]; then
+    echo "dashboard: loaded but not running (last exit=$status) — check logs/dashboard.err"
+  else
+    echo "dashboard: running (pid=$pid, last exit=$status)"
+    echo "open:      http://127.0.0.1:8000"
+  fi
+}
+
 cmd_watchdog_status() {
   if [[ "$(uname)" != "Darwin" ]]; then
     echo "watchdog-status is macOS-only."
@@ -209,15 +281,20 @@ case "${1:-}" in
   watchdog-install)   cmd_watchdog_install ;;
   watchdog-uninstall) cmd_watchdog_uninstall ;;
   watchdog-status)    cmd_watchdog_status ;;
+  dashboard-install)   cmd_dashboard_install ;;
+  dashboard-uninstall) cmd_dashboard_uninstall ;;
+  dashboard-status)    cmd_dashboard_status ;;
   wipe-journal)       shift; "$PY" "$ROOT/scripts/wipe_journal.py" "$@" ;;
   *)
     cat <<EOF
 usage: $(basename "$0") {start|stop|restart|status|logs|backtest|priors|walkforward|dashboard|testdb|
-                        watchdog-install|watchdog-uninstall|watchdog-status}
+                        watchdog-install|watchdog-uninstall|watchdog-status|
+                        dashboard-install|dashboard-uninstall|dashboard-status|
+                        wipe-journal}
 
-The watchdog-* subcommands are macOS-only; they manage a launchd agent
-that supervises scripts/watchdog_run.py (which in turn supervises
-run_paper.py, alerts on crash, and restarts on stale heartbeat).
+The watchdog-* / dashboard-* subcommands are macOS-only; they manage
+launchd agents. watchdog supervises the bot; dashboard supervises the
+FastAPI read-only UI on http://127.0.0.1:8000.
 
 Environment:
   TRADEBOT_PY   override python interpreter (default: \$ROOT/.venv/bin/python)

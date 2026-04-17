@@ -3,7 +3,7 @@ account:
   paper_starting_equity: 10000.0  # USD, for paper sim
   max_risk_per_trade_pct: 0.01    # Kelly-lite cap
   max_daily_loss_pct: 0.02        # halt entries if breached
-  max_open_positions: 5
+  max_open_positions: 10
 
 # ===== Universe (top 10 liquid US names) =====
 universe:
@@ -113,7 +113,7 @@ execution:
   min_volume_confirmation_stock: 1.20 # individual stocks
   max_spread_pct_etf: 0.05
   max_spread_pct_stock: 0.10
-  min_open_interest: 500
+  min_open_interest: 100
   min_today_option_volume: 100
   max_0dte_per_day: 50
   order_ttl_seconds: 5
