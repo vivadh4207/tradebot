@@ -380,14 +380,25 @@ class TradeBot:
             max_multiday=settings.get("sizing.max_contracts_multiday", 10),
             regime_multipliers=settings.get("sizing.regime_multipliers", {}) or {},
         )
+        _zero_dte_max_hold = float(settings.get(
+            "exits.zero_dte_max_hold_minutes", 30.0
+        ))
         self.exits = ExitEngine(ExitEngineConfig(
             pt_short_pct=settings.get("exits.profit_target_short_dte_pct", 0.35),
             pt_multi_pct=settings.get("exits.profit_target_multi_dte_pct", 0.50),
             sl_short_pct=settings.get("exits.stop_loss_short_dte_pct", 0.20),
             sl_multi_pct=settings.get("exits.stop_loss_multi_dte_pct", 0.30),
             hard_profit_cap_pct=settings.get("exits.hard_profit_cap_pct", 1.50),
+            zero_dte_max_hold_minutes=_zero_dte_max_hold,
         ))
-        self.fast = FastExitEvaluator()
+        from .exits.fast_exit import FastExitConfig as _FastExitConfig
+        self.fast = FastExitEvaluator(_FastExitConfig(
+            pt_short_pct=settings.get("exits.profit_target_short_dte_pct", 0.35),
+            pt_multi_pct=settings.get("exits.profit_target_multi_dte_pct", 0.50),
+            sl_short_pct=settings.get("exits.stop_loss_short_dte_pct", 0.20),
+            sl_multi_pct=settings.get("exits.stop_loss_multi_dte_pct", 0.30),
+            zero_dte_max_hold_minutes=_zero_dte_max_hold,
+        ))
         self.strategies = [
             MomentumSignal(), VwapReversionSignal(), OpeningRangeBreakout(),
         ]

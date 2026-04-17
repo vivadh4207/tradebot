@@ -30,6 +30,10 @@ class ExitEngineConfig:
     hard_profit_cap_pct: float = 1.50
     max_consecutive_holds: int = 3
     claude_hold_conf_min: float = 0.70
+    # Scalping cap for same-day-expiry contracts. Forces a close after
+    # N minutes regardless of P&L. Set to 0 to disable (old behavior =
+    # hold until PT / SL / 15:45 ET EOD sweep).
+    zero_dte_max_hold_minutes: float = 30.0
 
 
 class ExitEngine:
@@ -53,9 +57,26 @@ class ExitEngine:
     def decide(self, pos: Position, current_price: float, now: datetime,
                vix: float, spot: float, vwap: float,
                bars: List[Bar]) -> ExitDecision:
-        # Layer 1: 0DTE force close
+        # Layer 1: 0DTE force close at 15:45 ET
         if pos.dte() == 0 and now.time() >= self.cfg.zero_dte_force_close_time:
             return ExitDecision(True, "layer1_0dte_force_close", layer=1)
+
+        # Layer 1.5: 0DTE scalp-window timeout. Same-day options decay
+        # aggressively from theta, so the realistic tradable window is
+        # short. After N minutes of being held, force close regardless
+        # of P&L — the edge has almost certainly been converted (win or
+        # loss) and further holding just donates premium to theta.
+        # Disabled when zero_dte_max_hold_minutes <= 0.
+        if pos.dte() == 0 and self.cfg.zero_dte_max_hold_minutes > 0:
+            import time as _time
+            hold_min = max(0.0, (_time.time() - float(pos.entry_ts)) / 60.0)
+            if hold_min > self.cfg.zero_dte_max_hold_minutes:
+                return ExitDecision(
+                    True,
+                    f"layer1_5_0dte_scalp_timeout:{hold_min:.0f}min>"
+                    f"{self.cfg.zero_dte_max_hold_minutes:.0f}min",
+                    layer=1,
+                )
 
         # Layer 2: Tagged profiles (also handles vix_protection, scalp etc.)
         tagged = self.tagged.evaluate(pos, current_price, now, vix, spot, vwap)

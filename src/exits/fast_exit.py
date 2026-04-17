@@ -20,6 +20,10 @@ class FastExitConfig:
     pt_multi_pct: float = 0.50
     sl_short_pct: float = 0.20
     sl_multi_pct: float = 0.30
+    # Force-close same-day expiry positions after this many minutes of
+    # being held, regardless of P&L. 0DTE options decay fast — holding
+    # past the scalp window just donates premium to theta.
+    zero_dte_max_hold_minutes: float = 30.0
 
 
 class FastExitEvaluator:
@@ -30,6 +34,20 @@ class FastExitEvaluator:
         dte = pos.dte()
         pnl = pos.unrealized_pnl_pct(current_price)
         short_dte = dte <= 1
+        # 0DTE scalp-window timeout — fires BEFORE PT/SL so it reliably
+        # caps the hold time on same-day contracts. Only applies to DTE==0
+        # (not 1DTE), since 1DTE has overnight theta already baked into
+        # the entry price.
+        if dte == 0 and self.cfg.zero_dte_max_hold_minutes > 0:
+            import time as _time
+            hold_min = max(0.0, (_time.time() - float(pos.entry_ts)) / 60.0)
+            if hold_min > self.cfg.zero_dte_max_hold_minutes:
+                return ExitDecision(
+                    True,
+                    f"fast_0dte_scalp_timeout:{hold_min:.0f}min>"
+                    f"{self.cfg.zero_dte_max_hold_minutes:.0f}min",
+                    layer=0,
+                )
         if short_dte:
             pt, sl = self.cfg.pt_short_pct, self.cfg.sl_short_pct
         else:

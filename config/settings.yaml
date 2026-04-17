@@ -147,6 +147,10 @@ exits:
   hard_profit_cap_pct: 1.50
   max_consecutive_holds: 3
   claude_hold_conf_min: 0.70
+  # Force-close same-day-expiry (0DTE) contracts after this many minutes
+  # of being held, regardless of P&L. Theta on 0DTE decays sharply so
+  # the realistic tradable window is narrow. Set to 0 to disable.
+  zero_dte_max_hold_minutes: 30
 
 # ===== MI + Edge Score =====
 mi_edge:
