@@ -105,6 +105,9 @@ case "${1:-}" in
   compare-lstm) shift; "$PY" "$ROOT/scripts/compare_lstm.py" "$@" ;;
   analyze-ensemble) shift; "$PY" "$ROOT/scripts/analyze_ensemble.py" "$@" ;;
   propose-weights)  shift; "$PY" "$ROOT/scripts/propose_weights.py" "$@" ;;
+  var)              shift; "$PY" "$ROOT/scripts/daily_var.py" "$@" ;;
+  drift)            shift; "$PY" "$ROOT/scripts/monitor_feature_drift.py" "$@" ;;
+  orthogonalize)    shift; "$PY" "$ROOT/scripts/orthogonalize_signals.py" "$@" ;;
   dashboard)    shift; exec "$PY" "$ROOT/scripts/run_dashboard.py" "$@" ;;
   testdb)       shift; "$PY" "$ROOT/scripts/test_db_connection.py" "$@" ;;
   *)

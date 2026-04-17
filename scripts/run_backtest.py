@@ -32,6 +32,7 @@ from src.data.market_data import SyntheticDataAdapter
 from src.data.historical_adapter import HistoricalMarketDataAdapter
 from src.backtest.simulator import BacktestSimulator, SimConfig
 from src.backtest.metrics import performance_report
+from src.backtest.run_registry import register_run
 from src.storage.journal import build_journal
 
 
@@ -77,6 +78,24 @@ def main() -> int:
     report = performance_report(eq, [], days_traded=len(eq))
     for k, v in report.to_dict().items():
         print(f"  {k}: {v}")
+
+    # Register this run for reproducibility — git SHA + config hash + metrics.
+    try:
+        rec = register_run(
+            ROOT / "logs" / "backtest_runs.jsonl",
+            settings_path=ROOT / "config" / "settings.yaml",
+            seed=42 if args.data == "synthetic" else None,
+            data_source=args.data,
+            window_days=args.days,
+            total_bars=args.total_bars,
+            final_equity=result["final_equity"],
+            metrics=report.to_dict(),
+            notes=f"tf={args.timeframe_min}m",
+        )
+        print(f"[registered] git={rec.git_sha} cfg={rec.config_sha256} "
+              f"ts={rec.ts}")
+    except Exception as e:
+        print(f"[registered] failed (non-fatal): {e}")
     return 0
 
 

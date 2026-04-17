@@ -432,6 +432,37 @@ def logs_tail(lines: int = Query(200, ge=10, le=5000),
             "total_matched": len(all_lines)}
 
 
+@app.get("/api/var", response_class=JSONResponse)
+def var_report():
+    """Read the most recent Monte Carlo VaR report written by daily_var.py."""
+    from pathlib import Path
+    s, root = _settings()
+    p = root / "logs" / "var_report.json"
+    if not p.exists():
+        return {"ts": None, "message": "no VaR report yet — run scripts/daily_var.py"}
+    try:
+        return json.loads(p.read_text())
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/backtest_runs", response_class=JSONResponse)
+def backtest_runs(limit: int = Query(50, ge=1, le=500)):
+    """Read the JSONL run registry (git SHA + config hash + metrics)."""
+    from pathlib import Path
+    s, root = _settings()
+    p = root / "logs" / "backtest_runs.jsonl"
+    if not p.exists():
+        return {"runs": []}
+    runs = []
+    for line in p.read_text().splitlines()[-limit:][::-1]:
+        try:
+            runs.append(json.loads(line))
+        except Exception:
+            continue
+    return {"runs": runs}
+
+
 @app.get("/api/attribution", response_class=JSONResponse)
 def attribution(days: int = Query(30, ge=1, le=365)):
     """Per-entry-tag performance attribution. Maps entry_tag → win rate, mean pnl,

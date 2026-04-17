@@ -173,9 +173,21 @@ news:
 # ===== Broker =====
 broker:
   name: paper             # paper | alpaca
-  slippage_bps: 2         # 2 bps simulated slippage per leg
+  cost_model: stochastic  # 'stochastic' (recommended) or 'linear' (legacy fixed-bps)
+  slippage_bps: 2         # only used when cost_model=linear
   commission_per_option: 0.0
   commission_per_share: 0.0
+  # StochasticCostModel tuning (ignored when cost_model=linear)
+  half_spread_mult: 1.0
+  size_impact_coef: 0.25
+  vix_impact_coef: 0.015
+  slip_noise_bps: 0.5
+  slip_floor_bps: 0.5
+  snapshot_path: logs/broker_state.json
+
+# ===== Regime classifier =====
+regime:
+  classifier: rule        # 'rule' (stable, fast) | 'hmm' (smoother, slower)
 
 # ===== Storage (trade journal) =====
 storage:

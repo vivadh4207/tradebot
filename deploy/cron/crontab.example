@@ -46,6 +46,15 @@ CTL=$TRADEBOT/scripts/tradebotctl.sh
 # Sunday 21:00 ET → propose ensemble weight nudges from last 30d (human review required)
 0 21 * * 0      $CTL propose-weights --days 30 >> $TRADEBOT/logs/propose_weights.$(date +\%Y\%m\%d).log 2>&1
 
+# Sunday 21:30 ET → signal orthogonalization: detect correlated signals
+30 21 * * 0     $CTL orthogonalize --days 30 >> $TRADEBOT/logs/orthogonalize.$(date +\%Y\%m\%d).log 2>&1
+
+# Every market-open morning 08:30 ET → Monte Carlo VaR on open book
+30 8  * * 1-5   $CTL var --horizon-days 1 --n-paths 10000 >> $TRADEBOT/logs/var.$(date +\%Y\%m\%d).log 2>&1
+
+# Sunday 22:30 ET → LSTM feature drift monitor (after weekly retrain)
+30 22 * * 0     $CTL drift --days 7 >> $TRADEBOT/logs/drift.$(date +\%Y\%m\%d).log 2>&1
+
 # Every 15 min during market hours → resolve LSTM predictions whose horizon elapsed
 */15 9-16 * * 1-5  $CTL resolve-ml > $TRADEBOT/logs/resolve_ml.out 2>&1
 

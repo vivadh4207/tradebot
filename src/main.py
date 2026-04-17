@@ -22,6 +22,9 @@ from .core.logger import configure_logging, get_logger
 from .core.types import Signal, Order, Side, OptionRight
 from .brokers.paper import PaperBroker
 from .brokers.quote_validator import QuoteValidator
+from .brokers.slippage_model import StochasticCostModel, LinearCostModel, MarketContext
+from .risk.drawdown_guard import DrawdownGuard
+from .risk.vol_scaling import vol_scale
 from .data.market_data import SyntheticDataAdapter, AlpacaDataAdapter, MarketDataAdapter
 from .data.options_chain import SyntheticOptionsChain, OptionsChainProvider
 from .data.options_chain_alpaca import AlpacaOptionsChain
@@ -138,11 +141,27 @@ class TradeBot:
         )
         self._refresh_catalysts()
         snap_path = settings.get("broker.snapshot_path", "logs/broker_state.json")
+        # Cost model: stochastic (recommended) or linear (legacy).
+        # Stochastic makes backtest Sharpe match live Sharpe; linear overstates.
+        model_type = str(settings.get("broker.cost_model", "stochastic")).lower()
+        if model_type == "stochastic":
+            slip_model = StochasticCostModel(
+                base_half_spread_mult=float(settings.get("broker.half_spread_mult", 1.0)),
+                size_impact_coef=float(settings.get("broker.size_impact_coef", 0.25)),
+                vix_impact_coef=float(settings.get("broker.vix_impact_coef", 0.015)),
+                random_noise_bps=float(settings.get("broker.slip_noise_bps", 0.5)),
+                min_slippage_bps=float(settings.get("broker.slip_floor_bps", 0.5)),
+            )
+        else:
+            slip_model = LinearCostModel(
+                slippage_bps=float(settings.get("broker.slippage_bps", 2.0))
+            )
         self.broker = PaperBroker(
             starting_equity=settings.paper_equity,
             slippage_bps=settings.get("broker.slippage_bps", 2),
             journal=self.journal,
             snapshot_path=snap_path,
+            slippage_model=slip_model,
         )
         # Crash recovery: if a snapshot exists, restore state before we
         # accept the first tick. If this is a clean start, no-op.
@@ -170,8 +189,32 @@ class TradeBot:
             log.info("dividend_yield_primed", n=len(self.s.universe))
         except Exception as e:                           # noqa: BLE001
             log.warning("dividend_yield_prime_failed", err=str(e))
+
+        # Load measured priors from the journal (last 30 days). If we don't
+        # have enough trades yet, fall back to conservative defaults.
+        self._win_rate, self._avg_win, self._avg_loss = self._load_measured_priors()
+        log.info("priors_loaded", win_rate=self._win_rate,
+                 avg_win=self._avg_win, avg_loss=self._avg_loss)
         self._last_daily_summary_date = None
         self._halted_today = False
+
+        # Drawdown guard — reduces size / halts when peak-to-trough DD
+        # exceeds tiered thresholds. Peak seeded from last known equity.
+        self.drawdown_guard = DrawdownGuard()
+        self._peak_equity: float = float(settings.paper_equity)
+        self._dd_size_multiplier: float = 1.0      # updated each tick
+
+        # Regime classifier kind: 'rule' (stable default) or 'hmm' (smoother).
+        regime_kind = str(settings.get("regime.classifier", "rule")).lower()
+        self.regime_kind = regime_kind
+        self.hmm_regime_classifier = None
+        if regime_kind == "hmm":
+            try:
+                from .intelligence.regime_hmm import HMMRegimeClassifier
+                self.hmm_regime_classifier = HMMRegimeClassifier()
+                log.info("regime_classifier", kind="hmm")
+            except Exception as e:            # noqa: BLE001
+                log.warning("hmm_init_failed_fallback_to_rule", err=str(e))
 
         # Regime classifier + ensemble coordinator + live VIX probe
         self.vix_probe = VixProbe(
@@ -233,6 +276,42 @@ class TradeBot:
             if lstm._model is not None:
                 self.strategies.append(lstm)
         self._stop = threading.Event()
+
+    def _load_measured_priors(self, days: int = 30,
+                                min_trades: int = 30) -> tuple:
+        """Pull realized win_rate / avg_win / avg_loss from the journal.
+
+        Fallback priors (conservative, slight positive edge):
+          win_rate = 0.55, avg_win = 0.020, avg_loss = 0.025
+
+        These are used ONLY when there's insufficient live trade history.
+        Real bots should aim to have 100+ closed trades before trusting
+        journal-derived priors.
+        """
+        fallback = (0.55, 0.020, 0.025)
+        if self.journal is None:
+            return fallback
+        try:
+            from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+            since = _dt.now(tz=_tz.utc) - _td(days=days)
+            trades = self.journal.closed_trades(since=since)
+        except Exception as e:                      # noqa: BLE001
+            log.warning("priors_load_failed", err=str(e))
+            return fallback
+        wins = [t for t in trades if (t.pnl or 0) > 0]
+        losses = [t for t in trades if (t.pnl or 0) < 0]
+        if len(wins) + len(losses) < min_trades:
+            log.info("priors_using_fallback",
+                     n_trades=len(trades), needed=min_trades)
+            return fallback
+        win_rate = len(wins) / (len(wins) + len(losses))
+        avg_win = sum((t.pnl_pct or 0) for t in wins) / max(1, len(wins))
+        avg_loss = sum(abs(t.pnl_pct or 0) for t in losses) / max(1, len(losses))
+        # Sanity-clamp so one noisy month can't push us into Kelly extremes.
+        win_rate = max(0.30, min(0.80, win_rate))
+        avg_win = max(0.005, min(0.10, avg_win))
+        avg_loss = max(0.005, min(0.10, avg_loss))
+        return (win_rate, avg_win, avg_loss)
 
     def _refresh_catalysts(self) -> None:
         """Pull earnings/FDA events and hydrate the EconomicCalendar with
@@ -315,6 +394,9 @@ class TradeBot:
         if self._halted_today:
             return
         acct = self.broker.account()
+        # Track peak equity for peak-to-trough DD
+        if acct.equity > self._peak_equity:
+            self._peak_equity = acct.equity
         cap = self.s.max_daily_loss_pct * acct.equity
         if acct.day_pnl <= -cap:
             self._halted_today = True
@@ -323,6 +405,29 @@ class TradeBot:
                 f"Daily loss halt hit: day_pnl={acct.day_pnl:.2f} "
                 f"equity={acct.equity:.2f}. No new entries today.",
                 level="warn", title="HALT",
+            )
+            return
+        # Tiered drawdown guard: reduces size multiplier or HALTS if DD
+        # exceeds thresholds. Multiplier applied in _try_enter when sizing.
+        state = self.drawdown_guard.evaluate(acct.equity, self._peak_equity)
+        prev_mult = self._dd_size_multiplier
+        self._dd_size_multiplier = state.size_multiplier
+        if state.halted:
+            self._halted_today = True
+            log.warning("drawdown_halt", dd=state.current_drawdown_pct,
+                         peak=self._peak_equity, equity=acct.equity)
+            self.notifier.notify(
+                f"Drawdown halt: {state.current_drawdown_pct:.1%} from peak "
+                f"${self._peak_equity:.2f}. No new entries today.",
+                level="warn", title="HALT",
+            )
+        elif state.size_multiplier < 1.0 and prev_mult >= 1.0:
+            log.warning("drawdown_scale_down", mult=state.size_multiplier,
+                         dd=state.current_drawdown_pct)
+            self.notifier.notify(
+                f"Drawdown scale-down: ×{state.size_multiplier} "
+                f"(DD {state.current_drawdown_pct:.1%} from peak).",
+                level="warn", title="risk",
             )
 
     def _maybe_daily_summary(self, now) -> None:
@@ -416,6 +521,24 @@ class TradeBot:
         )
         regime = regime_snap.regime
 
+        # HMM overlay: if the HMM says we're in a high-vol regime, override
+        # the rule-based classifier's low-vol label. The rule-based one is
+        # stable and fast; the HMM catches structural breaks earlier.
+        if self.hmm_regime_classifier is not None:
+            try:
+                hmm = self.hmm_regime_classifier.classify(
+                    [b.close for b in bars[-150:]]
+                )
+                if hmm is not None and hmm.current_label == "high_vol":
+                    # Map rule-based regimes to their high-vol equivalents.
+                    from .intelligence.regime import Regime
+                    if regime == Regime.TREND_LOWVOL:
+                        regime = Regime.TREND_HIGHVOL
+                    elif regime == Regime.RANGE_LOWVOL:
+                        regime = Regime.RANGE_HIGHVOL
+            except Exception:
+                pass
+
         # 3. Run the coordinator
         decision = self.ensemble.aggregate(raw_signals, regime)
 
@@ -499,13 +622,25 @@ class TradeBot:
         # Regime passes through via sig.meta when the ensemble emitted it;
         # otherwise None → sizer leaves size untouched.
         regime = sig.meta.get("regime") if isinstance(sig.meta, dict) else None
+
+        # Per-symbol vol scaling: normalizes exposure so a $1 risk on NVDA
+        # ≈ $1 risk on KO. Uses recent bars passed in from _tick_symbol.
+        vs = vol_scale(bars, target_annual_vol=float(self.s.get(
+            "sizing.target_annual_vol", 0.20)))
+        vol_mult = vs.multiplier
+
         n = self.sizer.contracts(SizingInputs(
             equity=acct.equity, contract=contract,
-            win_rate_est=0.55, avg_win=0.015, avg_loss=0.025,
+            # Journal-measured priors — real observed performance, not guesses.
+            win_rate_est=self._win_rate,
+            avg_win=self._avg_win,
+            avg_loss=self._avg_loss,
             vix_today=vix_now, vix_52w_low=10.0, vix_52w_high=40.0,
             vrp_zscore=0.0, is_0dte=True,
             is_long=(sig.side == Side.BUY),
         ), regime=regime)
+        # Apply vol scaling + drawdown guard multiplier AFTER Kelly sizing
+        n = int(round(n * vol_mult * self._dd_size_multiplier))
         if n <= 0:
             return
         limit = spot * (1.001 if sig.side == Side.BUY else 0.999)
@@ -516,6 +651,16 @@ class TradeBot:
         if not v.ok:
             log.info("order_reject", reason=v.reason)
             return
+        # Push the current quote + VIX into the slippage model so the fill
+        # cost reflects real microstructure, not a fixed constant.
+        self.broker.update_market_context(
+            sig.symbol,
+            MarketContext(
+                bid=spot * 0.9998, ask=spot * 1.0002,
+                bid_size=1000, ask_size=1000, vix=vix_now,
+                recent_spread_pct=0.0004,
+            ),
+        )
         fill = self.broker.submit(v.adjusted_order or order)
         if fill:
             log.info("fill", symbol=sig.symbol, qty=n, price=fill.price, src=sig.source)
