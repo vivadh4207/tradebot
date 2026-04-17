@@ -751,23 +751,45 @@ class TradeBot:
                         underlying = pos.underlying or pos.symbol
                         right_str = (pos.right.value.upper() if pos.right
                                        else ("CALL" if pos.is_option else ""))
+                        exit_px = float(fill.price) if fill else float(price)
+                        # Decode the internal exit reason into a
+                        # plain-English explanation.
+                        reason_raw = str(d.reason)
+                        reason_human = {
+                            "fast_pt_hit": "Hit profit target (+35%) — full close (no scale-out path available)",
+                            "fast_scale_out_at_pt": "Hit profit target — closed 50%, trailing the rest",
+                            "fast_sl_hit": "Hit stop loss — cutting the trade to cap the loss",
+                            "fast_hard_cap": "Hit hard profit cap (+150%) — full close",
+                            "fast_trailing_stop": "Retraced >10% from peak — locking the remaining gain",
+                            "fast_0dte_scalp_timeout": "0DTE held past scalp window — theta was going to eat it",
+                            "momentum_reversal": "Underlying put in 3 consecutive bars against us — trend died",
+                            "volume_dry_up": "Volume fell below 50% baseline with no new high — interest faded",
+                        }
+                        prefix = reason_raw.split(":")[0]
+                        why = reason_human.get(prefix, reason_raw)
+                        pnl_emoji = "🟢" if realized_usd > 0 else ("🔴" if realized_usd < 0 else "⚪")
+                        description = (
+                            f"**P&L**: `{pnl_pct:+.2f}%` = **${realized_usd:+,.2f}**  "
+                            f"({qty_abs}× closed at ${exit_px:.2f}, entered at "
+                            f"${entry_px:.2f})\n\n"
+                            f"**Exit reason**: {why}"
+                        )
                         self.notifier.notify(
-                            f"CLOSE {qty_abs} × {right_str} {underlying} "
-                            f"@ ${(fill.price if fill else price):.2f} "
-                            f"→ {pnl_pct:+.1f}% (${realized_usd:+,.2f})",
-                            title="exit",
+                            description,
+                            title=(f"{pnl_emoji} EXIT — {underlying} {right_str} "
+                                     f"{pnl_pct:+.1f}% (${realized_usd:+,.0f})"),
                             level="success" if realized_usd > 0 else (
                                 "error" if realized_usd < 0 else "info"
                             ),
                             meta={
-                                "symbol": underlying,
-                                "side": f"{right_str} (closed)",
-                                "qty": qty_abs,
-                                "entry_px": round(entry_px, 4),
-                                "exit_px": round(float(fill.price) if fill else float(price), 4),
-                                "pnl_pct": f"{pnl_pct:+.2f}%",
-                                "pnl_usd": f"${realized_usd:+,.2f}",
-                                "reason": d.reason,
+                                "📊 Symbol": underlying,
+                                "📊 Contract": f"{right_str} {pos.strike or '—'}",
+                                "📊 Qty Closed": qty_abs,
+                                "💰 Entry Price": f"${entry_px:.2f}/share",
+                                "💰 Exit Price": f"${exit_px:.2f}/share",
+                                "💰 Realized P&L": f"{pnl_pct:+.2f}% = ${realized_usd:+,.2f}",
+                                "🔎 Trigger": prefix,
+                                "🔎 Detail": reason_raw.split(":", 1)[1] if ":" in reason_raw else "—",
                                 "_footer": f"OCC {pos.symbol}",
                             },
                         )
@@ -1323,33 +1345,71 @@ class TradeBot:
                       right=contract.right.value, strike=contract.strike,
                       qty=n, price=fill.price, src=sig.source,
                       auto_pt=auto_pt, auto_sl=auto_sl)
+            # Human-readable description at the top of the embed —
+            # explains the trade in one paragraph before the structured
+            # field breakdown. This is what the operator reads first.
+            direction_word = "bullish" if contract.right.value == "call" else "bearish"
+            side_word = contract.right.value.upper()
+            description = (
+                f"**Thesis**: {direction_word} on **{sig.symbol}** over the "
+                f"next {target_dte} day{'s' if target_dte != 1 else ''}.  Bought "
+                f"**{n}× {side_word}** at ${contract.strike} strike for "
+                f"**${fill.price:.2f}/share** (total cost "
+                f"**${n * fill.price * 100:,.2f}**).\n\n"
+                f"**Why now**: {sig.source} signal fired at "
+                f"{float(sig.confidence or 0):.2f} confidence in "
+                f"`{regime or '?'}` regime.  Underlying moved "
+                f"**{move_pct:+.2%}** over the last 5 bars with volume at "
+                f"**{vol_ratio:.1f}× avg**.  Delta **{delta_val:.2f}** means "
+                f"the option moves about **${delta_val*100:.0f}** for every "
+                f"$1 move in {sig.symbol}.\n\n"
+                f"**Exits auto-set**: profit target **${auto_pt}**, "
+                f"stop loss **${auto_sl}**.  Scale-out locks 50% at PT, "
+                f"the rest rides a trailing stop."
+            )
             self.notifier.notify(
-                f"BUY {n} × {contract.right.value.upper()} {sig.symbol} "
-                f"{contract.strike} @ ${fill.price:.2f}",
-                title="entry",
+                description,
+                title=f"🟢 ENTRY — {sig.symbol} {side_word} {contract.strike} ({target_dte}d)",
                 level="success",
                 meta={
-                    "symbol": sig.symbol,
-                    "side": f"{contract.right.value.upper()} (long)",
-                    "strike": contract.strike,
-                    "expiry": contract.expiry.isoformat() if contract.expiry else "—",
-                    "dte": target_dte,
-                    "qty": n,
-                    "fill_px": round(float(fill.price), 4),
-                    "cost_usd": round(n * fill.price * 100, 2),
-                    "delta": round(delta_val, 3) if delta_val else "—",
-                    "iv": round(contract.iv, 3) if contract.iv else "—",
-                    "regime": str(regime or "—"),
-                    "5bar_move": f"{move_pct:+.2%}",
-                    "vol_ratio": f"{vol_ratio:.1f}x",
-                    "spot": round(float(spot), 2),
-                    "vwap": round(float(vwap), 2),
-                    "sig_score": round(float(sig.confidence or 0), 3),
-                    "auto_PT": f"${auto_pt}",
-                    "auto_SL": f"${auto_sl}",
-                    "source": sig.source,
-                    "qty_policy": qty_reason,
-                    "_footer": f"OCC {contract.symbol}",
+                    # --- Position (row 1) -------------------------------
+                    "📊 Symbol": sig.symbol,
+                    "📊 Contract": f"{side_word} {contract.strike} · {target_dte}d",
+                    "📊 Qty × Price": f"{n} × ${fill.price:.2f} = ${n*fill.price*100:,.0f}",
+                    # --- Greeks (row 2) ---------------------------------
+                    "🎯 Delta": (
+                        f"{delta_val:.2f} (option moves "
+                        f"≈${delta_val*100:.0f}/$1 stock move)"
+                        if delta_val else "n/a"
+                    ),
+                    "🎯 IV": (
+                        f"{contract.iv:.1%} annualized" if contract.iv else "n/a"
+                    ),
+                    "🎯 Bid/Ask": f"${contract.bid:.2f} / ${contract.ask:.2f}",
+                    # --- Momentum (row 3) -------------------------------
+                    "📈 5-bar Move": (
+                        f"{move_pct:+.2%} in {direction_word} direction"
+                    ),
+                    "📈 Volume": f"{vol_ratio:.1f}× 20-bar average",
+                    "📈 Regime": str(regime or "?"),
+                    # --- Price context (row 4) --------------------------
+                    "📍 Spot": f"${spot:.2f}",
+                    "📍 VWAP": f"${vwap:.2f} ({((spot-vwap)/vwap*100):+.2f}% vs spot)",
+                    "📍 Signal Score": f"{float(sig.confidence or 0):.2f}",
+                    # --- Risk controls (row 5) --------------------------
+                    "🛑 Profit Target": (
+                        f"${auto_pt} "
+                        f"(+{((auto_pt-fill.price)/fill.price*100):.0f}%)"
+                    ),
+                    "🛑 Stop Loss": (
+                        f"${auto_sl} "
+                        f"({((auto_sl-fill.price)/fill.price*100):.0f}%)"
+                    ),
+                    "🛑 Qty Policy": qty_reason.split(":")[0],  # "default_1" / "strong"
+                    "_footer": (
+                        f"{contract.symbol} · src={sig.source} · "
+                        f"expires {contract.expiry.isoformat() if contract.expiry else '?'}"
+                    ),
                 },
             )
 
