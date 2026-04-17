@@ -10,7 +10,15 @@ import yaml
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    # Explicit .env path — tied to the repo root, not CWD. Prevents
+    # silent env-missing mode when the bot runs under launchd/systemd
+    # where CWD might not be the project root or the shell's .profile
+    # isn't sourced. Falls back to default (CWD walk) if not found.
+    _env_path = Path(__file__).resolve().parents[2] / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path)
+    else:
+        load_dotenv()
 except ImportError:
     pass
 

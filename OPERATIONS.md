@@ -9,6 +9,29 @@ observe at the same cadence it does.
 
 ---
 
+## Filter thresholds — ETFs vs stocks
+
+`execution.min_volume_confirmation_etf` (default **0.80**) and
+`execution.min_volume_confirmation_stock` (default **1.20**) control
+the per-bar volume / 20-bar-average ratio required for entry. ETFs
+get the looser threshold because their per-bar volume hovers near the
+average (SPY, QQQ, IWM, and the sector SPDRs trade tens of millions
+of shares/day at steady rates — they don't need surges to be
+tradable). Stocks need the 1.20× surge to confirm momentum.
+
+The `_is_etf(symbol)` helper in `src/main.py` classifies the universe
+via an explicit allow-list (broad-market index + bond/commodity/vol
+ETFs) plus a prefix heuristic covering SPDR sectors (XLF, XLE, XLC,
+XLI, XLB, XLU, XLY, XLV, XLP, XLK) and thematic ETFs (XBI, XHE, XME,
+XRT, XSD, XOP, XHB, XUR, ...). 4-char-max `X*` tickers only, so real
+stocks (e.g. XYZ-corp) don't get mis-classified.
+
+If you see a symbol repeatedly blocked at
+`f09_volume_confirmation[stock]: 0.98<1.20` that's actually an ETF,
+add it to `_ETF_EXPLICIT` in `src/main.py`.
+
+---
+
 ## The three loops
 
 | Loop | Cadence | What it tunes | Human review |

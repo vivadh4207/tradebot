@@ -103,14 +103,21 @@ signal:
 
 # ===== Execution =====
 execution:
-  min_volume_confirmation: 1.2   # current bar >= 1.2x avg
+  # Volume confirmation — per-bar volume / 20-bar avg must exceed this.
+  # ETFs get a looser threshold because their per-bar volume naturally
+  # hovers near the average (SPY trades ~70M/day steadily, so 1.2× surges
+  # are rare but liquidity is still ample). Stocks need the surge for
+  # momentum confirmation.
+  min_volume_confirmation: 1.2        # legacy single-value (fallback)
+  min_volume_confirmation_etf: 0.80   # SPY, QQQ, IWM, XLF, etc.
+  min_volume_confirmation_stock: 1.20 # individual stocks
   max_spread_pct_etf: 0.05
   max_spread_pct_stock: 0.10
   min_open_interest: 500
   min_today_option_volume: 100
   max_0dte_per_day: 50
   order_ttl_seconds: 5
-  target_dte: 1              # DTE to pick from the options chain (1 = next-day expiry)
+  target_dte: 7              # DTE to pick from the options chain (1 = next-day expiry)
 
 # ===== Position sizing =====
 sizing:
@@ -163,6 +170,12 @@ news:
 broker:
   name: paper             # paper | alpaca
   cost_model: stochastic  # 'stochastic' (recommended) or 'linear' (legacy fixed-bps)
+  # Fire-and-forget mirror: every paper order is ALSO submitted to
+  # Alpaca paper so trades appear in Alpaca's UI. Our PaperBroker stays
+  # source of truth; the two books will drift over time since the
+  # simulators differ. Requires ALPACA_API_KEY_ID + ALPACA_API_SECRET_KEY
+  # in .env and L1+ options permission on the Alpaca paper account.
+  mirror_to_alpaca: true
   slippage_bps: 2         # only used when cost_model=linear
   commission_per_option: 0.0
   commission_per_share: 0.0

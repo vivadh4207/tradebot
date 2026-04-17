@@ -110,13 +110,34 @@ class ExecutionChain:
                             advisory=True)
 
     def f09_volume_confirmation(self, ctx: ExecutionContext) -> FilterResult:
-        min_mult = self._s["execution"]["min_volume_confirmation"]
+        """Volume confirmation with ETF-aware thresholds.
+
+        ETFs (SPY/QQQ/IWM + sector ETFs) are inherently high-liquidity;
+        their per-minute bar volume doesn't need to exceed average to be
+        tradable — the average itself is already huge. Individual stocks
+        do need volume confirmation to separate genuine momentum from
+        chop. Two separate thresholds:
+          execution.min_volume_confirmation_etf   (default 0.80)
+          execution.min_volume_confirmation_stock (default 1.20)
+
+        `execution.min_volume_confirmation` (legacy) is used as a shared
+        default if the split values aren't set, for backward compat.
+        """
+        ex = self._s["execution"]
+        legacy = float(ex.get("min_volume_confirmation", 1.20))
+        if ctx.is_etf:
+            min_mult = float(ex.get("min_volume_confirmation_etf", 0.80))
+        else:
+            min_mult = float(ex.get("min_volume_confirmation_stock", legacy))
         if ctx.avg_bar_volume <= 0:
             return FilterResult(True, "vol_confirm: no_avg", advisory=True)
         mult = ctx.current_bar_volume / ctx.avg_bar_volume
+        kind = "etf" if ctx.is_etf else "stock"
         if mult < min_mult:
-            return FilterResult(False, f"vol_confirm: {mult:.2f}<{min_mult}")
-        return FilterResult(True, "ok")
+            return FilterResult(
+                False, f"vol_confirm[{kind}]: {mult:.2f}<{min_mult}"
+            )
+        return FilterResult(True, f"vol_confirm[{kind}]: {mult:.2f}>={min_mult}")
 
     def f10_orb_breakout(self, ctx: ExecutionContext) -> FilterResult:
         # Only apply to signals that explicitly require ORB confirmation.

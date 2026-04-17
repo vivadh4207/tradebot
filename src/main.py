@@ -78,6 +78,38 @@ def _build_data_adapter(settings: Settings) -> MarketDataAdapter:
     return SyntheticDataAdapter()
 
 
+# ETF universe classification. Used by f09_volume_confirmation to pick the
+# right volume-confirmation threshold: ETFs are inherently high-liquidity,
+# so per-bar volume often sits at ~1.0x avg (no surge) yet is still
+# perfectly tradable. Individual stocks need the surge to confirm
+# momentum is real.
+#
+# Prefix-based heuristic covers the major sector / thematic ETF families
+# (X**, IY**, VO**, Q** index ones) plus an explicit allow-list of the
+# top broad-market ETFs. Cheap to evaluate on every tick.
+_ETF_EXPLICIT = {
+    "SPY", "QQQ", "IWM", "DIA",       # broad index
+    "VOO", "VTI", "VT", "VEA",        # Vanguard
+    "IVV", "IJH", "IJR", "IWF",       # iShares
+    "EEM", "EFA", "EWZ",              # international
+    "TLT", "IEF", "SHY", "LQD", "HYG", # bonds
+    "GLD", "SLV", "USO",              # commodities
+    "UVXY", "VXX",                    # vol
+}
+_ETF_PREFIXES = ("XL", "XB", "XH", "XM", "XR", "XS", "XO", "XU")  # SPDR sectors
+
+
+def _is_etf(symbol: str) -> bool:
+    sym = (symbol or "").upper()
+    if sym in _ETF_EXPLICIT:
+        return True
+    # SPDR sector ETFs: XLF, XLE, XLC, XLI, XLB, XLU, XLY, XLV, XLP, XLK
+    # + XBI, XHE, XME, XRT, XSD, XOP, XHB, XUR, etc. from the user's universe
+    if any(sym.startswith(p) for p in _ETF_PREFIXES) and len(sym) <= 4:
+        return True
+    return False
+
+
 def _build_chain_provider(settings: Settings) -> OptionsChainProvider:
     key, secret = _have_alpaca_creds()
     if key and secret:
@@ -205,13 +237,48 @@ class TradeBot:
             )
             self._autocal_mode = "manual"
             self._auto_cost_model = None
-        self.broker = PaperBroker(
-            starting_equity=settings.paper_equity,
-            slippage_bps=settings.get("broker.slippage_bps", 2),
-            journal=self.journal,
-            snapshot_path=snap_path,
-            slippage_model=slip_model,
-        )
+        # Optional: mirror every order to Alpaca paper for UI visibility.
+        # Our PaperBroker stays source of truth; the mirror is
+        # fire-and-forget. The two books will drift over time
+        # (different fill simulators) but that's a feature, not a bug —
+        # we compare them to detect our model's bias.
+        mirror_alpaca = bool(settings.get("broker.mirror_to_alpaca", False))
+        alpaca_mirror_broker = None
+        if mirror_alpaca:
+            try:
+                key = os.environ.get("ALPACA_API_KEY_ID", "").strip()
+                sec = os.environ.get("ALPACA_API_SECRET_KEY", "").strip()
+                if not key or not sec:
+                    raise RuntimeError("ALPACA_API_KEY_ID / ALPACA_API_SECRET_KEY missing in env")
+                from .brokers.alpaca_adapter import AlpacaBroker
+                alpaca_mirror_broker = AlpacaBroker(
+                    api_key=key, api_secret=sec, paper=True,
+                )
+                log.info("alpaca_mirror_initialized", paper=True)
+            except Exception as e:                           # noqa: BLE001
+                log.warning("alpaca_mirror_init_failed", err=str(e))
+                alpaca_mirror_broker = None
+
+        if alpaca_mirror_broker is not None:
+            from .brokers.mirror_alpaca import MirrorAlpacaBroker
+            self.broker = MirrorAlpacaBroker(
+                starting_equity=settings.paper_equity,
+                slippage_bps=settings.get("broker.slippage_bps", 2),
+                journal=self.journal,
+                snapshot_path=snap_path,
+                slippage_model=slip_model,
+                alpaca_broker=alpaca_mirror_broker,
+            )
+            log.info("broker", kind="paper+alpaca_mirror")
+        else:
+            self.broker = PaperBroker(
+                starting_equity=settings.paper_equity,
+                slippage_bps=settings.get("broker.slippage_bps", 2),
+                journal=self.journal,
+                snapshot_path=snap_path,
+                slippage_model=slip_model,
+            )
+            log.info("broker", kind="paper")
         # Crash recovery: if a snapshot exists, restore state before we
         # accept the first tick. If this is a clean start, no-op.
         try:
@@ -731,7 +798,7 @@ class TradeBot:
             avg_bar_volume=sum(b.volume for b in bars[-20:]) / 20,
             opening_range_high=or_hi, opening_range_low=or_lo,
             spot=spot, vwap=vwap, vix=vix_now,
-            is_etf=sig.symbol in {"SPY", "QQQ", "IWM"},
+            is_etf=_is_etf(sig.symbol),
             econ_blackout=econ_blackout,
             news_score=news_score, news_label=news_label,
             news_rationale=news_rationale,
