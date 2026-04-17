@@ -68,21 +68,9 @@ universe:
   - AAL
   - UAL
   - AXP
-  - XLF
   - XLE
-  - XLY
-  - XLC
-  - XLI
-  - XLB
-  - XLU
-  - XBI
-  - XHE
-  - XME
-  - XRT
-  - XSD
-  - XOP
-  - XHB
-  - XUR 
+  - HOOD
+
 
 # ===== Session (US Eastern) =====
 session:
@@ -122,6 +110,7 @@ execution:
   min_today_option_volume: 100
   max_0dte_per_day: 50
   order_ttl_seconds: 5
+  target_dte: 1              # DTE to pick from the options chain (1 = next-day expiry)
 
 # ===== Position sizing =====
 sizing:
@@ -203,6 +192,11 @@ regime:
 storage:
   backend: cockroach              # sqlite | cockroach
   cockroach_dsn_env: COCKROACH_DSN   # name of env var holding the connection string
+  # All tradebot tables live in this schema, isolated from any unrelated
+  # tables sharing the same database. A CREATE SCHEMA IF NOT EXISTS runs
+  # on every connect; search_path is pinned to `<schema>, public` so
+  # writes land here and shared extensions (pgcrypto etc.) still resolve.
+  cockroach_schema: tradebot
 
 # ===== ML / LSTM signal =====
 ml:

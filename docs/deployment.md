@@ -81,8 +81,14 @@ sudo systemctl stop tradebot           # hard stop
 
 ### Acceptable alternatives
 
-- **Local Mac/PC with launchd/Task Scheduler.** Fine for paper testing. Bad
-  for live trading because the machine sleeps or reboots.
+- **Local Mac with the included launchd watchdog.** Good for paper and
+  small live books, provided you disable sleep (`sudo pmset -c
+  disablesleep 1` or `caffeinate -is`) and use the included watchdog
+  (`tradebotctl watchdog-install`). The watchdog restarts on crash,
+  alerts via Discord/Slack, and recycles on silent hangs — see
+  `docs/scheduling.md § Mode 2`. A home Mac is still less reliable than
+  a VPS (ISP outages, power blips), but the robustness gap has narrowed
+  meaningfully. Lid-closed on AC is safe with `disablesleep 1`.
 - **Fly.io / Railway / Render.** These support long-running processes;
   workable but generally more expensive than a $5 VPS for this workload.
 - **Docker on an always-on server.** Good. Add a `Dockerfile` and `docker-compose.yml`

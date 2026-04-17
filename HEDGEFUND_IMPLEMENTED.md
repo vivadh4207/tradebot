@@ -1,6 +1,10 @@
 # Hedge-fund roadmap — implementation report
 
-**Test count:** 145/145 passing (+13 new)
+**Test count:** 174/174 passing (+13 roadmap + 16 continuous-cal / watchdog)
+
+_Last updated: 2026-04-16 — see "Post-roadmap additions" at the bottom
+for the continuous-calibration and launchd-watchdog work that landed
+after the Tier 1–3 batch._
 
 ## Tier 1 — highest Sharpe impact (all 5 done)
 
@@ -113,7 +117,7 @@ tests/test_hedgefund_batch.py             # 13 regression tests
 ## Verification
 
 ```
-145 passed in 3.35s
+174 passed in 4.78s
 ```
 
 All 13 new tests specifically lock down the hedge-fund features:
@@ -144,3 +148,90 @@ The code is in. **The work that remains is running it for 30+ days and actually 
 - Triggering `check_drift` on your LSTM features weekly
 
 The infrastructure now matches what a real quant desk has. The constraint on actual performance is still what it was before: **measuring, observing, and iterating on real data**. Don't let the feature count make you complacent — *edge detection*, not feature count, is what separates a profitable bot from an expensive learning project.
+
+---
+
+## Post-roadmap additions
+
+Two things landed after the Tier 1–3 batch in response to operator
+feedback. Both are wired into the hot path (not shelfware).
+
+### Continuous slippage calibration (10 tests)
+
+The Tier 1 cost model was static until an operator manually tuned it.
+It now self-tunes on a schedule with guardrails. Reference quant
+practice (Almgren-Chriss post-trade analysis): observe realized vs
+predicted slippage, apply bounded adjustments, audit every change.
+
+Files:
+```
+src/analytics/slippage_calibration.py   # JSONL logger + analyze + propose_tuning
+src/brokers/auto_calibrating_model.py   # wraps StochasticCostModel, scheduled recalib
+scripts/calibrate_slippage.py           # weekly human-review report
+scripts/daily_report.py                 # EOD snapshot w/ keep_or_tune field
+config/settings.yaml                    # broker.auto_calibrate: daily (default)
+```
+
+Guardrails (non-negotiable):
+  - never move any constant more than 30% per cycle (daily) / 10% (hourly)
+  - never drift more than 2× from baseline across all cycles
+  - never tune with < 30 samples
+  - "keep what works" rule: if observed/predicted ratio ∈ [0.8, 1.2],
+    don't touch anything
+
+Dashboard: `/api/calibration` endpoint surfaces current stats +
+adjustment history. See `OPERATIONS.md` for the 3-cadence operator
+flow (daily / weekly / monthly).
+
+### Watchdog supervision (8 tests)
+
+Cron + a naked `run_paper.py` have two failure modes cron can't handle:
+(a) silent hangs where the process is alive but the main loop is
+wedged, and (b) unalerted crashes where the operator doesn't find out
+until the next market open. Fixed with a two-layer supervisor.
+
+Files:
+```
+scripts/watchdog_run.py                    # Python wrapper, crash alerts + heartbeat watchdog
+deploy/launchd/com.tradebot.paper.plist    # launchd KeepAlive=true → watchdog
+src/main.py                                # writes logs/heartbeat.txt every tick
+scripts/tradebotctl.sh                     # watchdog-install / -uninstall / -status
+```
+
+Layers:
+```
+launchd (KeepAlive=true) → watchdog_run.py → run_paper.py
+                             │
+                             ├── alerts Discord/Slack on crash (via src.notify)
+                             ├── tails stderr + records to watchdog_events.jsonl
+                             └── kills child if logs/heartbeat.txt stales (default 5 min)
+```
+
+What each layer catches: see `OPERATIONS.md § Watchdog supervision`.
+
+Install:
+```bash
+./scripts/tradebotctl.sh watchdog-install
+./scripts/tradebotctl.sh watchdog-status
+```
+
+### New test files
+
+```
+tests/test_continuous_calibration.py    # 10 tests: logger, analyze, propose_tuning,
+                                        # AutoCalibratingCostModel recalibrate + drift cap,
+                                        # PaperBroker calibration recording, /api/calibration
+tests/test_watchdog.py                   # 8 tests: clean exit, crash, stale heartbeat,
+                                        # fresh heartbeat, startup grace, append-only
+                                        # event log, stderr tail, heartbeat reset
+```
+
+### What did NOT land (intentionally)
+
+- **Network-outage detection.** A router/Wi-Fi/ISP blip lets the bot
+  keep ticking while Alpaca is unreachable; the SDK retries internally
+  but a multi-hour outage will silently miss trades. Out of scope for
+  the watchdog (which only sees the process). Separate backlog item.
+- **Dashboard alerting beyond the webhook.** The notifier covers
+  Discord/Slack. Pager/PagerDuty integration is not worth the
+  complexity at retail scale.

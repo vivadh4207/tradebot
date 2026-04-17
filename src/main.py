@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 import threading
 import time
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Dict, List, Optional
 
 from .core.clock import MarketClock
@@ -114,9 +114,11 @@ def _build_journal_from_settings(settings: Settings) -> Optional[TradeJournal]:
     backend = settings.get("storage.backend", "sqlite")
     sqlite_path = settings.get("storage.sqlite_path", "logs/tradebot.sqlite")
     dsn_env = settings.get("storage.cockroach_dsn_env", "COCKROACH_DSN")
+    schema = settings.get("storage.cockroach_schema", "tradebot")
     try:
-        j = build_journal(backend=backend, sqlite_path=sqlite_path, dsn_env_var=dsn_env)
-        log.info("journal", backend=backend)
+        j = build_journal(backend=backend, sqlite_path=sqlite_path,
+                           dsn_env_var=dsn_env, cockroach_schema=schema)
+        log.info("journal", backend=backend, schema=schema if backend != "sqlite" else None)
         return j
     except Exception as e:
         log.warning("journal_init_failed_fallback_to_none", err=str(e))
@@ -141,6 +143,11 @@ class TradeBot:
         self.chain_provider = _build_chain_provider(settings)
         self.journal = _build_journal_from_settings(settings)
         self.notifier: Notifier = build_notifier()
+        # Log the notifier flavor so operators can tell whether webhooks
+        # are wired (NullNotifier means DISCORD_WEBHOOK_URL /
+        # SLACK_WEBHOOK_URL was empty at import time — env var missing or
+        # .env not loaded by the time build_notifier() ran).
+        log.info("notifier", flavor=type(self.notifier).__name__)
         # Late-bind notifier to the auto-calibrator so it can push alerts
         # when realized vs. predicted slippage diverges meaningfully.
         if self._auto_cost_model is not None:
@@ -323,14 +330,21 @@ class TradeBot:
                                 min_trades: int = 30) -> tuple:
         """Pull realized win_rate / avg_win / avg_loss from the journal.
 
-        Fallback priors (conservative, slight positive edge):
-          win_rate = 0.55, avg_win = 0.020, avg_loss = 0.025
+        Fallback priors (small, honestly positive edge — +0.34% EV/trade):
+          win_rate = 0.52, avg_win = 0.025, avg_loss = 0.020
+
+        EV = 0.52*0.025 - 0.48*0.020 = +0.0034 per trade.
+        Kelly fraction f = (1.25*0.52 - 0.48) / 1.25 = 0.136 → combined
+        with `kelly_fraction_cap=0.25` and `kelly_hard_cap_pct=0.05`,
+        sizer emits small-but-nonzero positions. That's important: with
+        negative-EV fallbacks the bot never trades → priors never
+        accumulate → it stays stuck forever (chicken-and-egg).
 
         These are used ONLY when there's insufficient live trade history.
         Real bots should aim to have 100+ closed trades before trusting
         journal-derived priors.
         """
-        fallback = (0.55, 0.020, 0.025)
+        fallback = (0.52, 0.025, 0.020)
         if self.journal is None:
             return fallback
         try:
@@ -354,6 +368,54 @@ class TradeBot:
         avg_win = max(0.005, min(0.10, avg_win))
         avg_loss = max(0.005, min(0.10, avg_loss))
         return (win_rate, avg_win, avg_loss)
+
+    def _build_mark_prices(self, positions) -> Dict[str, float]:
+        """Build {position.symbol → mark_price} for an arbitrary list of
+        open positions. Options look up the current chain and use the
+        conservative side (bid on long, ask on short); stocks use
+        `latest_price(underlying)`. Missing quotes fall through silently
+        so flatten_all can fall back to avg_price.
+        """
+        marks: Dict[str, float] = {}
+        # Group by underlying so we fetch each chain at most once.
+        option_pos_by_underlying: Dict[str, list] = {}
+        for p in positions:
+            if p.is_option and p.underlying:
+                option_pos_by_underlying.setdefault(p.underlying, []).append(p)
+            else:
+                u = p.underlying or p.symbol
+                last = self.data.latest_price(u)
+                if last is not None:
+                    marks[p.symbol] = float(last)
+        for under, ops in option_pos_by_underlying.items():
+            spot = self.data.latest_price(under)
+            if spot is None:
+                continue
+            try:
+                from datetime import date as _d
+                # Pull the nearest chain; exit engine closes the specific
+                # contract, so we need its exact (strike, expiry, right).
+                dte_needed = max(1, min(
+                    ((p.expiry - _d.today()).days for p in ops if p.expiry),
+                    default=1,
+                ))
+                chain = self.chain_provider.chain(under, float(spot),
+                                                   target_dte=int(dte_needed))
+            except Exception as e:
+                log.warning("mark_chain_fetch_failed", underlying=under, err=str(e))
+                continue
+            # index chain by (strike, expiry, right) for O(1) lookup
+            idx = {(round(c.strike, 4), c.expiry, c.right): c for c in chain}
+            for p in ops:
+                key = (round(p.strike or 0.0, 4), p.expiry, p.right)
+                c = idx.get(key)
+                if c is None:
+                    continue
+                # Conservative mark: long closes at bid, short closes at ask.
+                mark = c.bid if p.qty > 0 else c.ask
+                if mark and mark > 0:
+                    marks[p.symbol] = float(mark)
+        return marks
 
     def _refresh_catalysts(self) -> None:
         """Pull earnings/FDA events and hydrate the EconomicCalendar with
@@ -388,8 +450,23 @@ class TradeBot:
                 self._stop.set()
                 break
             try:
-                for pos in list(self.broker.positions()):
-                    price = self.data.latest_price(pos.underlying or pos.symbol) or pos.avg_price
+                open_pos = list(self.broker.positions())
+                if not open_pos:
+                    self._stop.wait(interval)
+                    continue
+                # Options positions need per-contract marks (from the chain),
+                # NOT underlying spot. Using spot here would feed $250 into
+                # an exit evaluator that's comparing to a $1.20 option entry,
+                # triggering the hard-profit-cap instantly every tick.
+                marks = self._build_mark_prices(open_pos)
+                for pos in open_pos:
+                    price = marks.get(
+                        pos.symbol,
+                        # fallback: option avg_price (zero-change), stock spot
+                        pos.avg_price if pos.is_option
+                        else (self.data.latest_price(pos.underlying or pos.symbol)
+                              or pos.avg_price),
+                    )
                     d = self.fast.evaluate(pos, price)
                     if d and d.should_close:
                         side = Side.SELL if pos.qty > 0 else Side.BUY
@@ -397,18 +474,27 @@ class TradeBot:
                                   is_option=pos.is_option, limit_price=price,
                                   tag=f"fast:{d.reason}")
                         self.broker.submit(o)
-                        log.info("fast_exit", symbol=pos.symbol, reason=d.reason)
+                        log.info("fast_exit", symbol=pos.symbol,
+                                  reason=d.reason, price=price)
             except Exception as e:  # noqa: BLE001
                 log.warning("fast_loop_error", err=str(e))
             self._stop.wait(interval)
 
     def main_loop(self) -> None:
         interval = float(self.s.get("exits.main_loop_interval_sec", 180))
-        kill_file = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "KILL",
-        )
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        kill_file = os.path.join(repo_root, "KILL")
+        heartbeat_file = os.path.join(repo_root, "logs", "heartbeat.txt")
+        os.makedirs(os.path.dirname(heartbeat_file), exist_ok=True)
         while not self._stop.is_set():
+            # Heartbeat: the watchdog reads this and restarts us if it goes
+            # stale (process alive but main loop wedged). Cost: one syscall
+            # per tick.
+            try:
+                with open(heartbeat_file, "w", encoding="utf-8") as _hb:
+                    _hb.write(datetime.now(tz=timezone.utc).isoformat())
+            except Exception:
+                pass
             # cooperative kill switch: tradebotctl stop / `touch KILL`
             if os.path.exists(kill_file):
                 log.warning("kill_switch_seen", path=kill_file)
@@ -426,6 +512,17 @@ class TradeBot:
                 if not self._halted_today:
                     for symbol in self.s.universe:
                         self._tick_symbol(symbol)
+                # Mark every open position at current market so equity reflects
+                # live P&L (otherwise it's frozen at avg_price until a close).
+                # Fail-soft — a bad chain fetch shouldn't stop the loop.
+                try:
+                    open_pos = self.broker.positions()
+                    if open_pos:
+                        self.broker.mark_to_market(
+                            self._build_mark_prices(open_pos)
+                        )
+                except Exception as e:                        # noqa: BLE001
+                    log.warning("mtm_tick_failed", err=str(e))
             except Exception as e:  # noqa: BLE001
                 log.error("main_loop_error", err=str(e))
                 self.notifier.notify(f"main_loop_error: {e}", level="error",
@@ -484,12 +581,7 @@ class TradeBot:
         open_before = list(self.broker.positions())
         if open_before:
             log.info("eod_flatten_start", n=len(open_before))
-            mark_prices = {}
-            for p in open_before:
-                underlying = p.underlying or p.symbol
-                last = self.data.latest_price(underlying)
-                if last is not None:
-                    mark_prices[p.symbol] = last
+            mark_prices = self._build_mark_prices(open_before)
             try:
                 self.broker.flatten_all(mark_prices=mark_prices)
             except Exception as e:                 # noqa: BLE001
@@ -655,12 +747,28 @@ class TradeBot:
                     )
                     break
             return
-        from .core.types import OptionContract
-        contract = OptionContract(symbol=sig.symbol, underlying=sig.symbol,
-                                  strike=spot, expiry=sig.expiry or date.today(),
-                                  right=sig.option_right or OptionRight.CALL,
-                                  ask=max(0.05, spot * 0.02), bid=max(0.04, spot * 0.018),
-                                  open_interest=1000, today_volume=200)
+        # ---- Pick a real option from the chain -----------------------
+        # Directional signal → map to CALL (bullish) or PUT (bearish).
+        # For the ensemble path, `sig.side` is BUY for bullish entries
+        # across the board (we always long the option, not short it).
+        # The dominant_direction on the underlying decides right.
+        from .core.types import OptionContract, OptionRight
+        from .data.options_chain import SyntheticOptionsChain
+        meta_dir = sig.meta.get("direction") if isinstance(sig.meta, dict) else None
+        if sig.option_right is not None:
+            right = sig.option_right
+        elif meta_dir == "bearish":
+            right = OptionRight.PUT
+        else:
+            right = OptionRight.CALL
+
+        target_dte = int(self.s.get("execution.target_dte", 1))
+        chain = self.chain_provider.chain(sig.symbol, spot, target_dte=target_dte)
+        contract = SyntheticOptionsChain.find_atm(chain, spot, right)
+        if contract is None:
+            log.info("entry_skip_no_contract", symbol=sig.symbol,
+                      source=sig.source, right=right.value)
+            return
         # Regime passes through via sig.meta when the ensemble emitted it;
         # otherwise None → sizer leaves size untouched.
         regime = sig.meta.get("regime") if isinstance(sig.meta, dict) else None
@@ -681,31 +789,74 @@ class TradeBot:
             vrp_zscore=0.0, is_0dte=True,
             is_long=(sig.side == Side.BUY),
         ), regime=regime)
+        kelly_n = n
         # Apply vol scaling + drawdown guard multiplier AFTER Kelly sizing
         n = int(round(n * vol_mult * self._dd_size_multiplier))
         if n <= 0:
+            # Surface WHY. This is the silent-drop that was invisible: Kelly
+            # returns 0 when the priors imply negative EV, vol_scale clips
+            # near zero, or drawdown guard is fully engaged.
+            log.info(
+                "entry_skip_qty_zero",
+                symbol=sig.symbol, source=sig.source,
+                kelly_n=kelly_n, vol_mult=round(vol_mult, 3),
+                dd_mult=round(self._dd_size_multiplier, 3),
+                win_rate=self._win_rate, avg_win=self._avg_win,
+                avg_loss=self._avg_loss,
+            )
             return
-        limit = spot * (1.001 if sig.side == Side.BUY else 0.999)
-        order = Order(symbol=sig.symbol, side=sig.side, qty=n,
-                      is_option=False, limit_price=limit, tag=f"entry:{sig.source}")
+        # Directional bet on the underlying is expressed as LONG options:
+        # bullish → BUY CALL, bearish → BUY PUT. We don't sell premium here;
+        # that's a separate strategy that would need explicit configuration.
+        # Limit: cross the ask slightly so the fill is near-certain.
+        limit = round(contract.ask * 1.02, 2)
+        order = Order(symbol=contract.symbol, side=Side.BUY, qty=n,
+                      is_option=True, limit_price=limit,
+                      tag=f"entry:{sig.source}:{sig.symbol}")
         v = self.validator.validate(order, contract, acct.buying_power,
                                     self.s.get("account.max_open_positions", 5))
         if not v.ok:
-            log.info("order_reject", reason=v.reason)
+            log.info("order_reject", reason=v.reason, symbol=sig.symbol)
             return
         # Push the current quote + VIX into the slippage model so the fill
         # cost reflects real microstructure, not a fixed constant.
         self.broker.update_market_context(
-            sig.symbol,
+            contract.symbol,
             MarketContext(
-                bid=spot * 0.9998, ask=spot * 1.0002,
+                bid=contract.bid, ask=contract.ask,
                 bid_size=1000, ask_size=1000, vix=vix_now,
-                recent_spread_pct=0.0004,
+                recent_spread_pct=(contract.ask - contract.bid) / max(contract.ask, 0.01),
             ),
         )
-        fill = self.broker.submit(v.adjusted_order or order)
+        # Auto PT/SL at entry — CLAUDE.md hard rule. We price on the option,
+        # not the underlying. Short-DTE → tighter targets (matches the
+        # exit-engine defaults from config/settings.yaml).
+        dte = (contract.expiry - date.today()).days if contract.expiry else 9999
+        is_short_dte = dte <= 1
+        pt_pct = float(self.s.get(
+            "exits.profit_target_short_dte_pct" if is_short_dte
+            else "exits.profit_target_multi_dte_pct",
+            0.35 if is_short_dte else 0.50,
+        ))
+        sl_pct = float(self.s.get(
+            "exits.stop_loss_short_dte_pct" if is_short_dte
+            else "exits.stop_loss_multi_dte_pct",
+            0.20 if is_short_dte else 0.30,
+        ))
+        entry_px = limit  # the order's limit; fill may differ slightly
+        auto_pt = round(entry_px * (1 + pt_pct), 4)
+        auto_sl = round(max(0.01, entry_px * (1 - sl_pct)), 4)
+        fill = self.broker.submit(
+            v.adjusted_order or order,
+            contract=contract,
+            auto_profit_target=auto_pt,
+            auto_stop_loss=auto_sl,
+        )
         if fill:
-            log.info("fill", symbol=sig.symbol, qty=n, price=fill.price, src=sig.source)
+            log.info("fill", symbol=contract.symbol, underlying=sig.symbol,
+                      right=contract.right.value, strike=contract.strike,
+                      qty=n, price=fill.price, src=sig.source,
+                      auto_pt=auto_pt, auto_sl=auto_sl)
             self.notifier.notify(
                 f"{sig.symbol} {sig.side.value} x{n} @ {fill.price:.2f} src={sig.source}",
                 title="entry",
@@ -716,6 +867,23 @@ class TradeBot:
             log.error("live_trading_blocked_in_main_of_default_build — remove guard explicitly")
             return
         configure_logging("INFO")
+
+        # Startup ping to the notifier. Double-purpose:
+        # (1) confirms the Discord/Slack webhook is actually wired (if
+        #     the user never sees this message, their URL is wrong or
+        #     env var didn't load).
+        # (2) telemetry: each start is a restart event worth seeing.
+        try:
+            backend = self.s.get("storage.backend", "sqlite")
+            schema = self.s.get("storage.cockroach_schema", "tradebot") if backend != "sqlite" else ""
+            mode = "LIVE" if self.s.live_trading else "paper"
+            self.notifier.notify(
+                f"tradebot started — {mode}, broker={self.s.get('broker.name','paper')}"
+                + (f", schema={schema}" if schema else ""),
+                level="info", title="startup",
+            )
+        except Exception:
+            pass
 
         # SIGTERM / SIGINT handler so `systemctl stop` and Ctrl-C give us a
         # chance to flush the journal and trigger an EOD flatten.
@@ -768,11 +936,7 @@ class TradeBot:
                 open_now = list(self.broker.positions())
                 if open_now:
                     log.warning("shutdown_flatten", n=len(open_now))
-                    mark = {}
-                    for p in open_now:
-                        last = self.data.latest_price(p.underlying or p.symbol)
-                        if last is not None:
-                            mark[p.symbol] = last
+                    mark = self._build_mark_prices(open_now)
                     self.broker.flatten_all(mark_prices=mark)
             except Exception as e:                    # noqa: BLE001
                 log.error("shutdown_flatten_error", err=str(e))

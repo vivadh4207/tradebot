@@ -10,6 +10,12 @@ findings consolidated and verified against source, then fixed.
 **Result:** 12 P0/P1 fixes applied, 11 new regression tests added,
 **118/118 suite green.**
 
+> **Note (2026-04-16, same day — evening):** Test count has since grown
+> to **174/174** after the continuous-calibration and launchd-watchdog
+> additions. This audit doc captures the original audit snapshot only;
+> for post-audit work see `HEDGEFUND_IMPLEMENTED.md § Post-roadmap
+> additions` and `OPERATIONS.md § Watchdog supervision`.
+
 ## Summary
 
 | Severity | Before audit | Fixed | Open |

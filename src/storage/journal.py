@@ -447,7 +447,14 @@ class CockroachJournal(TradeJournal):
       postgresql://user:pass@free-tier.cockroachlabs.cloud:26257/defaultdb?sslmode=verify-full
     """
 
-    def __init__(self, dsn: str):
+    def __init__(self, dsn: str, *, schema: str = "tradebot"):
+        """Use `schema` to isolate tradebot tables in a dedicated Postgres
+        schema (default: `tradebot`). Prevents TRUNCATEs / migrations /
+        permission changes from ever affecting unrelated tables (e.g. a
+        separate app sharing the same database). Every connection sets
+        `search_path = <schema>, public` so writes land in the isolated
+        schema and reads can still see extensions like pgcrypto in public.
+        """
         try:
             import psycopg
         except ImportError as e:
@@ -455,11 +462,22 @@ class CockroachJournal(TradeJournal):
                 "psycopg (v3) is required for CockroachJournal. "
                 "Install with: pip install 'psycopg[binary]'"
             ) from e
+        # Validate schema name — identifier rules only, no injection.
+        import re as _re
+        if not _re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", schema or ""):
+            raise ValueError(f"invalid schema name: {schema!r}")
+        self._schema = schema
         self._psycopg = psycopg
         self._conn = psycopg.connect(dsn, autocommit=True)
+        # Create the schema if needed + pin search_path for this session.
+        with self._conn.cursor() as cur:
+            cur.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+            cur.execute(f"SET search_path = {schema}, public")
 
     def init_schema(self) -> None:
         with self._conn.cursor() as cur:
+            # Re-assert search_path in case init_schema runs on a new session.
+            cur.execute(f"SET search_path = {self._schema}, public")
             for stmt in _schema_sql().split(";"):
                 s = stmt.strip()
                 if s:
@@ -664,18 +682,24 @@ class CockroachJournal(TradeJournal):
 # ------------------------------------------------------------------ factory
 def build_journal(backend: str = "sqlite",
                   sqlite_path: str = "logs/tradebot.sqlite",
-                  dsn_env_var: str = "COCKROACH_DSN") -> TradeJournal:
+                  dsn_env_var: str = "COCKROACH_DSN",
+                  cockroach_schema: str = "tradebot") -> TradeJournal:
     """Build a journal from a backend name.
 
     backend == 'sqlite'     → SqliteJournal(sqlite_path)
-    backend == 'cockroach'  → CockroachJournal(os.environ[dsn_env_var])
+    backend == 'cockroach'  → CockroachJournal(os.environ[dsn_env_var],
+                                                 schema=cockroach_schema)
+
+    `cockroach_schema` isolates all tradebot tables in a dedicated schema
+    so unrelated tables in the same database are never at risk of
+    collateral damage from a bad migration or TRUNCATE.
     """
     backend = backend.lower()
     if backend == "sqlite":
         j = SqliteJournal(sqlite_path)
     elif backend in {"cockroach", "cockroachdb", "postgres", "postgresql"}:
         dsn = resolve_cockroach_dsn(dsn_env_var=dsn_env_var)
-        j = CockroachJournal(dsn)
+        j = CockroachJournal(dsn, schema=cockroach_schema)
     else:
         raise ValueError(f"Unknown journal backend: {backend}")
     j.init_schema()

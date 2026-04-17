@@ -30,6 +30,7 @@ def _load_journal():
         backend=s.get("storage.backend", "sqlite"),
         sqlite_path=s.get("storage.sqlite_path", str(root / "logs" / "tradebot.sqlite")),
         dsn_env_var=s.get("storage.cockroach_dsn_env", "COCKROACH_DSN"),
+        cockroach_schema=s.get("storage.cockroach_schema", "tradebot"),
     )
 
 
@@ -528,6 +529,68 @@ def daily_report():
         return {"error": str(e)}
 
 
+@app.get("/api/watchdog", response_class=JSONResponse)
+def watchdog(limit: int = Query(25, ge=1, le=500)):
+    """Watchdog + heartbeat status for the Loop Insights panel.
+
+    Returns:
+      - heartbeat_age_sec:  seconds since bot's main loop last wrote
+                            logs/heartbeat.txt. None if never written.
+                            >300s during market hours means the loop is
+                            wedged (watchdog about to recycle it).
+      - heartbeat_status:   "fresh" | "stale" | "missing"
+      - recent_events:      last N entries from logs/watchdog_events.jsonl,
+                            newest first. Kinds: start, exit,
+                            clean_shutdown, heartbeat_stale.
+      - counts:             aggregate event counts over the file's lifetime
+                            (cheap lookback for the panel's sparkline).
+    """
+    import time
+    from pathlib import Path
+    _, root = _settings()
+    hb_path = root / "logs" / "heartbeat.txt"
+    ev_path = root / "logs" / "watchdog_events.jsonl"
+
+    heartbeat_age_sec = None
+    heartbeat_status = "missing"
+    try:
+        if hb_path.exists():
+            heartbeat_age_sec = max(0.0, time.time() - hb_path.stat().st_mtime)
+            heartbeat_status = "fresh" if heartbeat_age_sec < 300 else "stale"
+    except Exception:
+        pass
+
+    recent: List[Dict[str, Any]] = []
+    counts: Counter = Counter()
+    if ev_path.exists():
+        try:
+            lines = ev_path.read_text(encoding="utf-8").splitlines()
+            for line in lines:
+                if not line.strip():
+                    continue
+                try:
+                    counts[json.loads(line).get("kind", "?")] += 1
+                except Exception:
+                    continue
+            for line in reversed(lines[-limit:]):
+                if not line.strip():
+                    continue
+                try:
+                    recent.append(json.loads(line))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    return {
+        "heartbeat_age_sec": round(heartbeat_age_sec, 1) if heartbeat_age_sec is not None else None,
+        "heartbeat_status": heartbeat_status,
+        "stale_threshold_sec": 300,
+        "recent_events": recent,
+        "counts": dict(counts),
+    }
+
+
 @app.get("/api/attribution", response_class=JSONResponse)
 def attribution(days: int = Query(30, ge=1, le=365)):
     """Per-entry-tag performance attribution. Maps entry_tag → win rate, mean pnl,
@@ -661,6 +724,25 @@ _INDEX_HTML = """<!DOCTYPE html>
   <th>score</th><th>opposing</th><th>n inputs</th><th>reason</th>
 </tr></thead><tbody></tbody></table></div>
 
+<h2>loop insights &nbsp;·&nbsp; <span class="mut">watchdog + heartbeat + slippage calibration</span></h2>
+<div class="grid" id="loop-summary"></div>
+<div class="card" style="margin-top:10px;">
+  <div style="display:flex;gap:24px;flex-wrap:wrap;">
+    <div style="flex:1;min-width:320px;">
+      <div class="mut" style="margin-bottom:6px;">recent watchdog events</div>
+      <table id="wd-events"><thead><tr>
+        <th>ts</th><th>kind</th><th>details</th>
+      </tr></thead><tbody></tbody></table>
+    </div>
+    <div style="flex:1;min-width:320px;">
+      <div class="mut" style="margin-bottom:6px;">auto-calibration history (most recent first)</div>
+      <table id="cal-history"><thead><tr>
+        <th>ts</th><th>n</th><th>ratio</th><th>changes</th>
+      </tr></thead><tbody></tbody></table>
+    </div>
+  </div>
+</div>
+
 <h2>logs &nbsp;·&nbsp; <span class="mut">last 200 lines from tradebot.out</span></h2>
 <div class="row">
   <label>filter</label>
@@ -680,7 +762,7 @@ function fmt(n, d=2) { return (n===null||n===undefined) ? '' : Number(n).toFixed
 function cls(n) { return n>0 ? 'pos' : (n<0 ? 'neg' : 'mut'); }
 async function refresh() {
   const d = document.getElementById('days').value;
-  const [m, eq, tr, en, hlt, pos, ml, rg, at, cat] = await Promise.all([
+  const [m, eq, tr, en, hlt, pos, ml, rg, at, cat, wd, cal] = await Promise.all([
     fetch('/api/metrics?days='+d).then(r=>r.json()),
     fetch('/api/equity?days='+d).then(r=>r.json()),
     fetch('/api/trades?days='+d+'&limit=200').then(r=>r.json()),
@@ -691,6 +773,8 @@ async function refresh() {
     fetch('/api/regime_now').then(r=>r.json()).catch(()=>null),
     fetch('/api/attribution?days='+d).then(r=>r.json()).catch(()=>null),
     fetch('/api/catalysts_upcoming').then(r=>r.json()).catch(()=>null),
+    fetch('/api/watchdog?limit=15').then(r=>r.json()).catch(()=>null),
+    fetch('/api/calibration?days='+Math.min(parseInt(d)||30,90)).then(r=>r.json()).catch(()=>null),
   ]);
   renderHealth(hlt);
   renderOpenPositions(pos);
@@ -698,6 +782,7 @@ async function refresh() {
   renderAttribution(at);
   renderMLRecent(ml);
   renderCatalysts(cat);
+  renderLoopInsights(wd, cal);
   const mel = document.getElementById('metrics');
   mel.innerHTML = '';
   const cards = [
@@ -961,6 +1046,99 @@ function renderCatalysts(c) {
       `<td class="mut">${e.details||''}</td>`;
     tb.appendChild(row);
   });
+}
+
+function renderLoopInsights(wd, cal) {
+  // --- summary strip: heartbeat, watchdog event counts, calibration ratio ---
+  const sum = document.getElementById('loop-summary');
+  sum.innerHTML = '';
+  const card = (k, v, color) => {
+    const el = document.createElement('div'); el.className = 'card';
+    const vstyle = color ? ('color:' + color) : '';
+    el.innerHTML = `<div class="k">${k}</div><div class="v" style="${vstyle}">${v}</div>`;
+    sum.appendChild(el);
+  };
+  // Heartbeat
+  if (wd && wd.heartbeat_status) {
+    const age = wd.heartbeat_age_sec;
+    let label, color;
+    if (wd.heartbeat_status === 'fresh') { label = age.toFixed(0)+'s ago'; color = '#6ee7a0'; }
+    else if (wd.heartbeat_status === 'stale') { label = age.toFixed(0)+'s — STALE'; color = '#ff8686'; }
+    else { label = 'never written'; color = '#f2c46b'; }
+    card('heartbeat', label, color);
+    const counts = wd.counts || {};
+    card('watchdog events', `${counts.start||0} starts · ${counts.exit||0} exits · ${counts.heartbeat_stale||0} stale`);
+  } else {
+    card('heartbeat', '(watchdog not running)', '#f2c46b');
+    card('watchdog events', '—');
+  }
+  // Calibration
+  if (cal && cal.stats) {
+    const s = cal.stats;
+    const ratio = s.ratio;
+    let color = '#cbd5ff';
+    if (ratio >= 0.8 && ratio <= 1.2) color = '#6ee7a0';
+    else if (ratio > 1.5 || (ratio > 0 && ratio < 0.5)) color = '#ff8686';
+    else color = '#f2c46b';
+    card('slippage ratio (obs/pred)',
+      `${ratio.toFixed(2)}  ·  ${s.keep_or_tune}`, color);
+    card('calibration n',
+      `${s.n} fills (${s.mean_observed_bps.toFixed(1)} bps observed)`);
+  } else {
+    card('slippage ratio (obs/pred)', '(no calibration data yet)', '#f2c46b');
+    card('calibration n', '—');
+  }
+
+  // --- recent watchdog events table ---
+  const evTb = document.querySelector('#wd-events tbody');
+  evTb.innerHTML = '';
+  const events = (wd && wd.recent_events) || [];
+  if (events.length === 0) {
+    evTb.innerHTML = '<tr><td colspan="3" class="mut">no watchdog events yet — install via <code>tradebotctl watchdog-install</code></td></tr>';
+  } else {
+    events.slice(0, 15).forEach(e => {
+      const detailParts = [];
+      if (e.exit_code !== undefined) detailParts.push('rc=' + e.exit_code);
+      if (e.duration_sec !== undefined) detailParts.push(e.duration_sec.toFixed(0) + 's');
+      if (e.age_sec !== undefined) detailParts.push('age=' + e.age_sec);
+      if (e.pid) detailParts.push('pid=' + e.pid);
+      const tint = e.kind === 'heartbeat_stale' || e.kind === 'exit' && e.exit_code !== 0 ? '#ff8686'
+                 : e.kind === 'clean_shutdown' ? '#cbd5ff' : '#6ee7a0';
+      const row = document.createElement('tr');
+      row.innerHTML =
+        `<td class="mut">${(e.ts||'').replace('T',' ').slice(0,19)}</td>`+
+        `<td style="color:${tint}">${e.kind}</td>`+
+        `<td class="mut">${detailParts.join(' · ')}</td>`;
+      evTb.appendChild(row);
+    });
+  }
+
+  // --- calibration history table ---
+  const calTb = document.querySelector('#cal-history tbody');
+  calTb.innerHTML = '';
+  const hist = (cal && cal.auto_history) || [];
+  if (hist.length === 0) {
+    calTb.innerHTML = '<tr><td colspan="4" class="mut">no auto-calibration cycles yet (needs 30+ fills)</td></tr>';
+  } else {
+    hist.slice(0, 15).forEach(h => {
+      const changes = h.changes || {};
+      const changeTxt = Object.keys(changes).length === 0
+        ? '(no change — within tolerance)'
+        : Object.entries(changes).map(([k,v]) => `${k}: ${v.old}→${v.new}`).join(', ');
+      const ratio = h.ratio;
+      let color = '#cbd5ff';
+      if (ratio >= 0.8 && ratio <= 1.2) color = '#6ee7a0';
+      else if (ratio > 1.5 || (ratio > 0 && ratio < 0.5)) color = '#ff8686';
+      else color = '#f2c46b';
+      const row = document.createElement('tr');
+      row.innerHTML =
+        `<td class="mut">${(h.ts||'').replace('T',' ').slice(0,19)}</td>`+
+        `<td>${h.n_fills ?? ''}</td>`+
+        `<td style="color:${color}">${ratio !== undefined ? ratio.toFixed(2) : ''}</td>`+
+        `<td class="mut" style="max-width:340px;white-space:normal;">${changeTxt}</td>`;
+      calTb.appendChild(row);
+    });
+  }
 }
 
 async function refreshLogs() {

@@ -15,7 +15,7 @@
 # will not apply. That's why we use absolute paths and the tradebotctl wrapper.
 
 TZ=America/New_York
-TRADEBOT=/ABSOLUTE/PATH/TO/tradebot
+TRADEBOT=/Users/vivekadhikari/Documents/Claude/Projects/tradebot
 CTL=$TRADEBOT/scripts/tradebotctl.sh
 
 # ---------------- live loop (Mon–Fri) ----------------

@@ -55,6 +55,20 @@ python scripts/run_backtest.py       # synthetic-data dry run
 python scripts/run_paper.py          # live market data, paper fills
 ```
 
+### Leaving it running (Mac)
+
+For anything past a one-off backtest, supervise the process under the
+included launchd watchdog — it restarts on crash, alerts Discord/Slack,
+and detects silent hangs via a heartbeat file:
+
+```bash
+./scripts/tradebotctl.sh watchdog-install
+./scripts/tradebotctl.sh watchdog-status
+```
+
+Linux VPS users: see `deploy/systemd/` + `docs/scheduling.md`.
+Full operator playbook: `OPERATIONS.md`.
+
 ## The hard rules (non-negotiable)
 
 1. `LIVE_TRADING=false` by default; must be explicitly set to `true`, and only for a broker adapter that passed 30+ days of paper.

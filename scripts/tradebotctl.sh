@@ -23,6 +23,12 @@ PID_FILE="$ROOT/logs/tradebot.pid"
 LOG_FILE="$ROOT/logs/tradebot.out"
 KILL_FILE="$ROOT/KILL"
 
+# launchd (macOS) watchdog integration. Paths are derived, not assumed,
+# so copying the repo elsewhere still works.
+LAUNCHD_LABEL="com.tradebot.paper"
+LAUNCHD_SRC_PLIST="$ROOT/deploy/launchd/${LAUNCHD_LABEL}.plist"
+LAUNCHD_INSTALLED_PLIST="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+
 mkdir -p "$ROOT/logs"
 
 # .env is intentionally NOT sourced here. Shell parsing is fragile with
@@ -89,6 +95,94 @@ cmd_logs() {
   tail -f "$LOG_FILE"
 }
 
+# ----- launchd watchdog (macOS only) -------------------------------------
+# Install, uninstall, and inspect the com.tradebot.paper LaunchAgent. The
+# agent runs scripts/watchdog_run.py, which supervises run_paper.py.
+cmd_watchdog_install() {
+  if [[ "$(uname)" != "Darwin" ]]; then
+    echo "watchdog-install is macOS-only (uses launchd). On Linux use systemd."
+    return 2
+  fi
+  if [[ ! -f "$LAUNCHD_SRC_PLIST" ]]; then
+    echo "source plist missing: $LAUNCHD_SRC_PLIST"
+    return 1
+  fi
+  mkdir -p "$(dirname "$LAUNCHD_INSTALLED_PLIST")"
+  # Rewrite the hardcoded path in the shipped plist to match this checkout.
+  # sed -i '' for BSD (macOS); temp file for portability.
+  tmp_plist="$(mktemp)"
+  awk -v new_root="$ROOT" -v new_py="$PY" '
+    {
+      gsub("/Users/vivekadhikari/Documents/Claude/Projects/tradebot/.venv/bin/python", new_py);
+      gsub("/Users/vivekadhikari/Documents/Claude/Projects/tradebot", new_root);
+      print;
+    }
+  ' "$LAUNCHD_SRC_PLIST" > "$tmp_plist"
+  mv "$tmp_plist" "$LAUNCHD_INSTALLED_PLIST"
+  # If a previous version is loaded, unload first so we pick up changes.
+  launchctl unload "$LAUNCHD_INSTALLED_PLIST" 2>/dev/null || true
+  if launchctl load "$LAUNCHD_INSTALLED_PLIST"; then
+    echo "watchdog installed + loaded: $LAUNCHD_INSTALLED_PLIST"
+    echo "check:    tradebotctl watchdog-status"
+    echo "alerts:   set DISCORD_WEBHOOK_URL or SLACK_WEBHOOK_URL in .env"
+  else
+    echo "launchctl load failed — see console.app for launchd errors"
+    return 1
+  fi
+}
+
+cmd_watchdog_uninstall() {
+  if [[ "$(uname)" != "Darwin" ]]; then
+    echo "watchdog-uninstall is macOS-only."
+    return 2
+  fi
+  if [[ -f "$LAUNCHD_INSTALLED_PLIST" ]]; then
+    launchctl unload "$LAUNCHD_INSTALLED_PLIST" 2>/dev/null || true
+    rm -f "$LAUNCHD_INSTALLED_PLIST"
+    echo "watchdog unloaded + removed"
+  else
+    echo "not installed"
+  fi
+}
+
+cmd_watchdog_status() {
+  if [[ "$(uname)" != "Darwin" ]]; then
+    echo "watchdog-status is macOS-only."
+    return 2
+  fi
+  local entry; entry="$(launchctl list 2>/dev/null | awk -v l="$LAUNCHD_LABEL" '$3 == l')"
+  if [[ -z "$entry" ]]; then
+    echo "watchdog: not loaded"
+    echo "install:  tradebotctl watchdog-install"
+    return 0
+  fi
+  # columns: PID STATUS LABEL
+  local pid status
+  pid="$(awk '{print $1}' <<< "$entry")"
+  status="$(awk '{print $2}' <<< "$entry")"
+  if [[ "$pid" == "-" ]]; then
+    echo "watchdog: loaded but not running (last exit=$status)"
+  else
+    echo "watchdog: running (pid=$pid, last exit=$status)"
+  fi
+  # Heartbeat freshness — tells you if the child is alive, not just the wrapper.
+  if [[ -f "$ROOT/logs/heartbeat.txt" ]]; then
+    # portable stat: macOS uses -f, Linux -c
+    local hb_mtime now age
+    hb_mtime="$(stat -f %m "$ROOT/logs/heartbeat.txt" 2>/dev/null || stat -c %Y "$ROOT/logs/heartbeat.txt" 2>/dev/null)"
+    now="$(date +%s)"
+    age=$(( now - hb_mtime ))
+    echo "heartbeat: ${age}s ago"
+  else
+    echo "heartbeat: (never written yet)"
+  fi
+  # Last event from the watchdog's own log
+  if [[ -f "$ROOT/logs/watchdog_events.jsonl" ]]; then
+    echo "last event:"
+    tail -n 1 "$ROOT/logs/watchdog_events.jsonl"
+  fi
+}
+
 case "${1:-}" in
   start)        cmd_start ;;
   stop)         cmd_stop ;;
@@ -112,9 +206,18 @@ case "${1:-}" in
   daily-report)     shift; "$PY" "$ROOT/scripts/daily_report.py" "$@" ;;
   dashboard)    shift; exec "$PY" "$ROOT/scripts/run_dashboard.py" "$@" ;;
   testdb)       shift; "$PY" "$ROOT/scripts/test_db_connection.py" "$@" ;;
+  watchdog-install)   cmd_watchdog_install ;;
+  watchdog-uninstall) cmd_watchdog_uninstall ;;
+  watchdog-status)    cmd_watchdog_status ;;
+  wipe-journal)       shift; "$PY" "$ROOT/scripts/wipe_journal.py" "$@" ;;
   *)
     cat <<EOF
-usage: $(basename "$0") {start|stop|restart|status|logs|backtest|priors|walkforward|dashboard|testdb}
+usage: $(basename "$0") {start|stop|restart|status|logs|backtest|priors|walkforward|dashboard|testdb|
+                        watchdog-install|watchdog-uninstall|watchdog-status}
+
+The watchdog-* subcommands are macOS-only; they manage a launchd agent
+that supervises scripts/watchdog_run.py (which in turn supervises
+run_paper.py, alerts on crash, and restarts on stale heartbeat).
 
 Environment:
   TRADEBOT_PY   override python interpreter (default: \$ROOT/.venv/bin/python)

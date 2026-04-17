@@ -12,7 +12,7 @@ import threading
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 
-from ..core.types import Order, Fill, Position, Side
+from ..core.types import Order, Fill, Position, Side, OptionContract
 from .base import BrokerAdapter, AccountState
 
 # Lazy cache of the calibration logger so we don't instantiate one per fill.
@@ -62,7 +62,16 @@ class PaperBroker(BrokerAdapter):
         with self._lock:
             return list(self._positions.values())
 
-    def submit(self, order: Order) -> Optional[Fill]:
+    def submit(self, order: Order, *,
+                contract: Optional[OptionContract] = None,
+                auto_profit_target: Optional[float] = None,
+                auto_stop_loss: Optional[float] = None) -> Optional[Fill]:
+        """Submit a paper order. For options, pass the full `contract`
+        so the created Position has underlying/strike/expiry/right set
+        (needed by the exit engine's DTE logic and by EOD option pricing).
+        `auto_profit_target` / `auto_stop_loss` are tagged onto the Position
+        at entry to honor the CLAUDE.md rule that every entry has both set.
+        """
         if order.limit_price is None:
             return None
         cost_for_log = None
@@ -88,7 +97,9 @@ class PaperBroker(BrokerAdapter):
         fee = (self._comm_option if order.is_option else self._comm_share) * order.qty
         fill = Fill(order=order, price=fill_price, qty=order.qty, fee=fee)
         with self._lock:
-            self._apply(fill)
+            self._apply(fill, contract=contract,
+                         auto_profit_target=auto_profit_target,
+                         auto_stop_loss=auto_stop_loss)
         # Journal writes happen OUTSIDE the lock to avoid blocking the fast-exit
         # loop on slow DB I/O. The fill object is immutable at this point so
         # there's no data race even across threads.
@@ -120,7 +131,10 @@ class PaperBroker(BrokerAdapter):
             self.submit(closing)
 
     # --- internal ---
-    def _apply(self, fill: Fill) -> None:
+    def _apply(self, fill: Fill, *,
+                contract: Optional[OptionContract] = None,
+                auto_profit_target: Optional[float] = None,
+                auto_stop_loss: Optional[float] = None) -> None:
         o = fill.order
         sym = o.symbol
         signed_qty = fill.qty if o.side == Side.BUY else -fill.qty
@@ -131,11 +145,26 @@ class PaperBroker(BrokerAdapter):
 
         pos = self._positions.get(sym)
         if pos is None and signed_qty != 0:
-            self._positions[sym] = Position(
+            # Populate the full option metadata from the contract so the
+            # exit engine's dte() / Greek paths work, and so EOD flatten
+            # can price the option via chain lookup on (underlying, strike,
+            # expiry, right) instead of trying `latest_price(OCC)` which
+            # has no bar data.
+            p = Position(
                 symbol=sym, qty=signed_qty, avg_price=fill.price,
                 is_option=o.is_option, multiplier=mul,
                 entry_tags={"tag": o.tag} if o.tag else {},
             )
+            if contract is not None:
+                p.underlying = contract.underlying
+                p.strike = contract.strike
+                p.expiry = contract.expiry
+                p.right = contract.right
+            if auto_profit_target is not None:
+                p.auto_profit_target = float(auto_profit_target)
+            if auto_stop_loss is not None:
+                p.auto_stop_loss = float(auto_stop_loss)
+            self._positions[sym] = p
             return
 
         if pos is None:
@@ -149,9 +178,6 @@ class PaperBroker(BrokerAdapter):
             realized = sign * (fill.price - pos.avg_price) * closed_qty * mul
             self._total_pnl += realized
             self._day_pnl += realized
-            self._equity = self._cash + sum(
-                p.qty * p.avg_price * p.multiplier for p in self._positions.values()
-            )
             self._log_trade(pos, fill, closed_qty, realized)
         if new_qty == 0:
             self._positions.pop(sym, None)
@@ -160,6 +186,13 @@ class PaperBroker(BrokerAdapter):
                 total_cost = pos.avg_price * pos.qty * mul + fill.price * signed_qty * mul
                 pos.avg_price = total_cost / (new_qty * mul) if new_qty * mul != 0 else fill.price
             pos.qty = new_qty
+        # Recompute equity at AVG price (book value) after qty adjustment.
+        # This is a conservative snapshot — the next mark_to_market() call
+        # with real market prices overwrites it with the mark-based equity.
+        # Moved after the pop so we don't double-count the closed position.
+        self._equity = self._cash + sum(
+            p.qty * p.avg_price * p.multiplier for p in self._positions.values()
+        )
 
     def _log_fill(self, fill: Fill) -> None:
         if self._journal is None:

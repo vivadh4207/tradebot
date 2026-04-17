@@ -46,7 +46,38 @@ attribution, LSTM, catalysts, ensemble, **calibration** (new),
 
 ## Phase 1 — Day 1 (even before you have 30 days of data)
 
-### Morning
+### One-time: install the supervisor
+
+On macOS, the bot runs under a launchd watchdog that restarts it on
+crash, alerts you via Discord/Slack, and detects silent hangs. Install
+once per machine:
+
+```bash
+./scripts/tradebotctl.sh watchdog-install     # installs + loads the LaunchAgent
+./scripts/tradebotctl.sh watchdog-status      # should show "running (pid=N)"
+```
+
+(On a Linux VPS, use `deploy/systemd/tradebot.service` instead — see
+`docs/scheduling.md`.)
+
+After that, **you don't run `tradebotctl start` by hand anymore** — the
+watchdog owns the lifecycle. Use `watchdog-status` to check it and
+`launchctl stop com.tradebot.paper` to pause it (or `watchdog-uninstall`
+to remove). See "Watchdog supervision" at the end of this file for the
+full picture.
+
+### Morning (with watchdog installed — zero-touch)
+
+The watchdog keeps the bot up 24/7; the bot itself respects market
+hours. You only have to refresh catalysts:
+
+```bash
+./scripts/tradebotctl.sh catalysts            # refresh earnings blackouts
+./scripts/tradebotctl.sh logs                 # tail if you want to watch
+./scripts/tradebotctl.sh watchdog-status      # sanity check
+```
+
+### Morning (no watchdog — development only)
 
 ```bash
 ./scripts/tradebotctl.sh catalysts        # refresh earnings blackouts
@@ -89,9 +120,24 @@ Read the output. Pay attention to `keep_or_tune` on the slippage line:
 
 ---
 
-## Phase 2 — Week 1 (manual runs, daily cadence)
+## Phase 2 — Week 1 (daily cadence)
 
-Run **every trading morning and evening** the same way as day 1:
+If you installed the watchdog, the bot stays up automatically —
+there's nothing to "start" in the morning. You just run catalyst
+refresh at the start of the day and reports at the end:
+
+```bash
+# morning (watchdog running)
+./scripts/tradebotctl.sh catalysts
+./scripts/tradebotctl.sh watchdog-status       # verify alive + heartbeat fresh
+
+# evening (watchdog running — bot already did the 15:45 EOD flatten internally)
+./scripts/tradebotctl.sh daily-report
+./scripts/tradebotctl.sh calibrate --days $(( $(date +%u) ))
+# ^ passes days-so-far-this-week; e.g. on Wed runs --days 3
+```
+
+If you're running without the watchdog (development-only):
 
 ```bash
 # morning
@@ -102,7 +148,6 @@ Run **every trading morning and evening** the same way as day 1:
 ./scripts/tradebotctl.sh stop
 ./scripts/tradebotctl.sh daily-report
 ./scripts/tradebotctl.sh calibrate --days $(( $(date +%u) ))
-# ^ passes days-so-far-this-week; e.g. on Wed runs --days 3
 ```
 
 ### Questions to ask yourself at EOD every day
@@ -140,6 +185,11 @@ crontab -l                                # verify
 Grant cron full-disk access (Mac-only, once): **System Settings →
 Privacy & Security → Full Disk Access → `+` → Cmd+Shift+G →
 `/usr/sbin/cron` → toggle ON**.
+
+**Watchdog + cron interaction:** the watchdog owns start/stop; cron
+only runs the periodic reports (calibration, walk-forward, VaR, etc.).
+If you installed the watchdog, comment out the `start` and `stop`
+lines in the crontab — leave the rest.
 
 ### First weekly review (30 minutes)
 
@@ -283,29 +333,123 @@ Every calibration decision — auto or manual — follows these rules:
 
 | Time (ET) | Action |
 |---|---|
+| 08:00 | `./scripts/tradebotctl.sh watchdog-status` — watchdog running? heartbeat fresh? |
 | 08:30 | `cat logs/var_report.json | python -m json.tool | head` — is 95% VaR < 5% of cash? |
 | 15:55 | Glance at dashboard → Open Positions — will EOD flatten close these cleanly? |
 | 16:30 | Open `/api/daily_report` on dashboard — today's win rate, EV, calibration |
 | 17:00 | Skim `logs/calibrate.<today>.log` — did the auto-cal shift anything material? |
 | 21:00 | (optional) Tail `logs/tradebot.out` for any `error`/`HALT` lines you missed |
+| any | Discord/Slack alert? Check `tail logs/watchdog_events.jsonl` for the matching event |
 
 **Sunday evening only**: 20-minute weekly review. Everything else runs
 itself.
 
 ---
 
-## Emergency procedures (unchanged from prior runbook)
+## Watchdog supervision (macOS)
+
+The watchdog is the outermost layer keeping the bot alive. It's a
+launchd LaunchAgent running `scripts/watchdog_run.py`, which in turn
+spawns `scripts/run_paper.py` as a child.
+
+```
+launchd  (KeepAlive=true, ThrottleInterval=10)
+  └── watchdog_run.py
+        ├── spawns run_paper.py
+        ├── monitors logs/heartbeat.txt
+        ├── alerts Discord/Slack on crash
+        └── kills + restarts child if heartbeat goes stale
+```
+
+### What each layer catches
+
+| Failure mode | Who catches it |
+|---|---|
+| Uncaught Python exception in the bot | watchdog → SIGTERM child → exit nonzero → launchd restarts |
+| OOM / external SIGKILL | launchd restarts (watchdog dies with child) |
+| Mac reboot | launchd restarts at login |
+| Main loop deadlock (process alive, stuck) | watchdog kills child after heartbeat stales (default 5 min) |
+| Crash loop (> 10 exits in 10s) | launchd stops auto-restarting; manual investigation required |
+| Network outage | **not caught** — bot keeps ticking, Alpaca SDK retries internally |
+
+### Daily / weekly checks
 
 ```bash
-# Cooperative stop (≤5s)
+./scripts/tradebotctl.sh watchdog-status
+```
+
+Gives you:
+- LaunchAgent loaded or not
+- Child pid (if running)
+- Heartbeat age in seconds
+- Last event from `logs/watchdog_events.jsonl`
+
+A healthy status looks like:
+
+```
+watchdog: running (pid=60735, last exit=0)
+heartbeat: 42s ago
+last event: {"kind":"start","pid":60735,"ts":"..."}
+```
+
+Stale heartbeat (> 300s) during market hours means the bot wedged and
+the watchdog is about to recycle it — check `logs/tradebot.err` and the
+Discord/Slack channel for the alert.
+
+### Logs added by the watchdog
+
+| File | Written by | Content |
+|---|---|---|
+| `logs/heartbeat.txt` | bot's main loop | single-line timestamp, rewritten every tick |
+| `logs/watchdog_events.jsonl` | watchdog | start / exit / clean_shutdown / heartbeat_stale events |
+| `logs/tradebot.out` | child stdout (via launchd) | same as before |
+| `logs/tradebot.err` | child stderr (via launchd) | same as before; watchdog tails the last line on crash |
+
+### Tuning (rarely needed)
+
+Environment variables read by the watchdog at startup:
+
+| Var | Default | Meaning |
+|---|---|---|
+| `WATCHDOG_HEARTBEAT_STALE_SEC` | 300 | how old heartbeat can get before we kill |
+| `WATCHDOG_CHECK_INTERVAL_SEC` | 30 | poll cadence |
+| `WATCHDOG_STARTUP_GRACE_SEC` | 120 | don't trip stale-heartbeat during child bootstrap |
+
+The defaults are conservative — `stale = 5 min` is ~1.6× the 3-minute
+main-loop tick, so normal slow cycles don't false-positive. Only
+override if you know what you're doing.
+
+### When the watchdog itself dies
+
+launchd's `KeepAlive=true` brings it back. `ThrottleInterval=10` caps
+restart rate at once per 10s. If it exits ≥ 10 times in 10s, launchd
+marks the job failed and stops restarting — check `launchctl list |
+grep tradebot` for exit status, and `Console.app → system.log` for
+launchd's complaint.
+
+---
+
+## Emergency procedures
+
+```bash
+# Cooperative stop (≤5s) — bot sees KILL file, flattens, flushes
 touch KILL
 
-# Hard stop
+# Pause under launchd — watchdog restarts it next tick, so only useful briefly
+launchctl stop com.tradebot.paper
+
+# Fully stop under launchd — watchdog does NOT come back
+./scripts/tradebotctl.sh watchdog-uninstall
+
+# Hard stop (no-watchdog mode only)
 ./scripts/tradebotctl.sh stop
 
 # Reconcile after crash
 cat logs/broker_state.json | python -m json.tool | grep -A2 positions
 # Cross-reference with Alpaca's web UI.
+
+# See what the watchdog last did
+tail -5 logs/watchdog_events.jsonl | python -m json.tool
 ```
 
 Rollback a bad auto-calibration:
@@ -316,7 +460,7 @@ tail -5 logs/calibration_history.jsonl | python -m json.tool
 
 # Copy the "old" values from the most recent entry, paste into settings.yaml
 # under `broker:` block, then:
-./scripts/tradebotctl.sh restart
+launchctl stop com.tradebot.paper        # watchdog restarts it with new config
 ```
 
 ---

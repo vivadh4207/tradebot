@@ -67,16 +67,25 @@ def test_drawdown_guard_scales_down_on_tick(monkeypatch):
 
 
 def test_measured_priors_fallback_when_journal_empty(monkeypatch, tmp_path):
-    """Fresh bot with no trades → falls back to conservative default priors."""
+    """Fresh bot with no trades → falls back to weakly positive-EV priors.
+
+    The fallback MUST produce positive Kelly so the bot can actually place
+    trades on day 1 for data collection. Negative-EV fallbacks are a
+    chicken-and-egg trap (no trades → no journal → priors never update).
+    """
     monkeypatch.chdir(Path(__file__).resolve().parents[1])
     from src.main import TradeBot
     from src.core.config import load_settings
     s = load_settings()
     bot = TradeBot(s)
-    # Defaults: 0.55 win-rate, 0.020 avg-win, 0.025 avg-loss
-    assert bot._win_rate == 0.55
-    assert bot._avg_win == 0.020
-    assert bot._avg_loss == 0.025
+    # Defaults: 0.52 win-rate, 0.025 avg-win, 0.020 avg-loss → +0.34% EV
+    assert bot._win_rate == 0.52
+    assert bot._avg_win == 0.025
+    assert bot._avg_loss == 0.020
+    # Kelly must be positive or the sizer returns 0 and no trades ever fire.
+    b = bot._avg_win / bot._avg_loss
+    kelly = (b * bot._win_rate - (1 - bot._win_rate)) / b
+    assert kelly > 0, f"fallback priors must have positive Kelly; got f={kelly:.4f}"
 
 
 def test_measured_priors_use_journal_when_enough_trades(monkeypatch, tmp_path):

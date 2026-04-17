@@ -1,8 +1,10 @@
-# Observability — Notifier + Dashboard + Walk-Forward
+# Observability — Notifier + Dashboard + Walk-Forward + Watchdog
 
 ## 1. Notifier (Discord / Slack webhook)
 
-Push fills, halts, daily summaries, and errors to a phone-accessible channel.
+Push fills, halts, daily summaries, **watchdog crash alerts**,
+**calibration-ratio excursions**, and errors to a phone-accessible
+channel.
 
 ### Setup
 
@@ -28,6 +30,10 @@ Discord is recommended (fastest to set up, free, mobile push built in).
 | `[warn] HALT: Daily loss halt hit: day_pnl=-204.50 ...` | warn | daily loss exceeds `account.max_daily_loss_pct` |
 | `[info] daily: EOD 2026-04-18: equity=9800.00 day_pnl=-200.00 ...` | info | once per session, after 15:45 ET |
 | `[ERROR] tradebot: main_loop_error: <exception>` | error | any unhandled exception in main loop |
+| `[warn] calibration: Slippage ratio=1.67 (n=47, pred=3.2bps, obs=5.3bps). Adjusted 2 constants.` | warn | auto-cal finds observed/predicted outside [0.5, 1.5] |
+| `[ERROR] watchdog: tradebot CRASHED rc=1 after 842s. Last stderr: <line>` | error | child exits nonzero |
+| `[info] watchdog: tradebot exited cleanly after 842s — restarting` | info | child exits 0 but we didn't ask it to |
+| `[ERROR] watchdog: heartbeat stale 312s — killing child pid=60735 so launchd can restart` | error | main loop wedged; forced recycle |
 
 ### Guarantees
 
@@ -64,9 +70,15 @@ ssh -L 8000:localhost:8000 user@your-vps
 | `GET /api/equity?days=30` | equity-curve points |
 | `GET /api/trades?days=30&limit=500` | closed-trade rows |
 | `GET /api/metrics?days=30` | aggregated stats + EV |
+| `GET /api/calibration` | current auto-cal stats + recent history entries |
+| `GET /api/daily_report` | today's EOD snapshot with `keep_or_tune` decision |
+| `GET /api/var` | latest Monte Carlo VaR / CVaR report |
+| `GET /api/backtest_runs` | reproducibility log of every backtest run |
+| `GET /api/watchdog` | watchdog status: recent events + heartbeat age |
 
 All reads come from whichever backend is configured in
-`config/settings.yaml` (`sqlite` or `cockroach`).
+`config/settings.yaml` (`sqlite` or `cockroach`). Watchdog +
+calibration endpoints read from the JSONL files in `logs/`.
 
 ## 3. Walk-forward
 
@@ -102,3 +114,37 @@ only measuring realized paper trades, `HistoricalDataProvider` pulls up
 to 3 years of daily bars from Alpaca with disk caching in
 `data_cache/<symbol>_daily_Ny.json`. Plug it into `BacktestSimulator`
 in place of `SyntheticDataAdapter` for long-range walk-forward.
+
+## 4. Watchdog (Mac launchd supervision)
+
+On macOS the bot runs under `scripts/watchdog_run.py`, which is
+supervised by launchd. The watchdog gives you three observability
+surfaces the bot itself can't provide:
+
+- **Crash alerts via the notifier.** Every abnormal child exit posts a
+  Discord/Slack message with exit code and the last line of stderr.
+- **Event log** at `logs/watchdog_events.jsonl`. Append-only JSONL with
+  `start`, `exit`, `clean_shutdown`, and `heartbeat_stale` records.
+- **Heartbeat freshness.** The bot writes `logs/heartbeat.txt` every
+  main-loop tick. The watchdog reads it; `tradebotctl watchdog-status`
+  prints the age.
+
+Quick health check:
+
+```bash
+./scripts/tradebotctl.sh watchdog-status
+```
+
+Dashboard:
+
+```
+GET /api/watchdog
+→ { "heartbeat_age_sec": 42, "last_event": {...}, "recent_events": [...] }
+```
+
+The dashboard HTML page surfaces these as the "Loop insights" panel
+alongside the existing calibration panel — if the heartbeat age goes
+red, the bot wedged and the watchdog is about to recycle it.
+
+See `OPERATIONS.md § Watchdog supervision` for the layering of each
+failure mode and which component handles it.
