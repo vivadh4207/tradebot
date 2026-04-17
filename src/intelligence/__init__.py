@@ -9,7 +9,10 @@ from .news_alpaca import AlpacaNewsProvider
 from .news_classifier import (
     NewsClassifier, KeywordClassifier, ClaudeNewsClassifier, build_classifier,
 )
+from .news_classifier_local import LocalLLMNewsClassifier
 from .econ_calendar import EconomicCalendar, ScheduledEvent
+from .regime import Regime, RegimeSnapshot, RegimeClassifier
+from .vix_probe import VixProbe, VixReading
 from .catalyst_calendar import (
     CatalystEvent, CatalystProvider, CatalystCalendar,
     StaticCatalystProvider, FinnhubCalendarProvider, YFinanceEarningsProvider,
@@ -24,8 +27,11 @@ __all__ = [
     "NewsProvider", "StaticNewsProvider", "NewsSentiment", "NewsItem",
     "CachedNewsSentiment",
     "AlpacaNewsProvider",
-    "NewsClassifier", "KeywordClassifier", "ClaudeNewsClassifier", "build_classifier",
+    "NewsClassifier", "KeywordClassifier", "ClaudeNewsClassifier",
+    "LocalLLMNewsClassifier", "build_classifier",
     "EconomicCalendar", "ScheduledEvent",
+    "Regime", "RegimeSnapshot", "RegimeClassifier",
+    "VixProbe", "VixReading",
     "CatalystEvent", "CatalystProvider", "CatalystCalendar",
     "StaticCatalystProvider", "FinnhubCalendarProvider", "YFinanceEarningsProvider",
     "build_default_catalyst_calendar",

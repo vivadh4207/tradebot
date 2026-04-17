@@ -6,9 +6,16 @@ from .vrp import VRPSignal
 from .wheel import WheelSignal
 from .master_stack import MasterSignalStack
 from .claude_ai import ClaudeAISignal
+from .lstm_signal import LSTMSignal
+from .ensemble import (
+    EnsembleCoordinator, EnsembleDecision, Contribution, DEFAULT_WEIGHTS,
+)
 
 __all__ = [
     "SignalSource", "SignalContext",
     "MomentumSignal", "OpeningRangeBreakout", "VwapReversionSignal",
     "VRPSignal", "WheelSignal", "MasterSignalStack", "ClaudeAISignal",
+    "LSTMSignal",
+    "EnsembleCoordinator", "EnsembleDecision", "Contribution",
+    "DEFAULT_WEIGHTS",
 ]

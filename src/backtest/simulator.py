@@ -38,6 +38,7 @@ class SimConfig:
     avg_win_prior: float = 0.030
     avg_loss_prior: float = 0.020
     verbose: bool = False
+    disable_signals: Optional[tuple] = None        # e.g. ("lstm",) to A/B-test
 
 
 class BacktestSimulator:
@@ -73,7 +74,7 @@ class BacktestSimulator:
             max_consecutive_holds=settings["exits"]["max_consecutive_holds"],
             claude_hold_conf_min=settings["exits"]["claude_hold_conf_min"],
         ))
-        self.strategies = [
+        all_strategies = [
             MomentumSignal(
                 bars=settings["signal"]["momentum_bars"],
                 slope_long=settings["signal"]["momentum_slope_long"],
@@ -82,6 +83,25 @@ class BacktestSimulator:
             VwapReversionSignal(),
             OpeningRangeBreakout(),
         ]
+        # Optional LSTM signal (only if a checkpoint actually loads)
+        try:
+            from ..signals.lstm_signal import LSTMSignal
+            lstm = LSTMSignal(
+                checkpoint_path=settings.get("ml", {}).get("lstm_checkpoint",
+                                    "checkpoints/lstm_best.pt"),
+                min_confidence=float(settings.get("ml", {})
+                                      .get("lstm_min_confidence", 0.55)),
+                timeframe_minutes=int(settings.get("ml", {})
+                                      .get("lstm_timeframe_minutes", 5)),
+                log_all_predictions=False,     # don't pollute the journal on backtests
+            )
+            if lstm._model is not None:
+                all_strategies.append(lstm)
+        except Exception:
+            pass
+        disabled = set(cfg.disable_signals or ())
+        self.strategies = [s for s in all_strategies if s.name not in disabled]
+        self._disabled_names = list(disabled)
         self.equity_curve: List[float] = []
         self.trade_pnls: List[float] = []
 

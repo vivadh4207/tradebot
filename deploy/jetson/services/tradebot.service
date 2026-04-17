@@ -1,0 +1,46 @@
+# Jetson-tuned systemd unit for the paper-trading loop.
+#
+# Install:
+#   sudo cp deploy/jetson/services/tradebot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now tradebot
+#   journalctl -u tradebot -f
+#
+# Edit User=, Group=, WorkingDirectory=, EnvironmentFile= for your install.
+[Unit]
+Description=tradebot (paper loop) — Jetson AGX Orin
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=orin
+Group=orin
+WorkingDirectory=/home/orin/tradebot
+EnvironmentFile=/home/orin/tradebot/.env
+Environment=TZ=America/New_York
+# CUDA libs for llama.cpp GPU offload
+Environment=LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/aarch64-linux-gnu
+ExecStart=/home/orin/tradebot/.venv/bin/python scripts/run_paper.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/home/orin/tradebot/logs/tradebot.out
+StandardError=append:/home/orin/tradebot/logs/tradebot.err
+
+# Jetson-specific resource controls
+Nice=-5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=2
+# Pin the process to the 8 high-perf A78AE cores (cores 0-7 on Orin 64GB).
+# Leaves cores 8-11 free for the dashboard + llama.cpp CUDA work.
+CPUAffinity=0 1 2 3 4 5 6 7
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/home/orin/tradebot/logs /home/orin/tradebot/data_cache
+
+[Install]
+WantedBy=multi-user.target

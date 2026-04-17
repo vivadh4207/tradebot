@@ -33,6 +33,10 @@ from .exits.fast_exit import FastExitEvaluator
 from .signals.momentum import MomentumSignal
 from .signals.vwap_reversion import VwapReversionSignal
 from .signals.orb import OpeningRangeBreakout
+from .signals.lstm_signal import LSTMSignal
+from .signals.ensemble import EnsembleCoordinator, DEFAULT_WEIGHTS
+from .intelligence.regime import Regime, RegimeClassifier
+from .intelligence.vix_probe import VixProbe
 from .storage.journal import build_journal, TradeJournal
 from .notify.base import build_notifier, Notifier
 from .intelligence.news import NewsProvider, StaticNewsProvider, CachedNewsSentiment
@@ -139,6 +143,33 @@ class TradeBot:
         )
         self._last_daily_summary_date = None
         self._halted_today = False
+
+        # Regime classifier + ensemble coordinator + live VIX probe
+        self.vix_probe = VixProbe(
+            ttl_seconds=int(settings.get("vix.cache_seconds", 60)),
+            fallback_vix=float(settings.get("vix.fallback", 15.0)),
+            prefer=str(settings.get("vix.prefer", "auto")),
+        )
+        self.regime_classifier = RegimeClassifier()
+        self.ensemble_enabled = bool(settings.get("ensemble.enabled", True))
+        self.ensemble_log = bool(settings.get("ensemble.log_decisions", True))
+        ens_weights_raw = settings.get("ensemble.weights", None)
+        ens_weights = None
+        if ens_weights_raw:
+            try:
+                ens_weights = {}
+                for k, v in ens_weights_raw.items():
+                    ens_weights[Regime(k)] = {sn: float(w) for sn, w in v.items()}
+            except Exception as e:                     # noqa: BLE001
+                log.warning("ensemble_weights_parse_failed", err=str(e))
+                ens_weights = None
+        self.ensemble = EnsembleCoordinator(
+            weights=ens_weights,
+            min_weighted_confidence=float(
+                settings.get("ensemble.min_weighted_confidence", 0.70)
+            ),
+            dominance_ratio=float(settings.get("ensemble.dominance_ratio", 1.5)),
+        )
         self.qv = QuoteValidator()
         self.exec_chain = ExecutionChain(settings.raw, self.clock)
         self.validator = OrderValidator()
@@ -147,6 +178,7 @@ class TradeBot:
             kelly_hard_cap=settings.get("sizing.kelly_hard_cap_pct", 0.05),
             max_0dte=settings.get("sizing.max_contracts_0dte", 5),
             max_multiday=settings.get("sizing.max_contracts_multiday", 10),
+            regime_multipliers=settings.get("sizing.regime_multipliers", {}) or {},
         )
         self.exits = ExitEngine(ExitEngineConfig(
             pt_short_pct=settings.get("exits.profit_target_short_dte_pct", 0.35),
@@ -159,6 +191,18 @@ class TradeBot:
         self.strategies = [
             MomentumSignal(), VwapReversionSignal(), OpeningRangeBreakout(),
         ]
+        if settings.get("ml.lstm_enabled", True):
+            lstm = LSTMSignal(
+                checkpoint_path=settings.get("ml.lstm_checkpoint",
+                                              "checkpoints/lstm_best.pt"),
+                min_confidence=float(settings.get("ml.lstm_min_confidence", 0.55)),
+                journal=self.journal,
+                timeframe_minutes=int(settings.get("ml.lstm_timeframe_minutes", 5)),
+                log_all_predictions=bool(settings.get("ml.lstm_log_predictions", True)),
+            )
+            # Only append when the model actually loaded; otherwise a no-op.
+            if lstm._model is not None:
+                self.strategies.append(lstm)
         self._stop = threading.Event()
 
     def _refresh_catalysts(self) -> None:
@@ -263,7 +307,7 @@ class TradeBot:
         self._halted_today = False
 
     def _tick_symbol(self, symbol: str) -> None:
-        bars = self.data.get_bars(symbol, limit=50)
+        bars = self.data.get_bars(symbol, limit=80)
         if len(bars) < 30:
             return
         spot = bars[-1].close
@@ -278,11 +322,69 @@ class TradeBot:
             opening_range_high=or_hi, opening_range_low=or_lo,
             chain=self.chain_provider.chain(symbol, spot, target_dte=1),
         )
+
+        # 1. Collect raw signals from every enabled strategy
+        raw_signals = []
         for strat in self.strategies:
             sig = strat.emit(sctx)
             if sig is None or sig.is_stale(ttl_sec=30):
                 continue
-            self._try_enter(sig, bars, or_hi, or_lo, spot, vwap)
+            raw_signals.append(sig)
+
+        # Fall back to legacy per-signal path if the ensemble is disabled.
+        if not self.ensemble_enabled:
+            for sig in raw_signals:
+                self._try_enter(sig, bars, or_hi, or_lo, spot, vwap)
+            return
+
+        if not raw_signals:
+            return
+
+        # 2. Classify current regime from bars + live VIX
+        vix_reading = self.vix_probe.get()
+        regime_snap = self.regime_classifier.classify(
+            vix=vix_reading.value,
+            now=bars[-1].ts,
+            recent_closes=[b.close for b in bars[-60:]],
+        )
+        regime = regime_snap.regime
+
+        # 3. Run the coordinator
+        decision = self.ensemble.aggregate(raw_signals, regime)
+
+        # 4. Log decision (for analyze_ensemble.py)
+        if self.ensemble_log and self.journal is not None:
+            try:
+                import json as _json
+                from .storage.journal import EnsembleRecord
+                self.journal.record_ensemble_decision(EnsembleRecord(
+                    id=None, ts=bars[-1].ts, symbol=symbol,
+                    regime=regime.value, emitted=decision.emitted,
+                    dominant_direction=decision.dominant_direction,
+                    dominant_score=decision.dominant_score,
+                    opposing_score=decision.opposing_score,
+                    n_inputs=decision.n_inputs, reason=decision.reason,
+                    contributors=_json.dumps(
+                        [{"source": c.source, "direction": c.direction,
+                          "raw": round(c.raw_confidence, 4),
+                          "weight": round(c.weight, 3)}
+                         for c in decision.contributions]
+                    ),
+                ))
+            except Exception as e:                     # noqa: BLE001
+                log.warning("ensemble_log_error", err=str(e))
+
+        if not decision.emitted or decision.signal is None:
+            log.info("ensemble_skip", symbol=symbol,
+                      regime=regime.value, reason=decision.reason)
+            return
+
+        log.info("ensemble_emit", symbol=symbol, regime=regime.value,
+                 direction=decision.dominant_direction,
+                 score=round(decision.dominant_score, 3),
+                 contributors=[c.source for c in decision.contributions
+                                if c.direction == decision.dominant_direction])
+        self._try_enter(decision.signal, bars, or_hi, or_lo, spot, vwap)
 
     def _try_enter(self, sig: Signal, bars, or_hi, or_lo, spot, vwap) -> None:
         acct = self.broker.account()
@@ -296,6 +398,7 @@ class TradeBot:
             except Exception as e:
                 log.warning("news_sentiment_error", symbol=sig.symbol, err=str(e))
         econ_blackout = self.econ_calendar.in_blackout(bars[-1].ts, symbol=sig.symbol)
+        vix_now = self.vix_probe.value()
         ectx = ExecutionContext(
             signal=sig, now=bars[-1].ts,
             account_equity=acct.equity, day_pnl=acct.day_pnl,
@@ -303,7 +406,7 @@ class TradeBot:
             current_bar_volume=bars[-1].volume,
             avg_bar_volume=sum(b.volume for b in bars[-20:]) / 20,
             opening_range_high=or_hi, opening_range_low=or_lo,
-            spot=spot, vwap=vwap, vix=15.0,
+            spot=spot, vwap=vwap, vix=vix_now,
             is_etf=sig.symbol in {"SPY", "QQQ", "IWM"},
             econ_blackout=econ_blackout,
             news_score=news_score, news_label=news_label,
@@ -326,13 +429,16 @@ class TradeBot:
                                   right=sig.option_right or OptionRight.CALL,
                                   ask=max(0.05, spot * 0.02), bid=max(0.04, spot * 0.018),
                                   open_interest=1000, today_volume=200)
+        # Regime passes through via sig.meta when the ensemble emitted it;
+        # otherwise None → sizer leaves size untouched.
+        regime = sig.meta.get("regime") if isinstance(sig.meta, dict) else None
         n = self.sizer.contracts(SizingInputs(
             equity=acct.equity, contract=contract,
             win_rate_est=0.55, avg_win=0.015, avg_loss=0.025,
-            vix_today=15.0, vix_52w_low=10.0, vix_52w_high=40.0,
+            vix_today=vix_now, vix_52w_low=10.0, vix_52w_high=40.0,
             vrp_zscore=0.0, is_0dte=True,
             is_long=(sig.side == Side.BUY),
-        ))
+        ), regime=regime)
         if n <= 0:
             return
         limit = spot * (1.001 if sig.side == Side.BUY else 0.999)

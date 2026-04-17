@@ -90,6 +90,41 @@ class ClosedTrade:
     is_option: bool
 
 
+@dataclass
+class EnsembleRecord:
+    id: Optional[int]
+    ts: datetime
+    symbol: str
+    regime: str
+    emitted: bool
+    dominant_direction: Optional[str]
+    dominant_score: Optional[float]
+    opposing_score: Optional[float]
+    n_inputs: int
+    reason: str
+    contributors: Optional[str] = None    # JSON string
+
+
+@dataclass
+class MLPrediction:
+    id: Optional[int]
+    ts: datetime
+    symbol: str
+    model: str
+    pred_class: int                     # 0=bearish, 1=neutral, 2=bullish
+    confidence: float
+    p_bearish: float
+    p_neutral: float
+    p_bullish: float
+    horizon_minutes: int
+    up_thr: float
+    down_thr: float
+    entry_price: Optional[float] = None
+    forward_return: Optional[float] = None
+    true_class: Optional[int] = None
+    resolved_at: Optional[datetime] = None
+
+
 def _schema_sql() -> str:
     here = Path(__file__).parent / "schema.sql"
     return here.read_text()
@@ -127,6 +162,36 @@ class TradeJournal(abc.ABC):
     def equity_series(self, since: Optional[datetime] = None,
                       limit: int = 5000) -> List[tuple]:
         """Return [(ts_iso_utc, equity, cash, day_pnl), ...] ordered by ts asc."""
+
+    @abc.abstractmethod
+    def record_ml_prediction(self, p: MLPrediction) -> int:
+        """Insert a prediction. Returns the row id."""
+
+    @abc.abstractmethod
+    def unresolved_ml_predictions(self, older_than: datetime,
+                                   limit: int = 1000) -> List[MLPrediction]:
+        """Predictions whose horizon has passed but `true_class` is NULL."""
+
+    @abc.abstractmethod
+    def resolve_ml_prediction(self, prediction_id: int,
+                               forward_return: float, true_class: int) -> None:
+        """Fill in forward_return / true_class / resolved_at for an id."""
+
+    @abc.abstractmethod
+    def resolved_ml_predictions(self, model: Optional[str] = None,
+                                 since: Optional[datetime] = None,
+                                 limit: int = 20000) -> List[MLPrediction]:
+        """Return resolved predictions for analysis."""
+
+    @abc.abstractmethod
+    def record_ensemble_decision(self, e: EnsembleRecord) -> int:
+        """Persist one EnsembleCoordinator decision. Returns row id."""
+
+    @abc.abstractmethod
+    def ensemble_decisions(self, since: Optional[datetime] = None,
+                            regime: Optional[str] = None,
+                            emitted: Optional[bool] = None,
+                            limit: int = 20000) -> List[EnsembleRecord]: ...
 
     @abc.abstractmethod
     def close(self) -> None: ...
@@ -235,6 +300,137 @@ class SqliteJournal(TradeJournal):
             )
         return [(r[0], float(r[1]), float(r[2]), float(r[3])) for r in cur.fetchall()]
 
+    # ---- ML predictions ----
+    def record_ml_prediction(self, p: MLPrediction) -> int:
+        cur = self._conn.cursor()
+        cur.execute(
+            "INSERT INTO ml_predictions (ts, symbol, model, pred_class, confidence, "
+            "p_bearish, p_neutral, p_bullish, horizon_minutes, up_thr, down_thr, "
+            "entry_price) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (_to_utc(p.ts).isoformat(), p.symbol, p.model, int(p.pred_class),
+             float(p.confidence), float(p.p_bearish), float(p.p_neutral),
+             float(p.p_bullish), int(p.horizon_minutes),
+             float(p.up_thr), float(p.down_thr),
+             None if p.entry_price is None else float(p.entry_price)),
+        )
+        return int(cur.lastrowid)
+
+    def unresolved_ml_predictions(self, older_than: datetime,
+                                   limit: int = 1000) -> List[MLPrediction]:
+        cur = self._conn.cursor()
+        cur.execute(
+            "SELECT id, ts, symbol, model, pred_class, confidence, "
+            "p_bearish, p_neutral, p_bullish, horizon_minutes, up_thr, down_thr, "
+            "entry_price FROM ml_predictions "
+            "WHERE resolved_at IS NULL AND ts <= ? ORDER BY ts ASC LIMIT ?",
+            (_to_utc(older_than).isoformat(), int(limit)),
+        )
+        out = []
+        for r in cur.fetchall():
+            out.append(MLPrediction(
+                id=int(r[0]),
+                ts=datetime.fromisoformat(r[1]),
+                symbol=r[2], model=r[3],
+                pred_class=int(r[4]), confidence=float(r[5]),
+                p_bearish=float(r[6]), p_neutral=float(r[7]), p_bullish=float(r[8]),
+                horizon_minutes=int(r[9]),
+                up_thr=float(r[10]), down_thr=float(r[11]),
+                entry_price=float(r[12]) if r[12] is not None else None,
+            ))
+        return out
+
+    def resolve_ml_prediction(self, prediction_id: int,
+                               forward_return: float, true_class: int) -> None:
+        self._conn.execute(
+            "UPDATE ml_predictions SET forward_return=?, true_class=?, resolved_at=? "
+            "WHERE id=?",
+            (float(forward_return), int(true_class),
+             _to_utc(datetime.now(tz=timezone.utc)).isoformat(),
+             int(prediction_id)),
+        )
+
+    def resolved_ml_predictions(self, model: Optional[str] = None,
+                                 since: Optional[datetime] = None,
+                                 limit: int = 20000) -> List[MLPrediction]:
+        q = ("SELECT id, ts, symbol, model, pred_class, confidence, "
+             "p_bearish, p_neutral, p_bullish, horizon_minutes, up_thr, down_thr, "
+             "entry_price, forward_return, true_class, resolved_at "
+             "FROM ml_predictions WHERE resolved_at IS NOT NULL")
+        params: list = []
+        if model is not None:
+            q += " AND model = ?"
+            params.append(model)
+        if since is not None:
+            q += " AND ts >= ?"
+            params.append(_to_utc(since).isoformat())
+        q += " ORDER BY ts ASC LIMIT ?"
+        params.append(int(limit))
+        cur = self._conn.cursor()
+        cur.execute(q, tuple(params))
+        out = []
+        for r in cur.fetchall():
+            out.append(MLPrediction(
+                id=int(r[0]),
+                ts=datetime.fromisoformat(r[1]),
+                symbol=r[2], model=r[3],
+                pred_class=int(r[4]), confidence=float(r[5]),
+                p_bearish=float(r[6]), p_neutral=float(r[7]), p_bullish=float(r[8]),
+                horizon_minutes=int(r[9]),
+                up_thr=float(r[10]), down_thr=float(r[11]),
+                entry_price=float(r[12]) if r[12] is not None else None,
+                forward_return=float(r[13]) if r[13] is not None else None,
+                true_class=int(r[14]) if r[14] is not None else None,
+                resolved_at=datetime.fromisoformat(r[15]) if r[15] else None,
+            ))
+        return out
+
+    # ---- ensemble ----
+    def record_ensemble_decision(self, e: EnsembleRecord) -> int:
+        cur = self._conn.cursor()
+        cur.execute(
+            "INSERT INTO ensemble_decisions (ts, symbol, regime, emitted, "
+            "dominant_direction, dominant_score, opposing_score, n_inputs, "
+            "reason, contributors) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (_to_utc(e.ts).isoformat(), e.symbol, e.regime, int(bool(e.emitted)),
+             e.dominant_direction,
+             None if e.dominant_score is None else float(e.dominant_score),
+             None if e.opposing_score is None else float(e.opposing_score),
+             int(e.n_inputs), e.reason, e.contributors),
+        )
+        return int(cur.lastrowid)
+
+    def ensemble_decisions(self, since: Optional[datetime] = None,
+                            regime: Optional[str] = None,
+                            emitted: Optional[bool] = None,
+                            limit: int = 20000) -> List[EnsembleRecord]:
+        q = ("SELECT id, ts, symbol, regime, emitted, dominant_direction, "
+             "dominant_score, opposing_score, n_inputs, reason, contributors "
+             "FROM ensemble_decisions WHERE 1=1")
+        params: list = []
+        if since is not None:
+            q += " AND ts >= ?"
+            params.append(_to_utc(since).isoformat())
+        if regime is not None:
+            q += " AND regime = ?"
+            params.append(regime)
+        if emitted is not None:
+            q += " AND emitted = ?"
+            params.append(1 if emitted else 0)
+        q += " ORDER BY ts ASC LIMIT ?"
+        params.append(int(limit))
+        cur = self._conn.cursor()
+        cur.execute(q, tuple(params))
+        return [EnsembleRecord(
+            id=int(r[0]),
+            ts=datetime.fromisoformat(r[1]),
+            symbol=r[2], regime=r[3],
+            emitted=bool(r[4]),
+            dominant_direction=r[5],
+            dominant_score=None if r[6] is None else float(r[6]),
+            opposing_score=None if r[7] is None else float(r[7]),
+            n_inputs=int(r[8]), reason=r[9], contributors=r[10],
+        ) for r in cur.fetchall()]
+
     def close(self) -> None:
         try:
             self._conn.close()
@@ -337,6 +533,126 @@ class CockroachJournal(TradeJournal):
             rows = cur.fetchall()
         return [(r[0].isoformat() if hasattr(r[0], "isoformat") else str(r[0]),
                  float(r[1]), float(r[2]), float(r[3])) for r in rows]
+
+    # ---- ML predictions ----
+    def record_ml_prediction(self, p: MLPrediction) -> int:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO ml_predictions (ts, symbol, model, pred_class, "
+                "confidence, p_bearish, p_neutral, p_bullish, horizon_minutes, "
+                "up_thr, down_thr, entry_price) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                (_to_utc(p.ts), p.symbol, p.model, int(p.pred_class),
+                 float(p.confidence), float(p.p_bearish), float(p.p_neutral),
+                 float(p.p_bullish), int(p.horizon_minutes),
+                 float(p.up_thr), float(p.down_thr), p.entry_price),
+            )
+            return int(cur.fetchone()[0])
+
+    def unresolved_ml_predictions(self, older_than: datetime,
+                                   limit: int = 1000) -> List[MLPrediction]:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, ts, symbol, model, pred_class, confidence, "
+                "p_bearish, p_neutral, p_bullish, horizon_minutes, up_thr, "
+                "down_thr, entry_price FROM ml_predictions "
+                "WHERE resolved_at IS NULL AND ts <= %s ORDER BY ts ASC LIMIT %s",
+                (_to_utc(older_than), int(limit)),
+            )
+            rows = cur.fetchall()
+        return [MLPrediction(
+            id=int(r[0]), ts=r[1], symbol=r[2], model=r[3],
+            pred_class=int(r[4]), confidence=float(r[5]),
+            p_bearish=float(r[6]), p_neutral=float(r[7]), p_bullish=float(r[8]),
+            horizon_minutes=int(r[9]),
+            up_thr=float(r[10]), down_thr=float(r[11]),
+            entry_price=float(r[12]) if r[12] is not None else None,
+        ) for r in rows]
+
+    def resolve_ml_prediction(self, prediction_id: int,
+                               forward_return: float, true_class: int) -> None:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "UPDATE ml_predictions SET forward_return=%s, true_class=%s, "
+                "resolved_at=%s WHERE id=%s",
+                (float(forward_return), int(true_class),
+                 datetime.now(tz=timezone.utc), int(prediction_id)),
+            )
+
+    def resolved_ml_predictions(self, model: Optional[str] = None,
+                                 since: Optional[datetime] = None,
+                                 limit: int = 20000) -> List[MLPrediction]:
+        q = ("SELECT id, ts, symbol, model, pred_class, confidence, p_bearish, "
+             "p_neutral, p_bullish, horizon_minutes, up_thr, down_thr, "
+             "entry_price, forward_return, true_class, resolved_at "
+             "FROM ml_predictions WHERE resolved_at IS NOT NULL")
+        params: list = []
+        if model is not None:
+            q += " AND model = %s"
+            params.append(model)
+        if since is not None:
+            q += " AND ts >= %s"
+            params.append(_to_utc(since))
+        q += " ORDER BY ts ASC LIMIT %s"
+        params.append(int(limit))
+        with self._conn.cursor() as cur:
+            cur.execute(q, tuple(params))
+            rows = cur.fetchall()
+        return [MLPrediction(
+            id=int(r[0]), ts=r[1], symbol=r[2], model=r[3],
+            pred_class=int(r[4]), confidence=float(r[5]),
+            p_bearish=float(r[6]), p_neutral=float(r[7]), p_bullish=float(r[8]),
+            horizon_minutes=int(r[9]),
+            up_thr=float(r[10]), down_thr=float(r[11]),
+            entry_price=float(r[12]) if r[12] is not None else None,
+            forward_return=float(r[13]) if r[13] is not None else None,
+            true_class=int(r[14]) if r[14] is not None else None,
+            resolved_at=r[15],
+        ) for r in rows]
+
+    # ---- ensemble ----
+    def record_ensemble_decision(self, e: EnsembleRecord) -> int:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO ensemble_decisions (ts, symbol, regime, emitted, "
+                "dominant_direction, dominant_score, opposing_score, n_inputs, "
+                "reason, contributors) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "RETURNING id",
+                (_to_utc(e.ts), e.symbol, e.regime, bool(e.emitted),
+                 e.dominant_direction, e.dominant_score, e.opposing_score,
+                 int(e.n_inputs), e.reason, e.contributors),
+            )
+            return int(cur.fetchone()[0])
+
+    def ensemble_decisions(self, since: Optional[datetime] = None,
+                            regime: Optional[str] = None,
+                            emitted: Optional[bool] = None,
+                            limit: int = 20000) -> List[EnsembleRecord]:
+        q = ("SELECT id, ts, symbol, regime, emitted, dominant_direction, "
+             "dominant_score, opposing_score, n_inputs, reason, contributors "
+             "FROM ensemble_decisions WHERE TRUE")
+        params: list = []
+        if since is not None:
+            q += " AND ts >= %s"
+            params.append(_to_utc(since))
+        if regime is not None:
+            q += " AND regime = %s"
+            params.append(regime)
+        if emitted is not None:
+            q += " AND emitted = %s"
+            params.append(bool(emitted))
+        q += " ORDER BY ts ASC LIMIT %s"
+        params.append(int(limit))
+        with self._conn.cursor() as cur:
+            cur.execute(q, tuple(params))
+            rows = cur.fetchall()
+        return [EnsembleRecord(
+            id=int(r[0]), ts=r[1], symbol=r[2], regime=r[3],
+            emitted=bool(r[4]), dominant_direction=r[5],
+            dominant_score=None if r[6] is None else float(r[6]),
+            opposing_score=None if r[7] is None else float(r[7]),
+            n_inputs=int(r[8]), reason=r[9], contributors=r[10],
+        ) for r in rows]
 
     def close(self) -> None:
         try:

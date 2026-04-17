@@ -85,7 +85,23 @@ class ClaudeNewsClassifier(NewsClassifier):
 
 
 def build_classifier() -> NewsClassifier:
-    """Pick a classifier based on env. Falls back to keywords."""
+    """Pick a classifier based on env.
+
+    Priority:
+      1. Local GGUF model via llama-cpp-python (if LLM_MODEL_PATH set AND file exists)
+      2. Claude via Anthropic API (if ANTHROPIC_API_KEY set)
+      3. Keyword (always available)
+    """
+    model_path = os.getenv("LLM_MODEL_PATH", "").strip()
+    if model_path and os.path.exists(model_path):
+        try:
+            from .news_classifier_local import LocalLLMNewsClassifier
+            c = LocalLLMNewsClassifier(model_path=model_path)
+            # If llama-cpp failed to load the model, fall through to next backend.
+            if getattr(c, "_llm", None) is not None:
+                return c
+        except Exception:
+            pass
     if os.getenv("ANTHROPIC_API_KEY"):
         return ClaudeNewsClassifier()
     return KeywordClassifier()

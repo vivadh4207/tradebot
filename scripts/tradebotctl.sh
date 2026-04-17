@@ -99,6 +99,12 @@ case "${1:-}" in
   priors)       shift; "$PY" "$ROOT/scripts/compute_priors.py" "$@" ;;
   walkforward)  shift; "$PY" "$ROOT/scripts/run_walkforward.py" "$@" ;;
   catalysts)    shift; "$PY" "$ROOT/scripts/refresh_catalysts.py" "$@" ;;
+  train-lstm)   shift; "$PY" "$ROOT/scripts/train_lstm.py" "$@" ;;
+  resolve-ml)   shift; "$PY" "$ROOT/scripts/resolve_ml_predictions.py" "$@" ;;
+  analyze-ml)   shift; "$PY" "$ROOT/scripts/analyze_ml_predictions.py" "$@" ;;
+  compare-lstm) shift; "$PY" "$ROOT/scripts/compare_lstm.py" "$@" ;;
+  analyze-ensemble) shift; "$PY" "$ROOT/scripts/analyze_ensemble.py" "$@" ;;
+  propose-weights)  shift; "$PY" "$ROOT/scripts/propose_weights.py" "$@" ;;
   dashboard)    shift; exec "$PY" "$ROOT/scripts/run_dashboard.py" "$@" ;;
   testdb)       shift; "$PY" "$ROOT/scripts/test_db_connection.py" "$@" ;;
   *)

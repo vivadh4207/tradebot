@@ -30,3 +30,6 @@ KILL
 .idea/
 *.swp
 .DS_Store
+
+# editor auto-saves
+*.save

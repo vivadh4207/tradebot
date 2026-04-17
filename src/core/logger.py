@@ -31,7 +31,24 @@ def configure_logging(level: str = "INFO") -> None:
         )
 
 
+class _StdlibKwargAdapter(logging.LoggerAdapter):
+    """Accepts arbitrary kwargs (structlog style) and folds them into the
+    log message so calls like `log.info("event", reason=x, symbol=y)` work
+    whether or not structlog is installed.
+    """
+
+    def process(self, msg, kwargs):
+        stdlib = {}
+        for k in ("exc_info", "stack_info", "stacklevel", "extra"):
+            if k in kwargs:
+                stdlib[k] = kwargs.pop(k)
+        if kwargs:
+            payload = " ".join(f"{k}={v!r}" for k, v in kwargs.items())
+            msg = f"{msg} {payload}"
+        return msg, stdlib
+
+
 def get_logger(name: str) -> Any:
     if _HAS_STRUCTLOG:
         return structlog.get_logger(name)
-    return logging.getLogger(name)
+    return _StdlibKwargAdapter(logging.getLogger(name), {})

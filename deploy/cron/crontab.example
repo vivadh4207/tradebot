@@ -43,6 +43,22 @@ CTL=$TRADEBOT/scripts/tradebotctl.sh
 # Sunday 20:00 ET → longer walk-forward report (quarterly-window sizes)
 0 20 * * 0      $CTL walkforward --train-days 365 --test-days 63 --max-windows 12 >> $TRADEBOT/logs/walkforward_weekly.$(date +\%Y\%m\%d).log 2>&1
 
+# Sunday 21:00 ET → propose ensemble weight nudges from last 30d (human review required)
+0 21 * * 0      $CTL propose-weights --days 30 >> $TRADEBOT/logs/propose_weights.$(date +\%Y\%m\%d).log 2>&1
+
+# Every 15 min during market hours → resolve LSTM predictions whose horizon elapsed
+*/15 9-16 * * 1-5  $CTL resolve-ml > $TRADEBOT/logs/resolve_ml.out 2>&1
+
+# 19:00 ET Mon-Fri → LSTM calibration report (post-resolve)
+0 19 * * 1-5    $CTL analyze-ml --days 14 > $TRADEBOT/logs/ml_analysis.$(date +\%Y\%m\%d).log 2>&1
+
+# 19:15 ET Mon-Fri → Ensemble decisions analysis (regime × win rate)
+15 19 * * 1-5   $CTL analyze-ensemble --days 14 > $TRADEBOT/logs/ensemble_analysis.$(date +\%Y\%m\%d).log 2>&1
+
+# Sunday 23:00 ET → retrain LSTM on last year; restart bot Mon 07:30 via the
+# standard `start`/`stop` pair (the retrained checkpoint is picked up at start).
+0 23 * * 0      $CTL train-lstm --days 365 --timeframe-min 5 --epochs 30 >> $TRADEBOT/logs/train_lstm.$(date +\%Y\%m\%d).log 2>&1
+
 # ---------------- safety ----------------
 
 # Every hour during market hours: if PID file is stale but process gone, clear it.

@@ -1,8 +1,13 @@
-"""PositionSizer — wraps the Hybrid Kelly+VIX model for contract sizing."""
+"""PositionSizer — wraps the Hybrid Kelly+VIX model for contract sizing.
+
+Optional regime-aware multiplier: shrink size in regimes with poor
+realized win rate, grow it in regimes with proven edge. Multipliers are
+clipped to [0, 2]; set to 0.0 to forbid entries in that regime.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional
 
 from ..core.types import OptionContract
 from ..math_tools.sizing import hybrid_sizing
@@ -26,18 +31,19 @@ class SizingInputs:
 class PositionSizer:
     def __init__(self, kelly_fraction_cap: float = 0.25,
                  kelly_hard_cap: float = 0.05,
-                 max_0dte: int = 5, max_multiday: int = 10):
+                 max_0dte: int = 5, max_multiday: int = 10,
+                 regime_multipliers: Optional[Dict[str, float]] = None):
         self.kelly_f = kelly_fraction_cap
         self.kelly_hc = kelly_hard_cap
         self.max_0dte = max_0dte
         self.max_multiday = max_multiday
+        # Regime name → multiplier on the final contract count. Clipped [0, 2].
+        self.regime_multipliers: Dict[str, float] = {
+            k: max(0.0, min(2.0, float(v)))
+            for k, v in (regime_multipliers or {}).items()
+        }
 
-    def contracts(self, inp: SizingInputs) -> int:
-        # Max loss per contract:
-        #   LONG option:  premium × 100
-        #   SHORT option: naked = strike × 100 - credit (approx strike × 100)
-        # For short defined-risk spreads, callers should pass a premium_risk-style
-        # contract.ask equal to the net debit of the spread.
+    def contracts(self, inp: SizingInputs, regime: Optional[str] = None) -> int:
         premium_risk = max(inp.contract.ask, 0.01) * 100
         if inp.is_long:
             max_loss = premium_risk
@@ -45,7 +51,7 @@ class PositionSizer:
             strike_risk = inp.contract.strike * 100
             max_loss = max(strike_risk, premium_risk)
         max_c = self.max_0dte if inp.is_0dte else self.max_multiday
-        return hybrid_sizing(
+        n = hybrid_sizing(
             equity=inp.equity,
             max_loss_per_contract=max_loss,
             win_rate_est=inp.win_rate_est,
@@ -59,3 +65,7 @@ class PositionSizer:
             kelly_hard_cap=self.kelly_hc,
             max_contracts=max_c,
         )
+        if regime and self.regime_multipliers:
+            mult = self.regime_multipliers.get(regime, 1.0)
+            n = int(n * mult)
+        return max(0, min(n, max_c))

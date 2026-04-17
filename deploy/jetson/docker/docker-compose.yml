@@ -1,0 +1,37 @@
+# Two-container stack: trading loop + read-only dashboard.
+# Share the same journal volume so the dashboard sees live trades.
+#
+# Usage:
+#   cd deploy/jetson/docker
+#   docker compose --env-file ../../../.env up -d
+#   docker compose logs -f tradebot
+version: "3.9"
+
+services:
+  tradebot:
+    build:
+      context: ../../..
+      dockerfile: deploy/jetson/docker/Dockerfile
+    runtime: nvidia
+    restart: unless-stopped
+    env_file: ../../../.env
+    environment:
+      - TZ=America/New_York
+    volumes:
+      - ../../../logs:/app/logs
+      - ../../../data_cache:/app/data_cache
+      - ../../../deploy/jetson/models:/app/deploy/jetson/models:ro
+
+  dashboard:
+    build:
+      context: ../../..
+      dockerfile: deploy/jetson/docker/Dockerfile
+    restart: unless-stopped
+    env_file: ../../../.env
+    environment:
+      - TZ=America/New_York
+    command: ["python", "scripts/run_dashboard.py", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ../../../logs:/app/logs
