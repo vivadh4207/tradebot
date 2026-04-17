@@ -424,9 +424,43 @@ class TradeBot:
             sl_multi_pct=settings.get("exits.stop_loss_multi_dte_pct", 0.30),
             zero_dte_max_hold_minutes=_zero_dte_max_hold,
         ))
-        self.strategies = [
-            MomentumSignal(), VwapReversionSignal(), OpeningRangeBreakout(),
-        ]
+
+        # Strategy mode: "directional" (long options on momentum/ORB
+        # signals, original behavior) or "wheel" (sell cash-secured puts
+        # on SPY/QQQ, positive-theta premium harvest). The wheel mode
+        # bypasses the ensemble entirely — it's not a directional bet,
+        # so competing with momentum signals makes no sense.
+        self.strategy_mode = str(settings.get("strategy_mode", "directional")).lower()
+        log.info("strategy_mode", mode=self.strategy_mode)
+        if self.strategy_mode == "wheel":
+            from .signals.wheel_runner import WheelRunner, WheelRunnerConfig
+            from .exits.wheel_exits import WheelExitEvaluator, WheelExitConfig
+            w = settings.raw.get("wheel", {}) or {}
+            self.wheel_runner = WheelRunner(
+                WheelRunnerConfig(
+                    universe=list(w.get("universe", ["SPY", "QQQ"])),
+                    target_dte=int(w.get("target_dte", 35)),
+                    target_delta=float(w.get("target_delta", 0.30)),
+                    min_premium_pct=float(w.get("min_premium_pct", 0.004)),
+                    max_open_positions=int(w.get("max_open_positions", 2)),
+                    min_cash_reserve_pct=float(w.get("min_cash_reserve_pct", 0.10)),
+                ),
+                bot=self,
+            )
+            self.wheel_exits = WheelExitEvaluator(WheelExitConfig(
+                profit_target_pct=float(w.get("profit_target_pct", 0.50)),
+                stop_loss_pct=float(w.get("stop_loss_pct", 1.00)),
+                dte_roll_threshold=int(w.get("dte_roll_threshold", 21)),
+            ))
+            # Directional signal list is intentionally empty — wheel
+            # runner is the only entry source in this mode.
+            self.strategies = []
+        else:
+            self.wheel_runner = None
+            self.wheel_exits = None
+            self.strategies = [
+                MomentumSignal(), VwapReversionSignal(), OpeningRangeBreakout(),
+            ]
         if settings.get("ml.lstm_enabled", True):
             lstm = LSTMSignal(
                 checkpoint_path=settings.get("ml.lstm_checkpoint",
@@ -593,7 +627,14 @@ class TradeBot:
                         else (self.data.latest_price(pos.underlying or pos.symbol)
                               or pos.avg_price),
                     )
-                    d = self.fast.evaluate(pos, price)
+                    # Route to the right exit evaluator based on position sign:
+                    # short-option (qty<0) → wheel exit (premium math)
+                    # long (qty>0)          → standard FastExitEvaluator
+                    if (self.wheel_exits is not None
+                            and pos.is_option and pos.qty < 0):
+                        d = self.wheel_exits.evaluate(pos, price)
+                    else:
+                        d = self.fast.evaluate(pos, price)
                     if d and d.should_close:
                         side = Side.SELL if pos.qty > 0 else Side.BUY
                         qty_abs = abs(pos.qty)
@@ -680,8 +721,16 @@ class TradeBot:
                     continue
                 self._check_halt_conditions()
                 if not self._halted_today:
-                    for symbol in self.s.universe:
-                        self._tick_symbol(symbol)
+                    if self.strategy_mode == "wheel" and self.wheel_runner:
+                        # Wheel bypasses the directional per-symbol tick.
+                        # It has its own universe + cadence.
+                        try:
+                            self.wheel_runner.tick()
+                        except Exception as e:              # noqa: BLE001
+                            log.warning("wheel_runner_tick_failed", err=str(e))
+                    else:
+                        for symbol in self.s.universe:
+                            self._tick_symbol(symbol)
                 # Mark every open position at current market so equity reflects
                 # live P&L (otherwise it's frozen at avg_price until a close).
                 # Fail-soft — a bad chain fetch shouldn't stop the loop.

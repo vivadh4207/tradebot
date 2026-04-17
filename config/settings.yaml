@@ -1,3 +1,23 @@
+# ===== Strategy mode =====
+# "directional" = buy long options on momentum/ORB signals (original).
+#                 Structurally negative EV for retail — theta + spread
+#                 overcome the directional edge on most attempts.
+# "wheel"       = sell 30-delta cash-secured puts on SPY/QQQ at 30-45 DTE.
+#                 Positive-theta premium harvesting. Close at 50% max
+#                 profit or 21 DTE. Win rate ~70% historically.
+strategy_mode: wheel
+
+# Wheel-specific config (used only when strategy_mode=wheel)
+wheel:
+  universe: [SPY, QQQ]           # trade only these 2 for MVP
+  target_dte: 35                 # aim for 30-45 DTE puts
+  target_delta: 0.30             # 30-delta = ~3% OTM
+  profit_target_pct: 0.50        # close when we've captured 50% of premium
+  stop_loss_pct: 1.00            # close if option doubles (lose 1× premium)
+  dte_roll_threshold: 21         # force-close at 21 DTE regardless of P&L
+  max_open_positions: 2          # cash-secured: 2 × 100 × ~$700 = $140k required
+  min_cash_reserve_pct: 0.10     # always keep 10% cash free
+
 # ===== Account =====
 account:
   paper_starting_equity: 10000.0  # USD, for paper sim
