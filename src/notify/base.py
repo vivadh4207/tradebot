@@ -95,20 +95,24 @@ def build_notifier() -> Notifier:
 
 # ------------------------------------------------------------- routing
 # Maps event titles to a channel name. Matching is case-insensitive on
-# the title keyword. First match wins. Unmatched → "default".
+# the title keyword. First match wins. Unmatched titles fall back to
+# "default" (or to "alerts" when level == "error" — see _pick below).
 _TITLE_TO_CHANNEL = {
     "trades":      {"entry", "exit"},
     "catalysts":   {"catalysts", "catalyst"},
-    "alerts":      {"halt", "shutdown", "watchdog",
-                     "news block", "reconcile"},
+    # startup / shutdown / halts / watchdog / reconcile / news blocks /
+    # and generic error-level messages all route to the alerts channel.
+    # Operator preference: "startup and any errors should go to alerts".
+    "alerts":      {"halt", "shutdown", "startup", "watchdog",
+                     "news block", "reconcile", "error", "risk"},
     "calibration": {"calibration"},
 }
 
 
 class MultiChannelNotifier(Notifier):
     """Route notify() calls to one of several WebhookNotifiers based on
-    the `title` kwarg. Falls back to the `default` channel for any
-    unrouted title or when the target channel isn't configured.
+    the `title` kwarg AND `level`. Falls back to the `default` channel
+    for any unrouted non-error title.
 
     Designed for Discord multi-channel setups where you want entry/exit
     fills in one channel, catalysts in another, and alerts in a third —
@@ -119,16 +123,20 @@ class MultiChannelNotifier(Notifier):
         assert "default" in channels, "MultiChannelNotifier requires a 'default' channel"
         self._channels = channels
 
-    def _pick(self, title: str) -> Notifier:
+    def _pick(self, title: str, level: str = "info") -> Notifier:
         t = (title or "").lower().strip()
         for chan, keywords in _TITLE_TO_CHANNEL.items():
             if t in keywords and chan in self._channels:
                 return self._channels[chan]
+        # Any error-level message without a specific channel goes to
+        # alerts (if configured). Keeps default channel free of noise.
+        if level == "error" and "alerts" in self._channels:
+            return self._channels["alerts"]
         return self._channels["default"]
 
     def notify(self, text: str, *, level: str = "info", title: str = "",
                 meta=None) -> None:
-        self._pick(title).notify(text, level=level, title=title, meta=meta)
+        self._pick(title, level).notify(text, level=level, title=title, meta=meta)
 
     def close(self) -> None:
         """Close every underlying WebhookNotifier's queue."""

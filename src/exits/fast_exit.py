@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from ..core.types import Position, ExitDecision
+from ..core.types import Position, ExitDecision, OptionRight
 
 
 @dataclass
@@ -51,11 +51,90 @@ class FastExitConfig:
     trailing_stop_pct: float = 0.10
     trailing_stop_enabled: bool = True
     hard_cap_pct: float = 1.50
+    # Momentum-exit: close when the underlying's momentum reverses or
+    # volume dries up, even if we haven't hit the fixed PT. Only fires
+    # when the position is in profit (> min_profit_to_exit) — we don't
+    # exit losers on noise; stop-loss handles those.
+    momentum_exit_enabled: bool = True
+    momentum_exit_min_profit: float = 0.10      # must be up 10% first
+    momentum_exit_reverse_bars: int = 3          # N consecutive bars against direction
+    momentum_exit_vol_multiple: float = 0.50     # volume < 0.5× avg = dry-up
+    momentum_exit_vol_lookback: int = 15         # baseline volume window
+    momentum_exit_stall_lookback: int = 5        # "no new high" window
 
 
 class FastExitEvaluator:
     def __init__(self, cfg: FastExitConfig = FastExitConfig()):
         self.cfg = cfg
+
+    def _momentum_exit(self, pos: Position, bars) -> Optional[ExitDecision]:
+        """Close-on-trend-reversal exit for long calls/puts.
+
+        Two independent triggers (either fires = close):
+          A. **Reverse bars** — N consecutive candles against our
+             direction (red for calls, green for puts). Default N=3.
+             Indicates momentum died.
+          B. **Volume dry-up + stall** — recent avg volume < 0.5× of the
+             prior baseline window, AND the underlying hasn't made a
+             new extreme (high for calls, low for puts) in the last K
+             bars. Indicates buying/selling interest faded.
+
+        The caller guards with a min-profit-threshold so we only fire
+        on positions already in the green.
+        """
+        cfg = self.cfg
+        # Direction derived from the option right (we only go long).
+        is_bullish = (pos.right == OptionRight.CALL)
+        # --- A. reverse bars ---
+        n = cfg.momentum_exit_reverse_bars
+        recent = bars[-n:]
+        if is_bullish:
+            if all(b.close < b.open for b in recent):
+                return ExitDecision(
+                    True,
+                    f"momentum_reversal:{n}_red_bars_against_call",
+                    layer=0,
+                )
+        else:
+            if all(b.close > b.open for b in recent):
+                return ExitDecision(
+                    True,
+                    f"momentum_reversal:{n}_green_bars_against_put",
+                    layer=0,
+                )
+        # --- B. volume dry-up + stall ---
+        # Baseline = the older portion of the volume lookback window,
+        # excluding the very latest bars (so we compare "recent" vs
+        # "before").
+        lb = cfg.momentum_exit_vol_lookback
+        stall = cfg.momentum_exit_stall_lookback
+        if len(bars) >= lb + stall:
+            baseline = bars[-(lb + stall):-stall]
+            recent_window = bars[-stall:]
+            avg_baseline = sum(b.volume for b in baseline) / max(1, len(baseline))
+            avg_recent = sum(b.volume for b in recent_window) / max(1, len(recent_window))
+            if avg_baseline > 0 and avg_recent < cfg.momentum_exit_vol_multiple * avg_baseline:
+                if is_bullish:
+                    recent_high = max(b.high for b in recent_window)
+                    baseline_high = max(b.high for b in baseline)
+                    if recent_high <= baseline_high:
+                        return ExitDecision(
+                            True,
+                            f"volume_dry_up:{avg_recent/avg_baseline:.2f}x"
+                            f"_and_no_new_high",
+                            layer=0,
+                        )
+                else:
+                    recent_low = min(b.low for b in recent_window)
+                    baseline_low = min(b.low for b in baseline)
+                    if recent_low >= baseline_low:
+                        return ExitDecision(
+                            True,
+                            f"volume_dry_up:{avg_recent/avg_baseline:.2f}x"
+                            f"_and_no_new_low",
+                            layer=0,
+                        )
+        return None
 
     def _effective_0dte_timeout(self, pnl_pct: float) -> float:
         """Compute the current max-hold window based on unrealized P&L.
@@ -69,7 +148,8 @@ class FastExitEvaluator:
             return max(1.0, base - self.cfg.zero_dte_unfavorable_reduction_minutes)
         return base
 
-    def evaluate(self, pos: Position, current_price: float) -> Optional[ExitDecision]:
+    def evaluate(self, pos: Position, current_price: float,
+                  bars=None) -> Optional[ExitDecision]:
         dte = pos.dte()
         pnl = pos.unrealized_pnl_pct(current_price)
         short_dte = dte <= 1
@@ -108,6 +188,22 @@ class FastExitEvaluator:
         # Stop loss always fires first.
         if pnl <= -sl:
             return ExitDecision(True, f"fast_sl_hit:{pnl:.2%}", layer=0)
+
+        # Momentum/volume exit — close when the underlying trend reverses
+        # even if we haven't hit the fixed PT. Only fires when already
+        # in profit so we don't exit on noise when the trade is still
+        # underwater. Requires bars to be passed in from the caller.
+        if (self.cfg.momentum_exit_enabled
+                and bars is not None
+                and len(bars) >= max(
+                    self.cfg.momentum_exit_reverse_bars,
+                    self.cfg.momentum_exit_vol_lookback,
+                    self.cfg.momentum_exit_stall_lookback,
+                )
+                and pnl >= self.cfg.momentum_exit_min_profit):
+            mx = self._momentum_exit(pos, bars)
+            if mx is not None:
+                return mx
 
         # Scale-out at first PT hit: close half, flag pos.scaled_out,
         # let the remainder trail the high. Requires at least 2 contracts

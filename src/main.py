@@ -577,11 +577,25 @@ class TradeBot:
 
     def _refresh_catalysts(self) -> None:
         """Pull earnings/FDA events and hydrate the EconomicCalendar with
-        per-symbol blackouts. Swallows errors (network, missing deps)."""
+        per-symbol blackouts. Swallows errors (network, missing deps).
+
+        Discord notification throttled to once per day — the catalyst
+        list only changes slowly (earnings dates are set weeks ahead)
+        so re-posting on every watchdog restart is pure noise.
+        """
         try:
             events = self.catalyst_calendar.refresh(self.s.universe)
             n = self.catalyst_calendar.hydrate_econ_calendar(self.econ_calendar)
             log.info("catalysts_refreshed", events=len(events), blackouts=n)
+            # Throttle: once per calendar day. _last_catalyst_notify_date
+            # is initialized to None so first-ever post happens; after
+            # that only when the date changes.
+            from datetime import date as _date
+            today = _date.today()
+            last = getattr(self, "_last_catalyst_notify_date", None)
+            if last == today:
+                return
+            self._last_catalyst_notify_date = today
             if events:
                 # Group by symbol so the list stays scannable. With
                 # structured notifier `meta` we get one field per event
@@ -643,7 +657,15 @@ class TradeBot:
                             and pos.is_option and pos.qty < 0):
                         d = self.wheel_exits.evaluate(pos, price)
                     else:
-                        d = self.fast.evaluate(pos, price)
+                        # Pass bars of the UNDERLYING so the momentum-exit
+                        # check has trend/volume data. Cheap — data
+                        # adapter caches per-symbol bars.
+                        und = pos.underlying or pos.symbol
+                        try:
+                            bars_for_exit = self.data.get_bars(und, limit=40)
+                        except Exception:
+                            bars_for_exit = None
+                        d = self.fast.evaluate(pos, price, bars=bars_for_exit)
                     if d and d.should_close:
                         side = Side.SELL if pos.qty > 0 else Side.BUY
                         qty_abs = abs(pos.qty)
