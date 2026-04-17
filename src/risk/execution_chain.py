@@ -52,6 +52,10 @@ class ExecutionContext:
     # Recent price bars (last ~20-80) — used by the momentum-confirmation
     # filter to verify the underlying actually moved in signal direction.
     recent_bars: list = None          # type: ignore[assignment]
+    # Computed delta (abs value) for the picked option contract.
+    # Populated by f18_option_scalp_viability when IV is known; read by
+    # the sizing logic in main.py to decide 1 vs scale-up contracts.
+    contract_delta: float = 0.0
 
 
 class ExecutionChain:
@@ -291,6 +295,71 @@ class ExecutionChain:
             )
         return FilterResult(True, f"momentum_ok: {move:+.3%}")
 
+    def f18_option_scalp_viability(self, ctx: ExecutionContext) -> FilterResult:
+        """Reject options that can't produce meaningful dollar P&L on a
+        realistic underlying move. Three independent rejects:
+
+          (a) ask < min_option_ask — lottery tickets that barely move in $
+          (b) |delta| outside [scalp_delta_min, scalp_delta_max] — OTM
+              wings or deep ITM, neither scalps well on 5-10 min moves
+          (c) today_volume < scalp_min_contract_volume — stale market
+        """
+        ex = self._s.get("execution", {}) or {}
+        if not bool(ex.get("scalp_viability_enabled", True)):
+            return FilterResult(True, "scalp_via_disabled", advisory=True)
+        c = ctx.contract
+        if c is None:
+            return FilterResult(True, "scalp_via_no_contract", advisory=True)
+        # min_option_ask is DISABLED by default (set to 0.0) per operator:
+        # the decision to enter comes from the composite of all filters +
+        # delta + momentum + volume, NOT from a dollar-price floor. A
+        # $0.40 OTM call with delta 0.25, high gamma, and strong
+        # momentum behind it is a legitimate scalp. Setting this above
+        # 0 re-enables a price floor if needed.
+        min_ask = float(ex.get("min_option_ask", 0.0))
+        if min_ask > 0 and c.ask and c.ask < min_ask:
+            return FilterResult(
+                False,
+                f"scalp_via_cheap: ask=${c.ask:.2f}<${min_ask:.2f}",
+            )
+        min_vol = int(ex.get("scalp_min_contract_volume", 50))
+        if c.today_volume and c.today_volume < min_vol:
+            # today_volume=0 means unknown (Alpaca snapshot limitation)
+            # rather than actually-zero; only reject when positive-but-low
+            if c.today_volume > 0:
+                return FilterResult(
+                    False,
+                    f"scalp_via_thin_volume: {c.today_volume}<{min_vol}",
+                )
+        # Delta check. Computed via BS with chain IV. Skip if no IV data.
+        if c.iv and c.iv > 0 and c.expiry is not None:
+            try:
+                from ..math_tools.pricer import bs_greeks
+                from datetime import date as _date
+                dte_days = max(1, (c.expiry - _date.today()).days)
+                T = dte_days / 365.0
+                r = 0.045     # rough risk-free; OK for short-dated
+                q = 0.015     # dividend approximation
+                greeks = bs_greeks(
+                    S=ctx.spot, K=c.strike, T=T, r=r,
+                    sigma=c.iv, q=q,
+                    option_type=c.right.value,
+                )
+                delta = abs(float(greeks.get("delta", 0.0) or 0.0))
+                d_min = float(ex.get("scalp_delta_min", 0.35))
+                d_max = float(ex.get("scalp_delta_max", 0.65))
+                if delta < d_min or delta > d_max:
+                    return FilterResult(
+                        False,
+                        f"scalp_via_delta: {delta:.2f} not in [{d_min:.2f},{d_max:.2f}]",
+                    )
+                # Stash delta on ctx for the sizer to read later.
+                ctx.contract_delta = delta
+            except Exception as e:                           # noqa: BLE001
+                # Math failed — don't block the trade, just log
+                log.warning("scalp_via_greek_calc_failed err=%s", e)
+        return FilterResult(True, "scalp_via_ok")
+
     # ---------- runner ----------
     def run(self, ctx: ExecutionContext) -> List[FilterResult]:
         filters: List[Callable[[ExecutionContext], FilterResult]] = [
@@ -303,6 +372,7 @@ class ExecutionChain:
             self.f13_0dte_cap, self.f14_mi_edge_gate,
             self.f15_news_filter,
             self.f16_vwap_alignment, self.f17_momentum_confirmation,
+            self.f18_option_scalp_viability,
         ]
         results: List[FilterResult] = []
         for f in filters:

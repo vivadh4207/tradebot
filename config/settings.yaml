@@ -142,6 +142,45 @@ execution:
   momentum_confirmation_enabled: false
   momentum_confirmation_min_move: 0.002   # 0.2% over last 5 bars
 
+  # Scalp-viability filter (f18) — holistic gate. The decision to
+  # enter comes from the COMPOSITE of all filters (momentum, volume,
+  # spread, OI, IV rank, VWAP, news, ensemble confidence) — NOT from
+  # an arbitrary price floor. A $0.40 OTM call can 10-bag on the
+  # right setup, so we don't reject purely on absolute price.
+  #
+  # What f18 DOES enforce:
+  #   - |delta| ∈ [scalp_delta_min, scalp_delta_max] — the option
+  #     has to be responsive to underlying moves. 0.20 covers
+  #     high-gamma OTM plays; 0.70 covers ITM moderately-leveraged
+  #     plays. Outside that range the option either barely moves
+  #     (pure tails) or is all intrinsic (deep ITM, low gearing).
+  #   - today_volume >= min when REPORTED > 0 — stale quotes only.
+  # min_option_ask is kept at 0 (disabled) per operator: real filter
+  # is the cumulative-signal one, not a dollar-amount gate.
+  scalp_viability_enabled: true
+  min_option_ask: 0.0                # disabled; composite decides
+  scalp_delta_min: 0.20              # was 0.35 — allow cheap OTM
+  scalp_delta_max: 0.70              # was 0.65 — allow mild ITM
+  scalp_min_contract_volume: 50
+
+  # Contract-count policy.
+  #   default_qty = 1 per entry per ticker (operator request: "only buy
+  #                1 contract unless momentum + greeks both favor")
+  #   scale-up to max_qty_if_strong ONLY when all THREE conditions:
+  #     - delta in sweet spot [scalp_delta_scale_min, scalp_delta_scale_max]
+  #     - 5-bar underlying move in signal direction >= 0.5%
+  #     - current bar volume >= scalp_min_volume_multiple × 20-bar avg
+  default_qty_per_entry: 1
+  max_qty_if_strong: 3
+  # Scale-up to qty>1 requires a COMPOSITE of momentum + volume +
+  # delta being simultaneously strong. Delta range widened because
+  # high-gamma OTM (delta 0.25–0.35) is exactly where a cheap call
+  # can multiply on a real move — we want to size up there too.
+  scalp_delta_scale_min: 0.25        # was 0.40 — include high-gamma OTM
+  scalp_delta_scale_max: 0.60        # was 0.55
+  scalp_scale_min_underlying_move: 0.005
+  scalp_scale_min_volume_multiple: 2.0
+
 # ===== Position sizing =====
 sizing:
   kelly_fraction_cap: 0.25   # quarter-Kelly, capped at 5% of equity
