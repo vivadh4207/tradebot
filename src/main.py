@@ -37,6 +37,7 @@ from .signals.lstm_signal import LSTMSignal
 from .signals.ensemble import EnsembleCoordinator, DEFAULT_WEIGHTS
 from .intelligence.regime import Regime, RegimeClassifier
 from .intelligence.vix_probe import VixProbe
+from .intelligence.dividend_yield import DividendYieldProvider
 from .storage.journal import build_journal, TradeJournal
 from .notify.base import build_notifier, Notifier
 from .intelligence.news import NewsProvider, StaticNewsProvider, CachedNewsSentiment
@@ -136,11 +137,39 @@ class TradeBot:
             lookahead_days=int(settings.get("catalysts.lookahead_days", 14)),
         )
         self._refresh_catalysts()
+        snap_path = settings.get("broker.snapshot_path", "logs/broker_state.json")
         self.broker = PaperBroker(
             starting_equity=settings.paper_equity,
             slippage_bps=settings.get("broker.slippage_bps", 2),
             journal=self.journal,
+            snapshot_path=snap_path,
         )
+        # Crash recovery: if a snapshot exists, restore state before we
+        # accept the first tick. If this is a clean start, no-op.
+        try:
+            restored = self.broker.restore_from_snapshot(snap_path)
+            if restored > 0:
+                log.info("broker_state_restored", n_positions=restored,
+                         path=snap_path)
+                self.notifier.notify(
+                    f"Restored {restored} position(s) from snapshot. "
+                    f"Review vs broker before trading.",
+                    level="warn", title="startup",
+                )
+        except Exception as e:                           # noqa: BLE001
+            log.warning("broker_snapshot_restore_failed", err=str(e))
+
+        # Per-symbol dividend yield cache (only dividend-payers get non-zero).
+        self.dividend_yield = DividendYieldProvider(
+            cache_path=settings.get("pricing.dividend_cache",
+                                     "data_cache/div_yields.json"),
+            max_age_hours=int(settings.get("pricing.dividend_refresh_hours", 24)),
+        )
+        try:
+            self.dividend_yield.prime(self.s.universe)
+            log.info("dividend_yield_primed", n=len(self.s.universe))
+        except Exception as e:                           # noqa: BLE001
+            log.warning("dividend_yield_prime_failed", err=str(e))
         self._last_daily_summary_date = None
         self._halted_today = False
 

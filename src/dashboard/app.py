@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import json
+import os
 from collections import Counter, defaultdict
 
 from fastapi import FastAPI, Query
@@ -19,6 +20,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from ..core.config import load_settings
 from ..storage.journal import build_journal
+from ..storage.position_snapshot import load_snapshot
 
 
 def _load_journal():
@@ -215,6 +217,256 @@ def ensemble(days: int = Query(14, ge=1, le=365),
     }
 
 
+def _settings():
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    return load_settings(root / "config" / "settings.yaml"), root
+
+
+@app.get("/api/health", response_class=JSONResponse)
+def health():
+    """Liveness + last-tick freshness. Essential for ops."""
+    s, root = _settings()
+    j = _load_journal()
+    try:
+        snap = load_snapshot(s.get("broker.snapshot_path",
+                                     str(root / "logs" / "broker_state.json")))
+        # Derive "last tick" from the most recent equity_curve entry if present
+        from datetime import datetime, timedelta, timezone
+        since = datetime.now(tz=timezone.utc) - timedelta(hours=48)
+        eq = j.equity_series(since=since, limit=1)
+        last_tick = eq[-1][0] if eq else None
+        trades = j.closed_trades(since=since)
+        last_trade = trades[-1].closed_at.isoformat() if trades and trades[-1].closed_at else None
+    finally:
+        j.close()
+
+    log_path = root / "logs" / "tradebot.out"
+    log_size = log_path.stat().st_size if log_path.exists() else 0
+
+    snap_saved = snap.saved_at if snap else None
+    snap_positions = len(snap.positions) if snap else 0
+    snap_cash = snap.cash if snap else None
+    snap_day_pnl = snap.day_pnl if snap else None
+
+    return {
+        "backend": s.get("storage.backend", "sqlite"),
+        "universe": s.get("universe", []),
+        "ensemble_enabled": s.get("ensemble.enabled", True),
+        "lstm_enabled": s.get("ml.lstm_enabled", True),
+        "live_trading": s.live_trading,
+        "last_equity_snapshot": last_tick,
+        "last_trade_close": last_trade,
+        "broker_snapshot_saved_at": snap_saved,
+        "broker_open_positions": snap_positions,
+        "broker_cash": snap_cash,
+        "broker_day_pnl": snap_day_pnl,
+        "log_size_bytes": log_size,
+    }
+
+
+@app.get("/api/positions_open", response_class=JSONResponse)
+def positions_open():
+    """Currently open positions (from snapshot) with estimated unrealized P&L."""
+    s, root = _settings()
+    snap = load_snapshot(s.get("broker.snapshot_path",
+                                 str(root / "logs" / "broker_state.json")))
+    if snap is None:
+        return {"positions": [], "saved_at": None}
+    positions = []
+    for p in snap.positions:
+        positions.append({
+            "symbol": p.symbol, "qty": p.qty, "avg_price": p.avg_price,
+            "is_option": p.is_option, "underlying": p.underlying,
+            "strike": p.strike, "expiry": p.expiry_iso, "right": p.right,
+            "entry_tag": p.entry_tag,
+            "auto_profit_target": p.auto_profit_target,
+            "auto_stop_loss": p.auto_stop_loss,
+            "consecutive_holds": p.consecutive_holds,
+        })
+    return {"positions": positions, "saved_at": snap.saved_at,
+            "cash": snap.cash, "day_pnl": snap.day_pnl,
+            "total_pnl": snap.total_pnl}
+
+
+@app.get("/api/ml_recent", response_class=JSONResponse)
+def ml_recent(days: int = Query(7, ge=1, le=90),
+               limit: int = Query(100, ge=1, le=1000)):
+    """Recent LSTM predictions + resolved accuracy summary."""
+    from datetime import datetime, timedelta, timezone
+    j = _load_journal()
+    try:
+        since = datetime.now(tz=timezone.utc) - timedelta(days=days)
+        resolved = j.resolved_ml_predictions(since=since, limit=limit)
+        unresolved = j.unresolved_ml_predictions(older_than=datetime.now(tz=timezone.utc),
+                                                   limit=limit)
+    finally:
+        j.close()
+    total = resolved
+    correct = sum(1 for t in total if t.pred_class == t.true_class)
+    wins = sum(1 for t in total if t.pred_class != 1 and t.pred_class == t.true_class)
+    losses = sum(1 for t in total if t.pred_class != 1 and t.pred_class != t.true_class
+                 and t.true_class != 1)
+    directional = [t for t in total if t.pred_class != 1]
+    dir_correct = sum(1 for t in directional if t.pred_class == t.true_class)
+    dir_wrong_side = sum(
+        1 for t in directional
+        if (t.pred_class == 2 and t.true_class == 0)
+        or (t.pred_class == 0 and t.true_class == 2)
+    )
+    accuracy = correct / len(total) if total else 0.0
+    return {
+        "n_resolved": len(total),
+        "n_unresolved": len(unresolved),
+        "overall_accuracy": round(accuracy, 4),
+        "n_directional": len(directional),
+        "directional_hit_rate": round(dir_correct / len(directional), 4) if directional else 0.0,
+        "directional_wrong_side_rate": round(dir_wrong_side / len(directional), 4) if directional else 0.0,
+        "recent": [
+            {"ts": t.ts.isoformat(), "symbol": t.symbol,
+             "pred": ["bearish", "neutral", "bullish"][t.pred_class],
+             "confidence": round(t.confidence, 3),
+             "true": (["bearish", "neutral", "bullish"][t.true_class]
+                      if t.true_class is not None else None),
+             "fwd_return": round(t.forward_return, 4) if t.forward_return is not None else None,
+             "horizon_min": t.horizon_minutes}
+            for t in total[-limit:][::-1]
+        ],
+    }
+
+
+@app.get("/api/regime_now", response_class=JSONResponse)
+def regime_now():
+    """Most recent regime label the bot saw (from ensemble_decisions)."""
+    from datetime import datetime, timedelta, timezone
+    j = _load_journal()
+    try:
+        since = datetime.now(tz=timezone.utc) - timedelta(days=2)
+        decisions = j.ensemble_decisions(since=since, limit=5000)
+    finally:
+        j.close()
+    if not decisions:
+        return {"regime": None, "as_of": None, "recent_distribution": {}}
+    last = decisions[-1]
+    # distribution of last 200 decisions
+    recent = decisions[-200:]
+    dist = Counter(d.regime for d in recent)
+    return {
+        "regime": last.regime,
+        "as_of": last.ts.isoformat() if hasattr(last.ts, "isoformat") else str(last.ts),
+        "symbol": last.symbol,
+        "emitted": bool(last.emitted),
+        "recent_distribution": dict(dist),
+    }
+
+
+@app.get("/api/catalysts_upcoming", response_class=JSONResponse)
+def catalysts_upcoming():
+    """Upcoming earnings / FDA events in the next 14 days (auto-populated)."""
+    from pathlib import Path
+    import json as _json
+    s, root = _settings()
+    # Read the most recent refresh log if available (cron writes these)
+    logs_dir = root / "logs"
+    out = {"events": [], "source": None}
+    if not logs_dir.exists():
+        return out
+    candidates = sorted(logs_dir.glob("catalysts.*.log"))
+    if not candidates:
+        return out
+    last = candidates[-1]
+    try:
+        text = last.read_text()
+        # the refresh script writes plain lines unless --json; try to parse
+        # simple lines: SYMBOL DATE TYPE TIMING DETAILS
+        events = []
+        for line in text.splitlines():
+            parts = line.split(None, 4)
+            if len(parts) >= 4 and len(parts[0]) <= 8 and "-" in parts[1]:
+                events.append({
+                    "symbol": parts[0], "date": parts[1],
+                    "type": parts[2], "timing": parts[3],
+                    "details": parts[4] if len(parts) > 4 else "",
+                })
+        out["events"] = events
+        out["source"] = last.name
+    except Exception:
+        pass
+    return out
+
+
+@app.get("/api/logs_tail", response_class=JSONResponse)
+def logs_tail(lines: int = Query(200, ge=10, le=5000),
+               grep: str = Query("", max_length=256)):
+    """Tail the bot's primary log file. Optional grep filter (plain substring)."""
+    from pathlib import Path
+    s, root = _settings()
+    log_path = root / "logs" / "tradebot.out"
+    if not log_path.exists():
+        return {"lines": [], "path": str(log_path), "missing": True}
+    # Efficient-ish tail for small files; OK up to ~100 MB
+    try:
+        with log_path.open("rb") as f:
+            # seek to end, read backward in chunks, collect last N lines
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            chunk = 64 * 1024
+            buf = b""
+            pos = size
+            collected = 0
+            while pos > 0 and collected <= lines * 2:
+                read_size = min(chunk, pos)
+                pos -= read_size
+                f.seek(pos)
+                buf = f.read(read_size) + buf
+                collected = buf.count(b"\n")
+            text = buf.decode("utf-8", errors="replace")
+            all_lines = text.splitlines()
+    except Exception as e:
+        return {"lines": [], "path": str(log_path), "error": str(e)}
+    if grep:
+        g = grep.lower()
+        all_lines = [ln for ln in all_lines if g in ln.lower()]
+    tail = all_lines[-lines:]
+    return {"lines": tail, "path": str(log_path), "missing": False,
+            "total_matched": len(all_lines)}
+
+
+@app.get("/api/attribution", response_class=JSONResponse)
+def attribution(days: int = Query(30, ge=1, le=365)):
+    """Per-entry-tag performance attribution. Maps entry_tag → win rate, mean pnl,
+    count, total PnL — so you can see which signal source is carrying the book."""
+    from datetime import datetime, timedelta, timezone
+    j = _load_journal()
+    try:
+        since = datetime.now(tz=timezone.utc) - timedelta(days=days)
+        ts = j.closed_trades(since=since)
+    finally:
+        j.close()
+
+    buckets: dict = defaultdict(lambda: {"n": 0, "wins": 0,
+                                           "pnl_sum": 0.0, "pnl_pct_sum": 0.0})
+    for t in ts:
+        tag = t.entry_tag or "(none)"
+        b = buckets[tag]
+        b["n"] += 1
+        if (t.pnl or 0) > 0:
+            b["wins"] += 1
+        b["pnl_sum"] += float(t.pnl or 0)
+        b["pnl_pct_sum"] += float(t.pnl_pct or 0)
+    out = []
+    for tag, b in sorted(buckets.items(), key=lambda kv: -kv[1]["pnl_sum"]):
+        n = b["n"]
+        out.append({
+            "entry_tag": tag,
+            "n": n,
+            "win_rate": round(b["wins"] / n, 4) if n else 0.0,
+            "mean_pnl_pct": round(b["pnl_pct_sum"] / n, 6) if n else 0.0,
+            "total_pnl": round(b["pnl_sum"], 2),
+        })
+    return {"by_entry_tag": out}
+
+
 _INDEX_HTML = """<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8"/>
@@ -249,7 +501,11 @@ _INDEX_HTML = """<!DOCTYPE html>
 </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head><body>
-<h1>tradebot &nbsp;·&nbsp; <span class="mut">read-only journal view</span></h1>
+<h1>tradebot &nbsp;·&nbsp; <span class="mut">executive view</span></h1>
+
+<h2>health</h2>
+<div class="grid" id="health"></div>
+
 <div class="row">
   <label>lookback</label>
   <select id="days">
@@ -259,6 +515,34 @@ _INDEX_HTML = """<!DOCTYPE html>
   </select>
 </div>
 <div class="grid" id="metrics"></div>
+
+<h2>open positions</h2>
+<div class="card"><table id="open-pos"><thead><tr>
+  <th>symbol</th><th>qty</th><th>avg px</th><th>type</th>
+  <th>strike</th><th>expiry</th><th>auto PT</th><th>auto SL</th>
+  <th>holds</th><th>entry tag</th>
+</tr></thead><tbody></tbody></table></div>
+
+<h2>regime + vix</h2>
+<div class="grid" id="regime-now"></div>
+
+<h2>performance attribution by entry tag</h2>
+<div class="card"><table id="attribution"><thead><tr>
+  <th>entry tag</th><th>n</th><th>win rate</th>
+  <th>mean pnl %</th><th>total pnl</th>
+</tr></thead><tbody></tbody></table></div>
+
+<h2>LSTM calibration (resolved)</h2>
+<div class="grid" id="ml-summary"></div>
+<div class="card"><table id="ml-recent"><thead><tr>
+  <th>time</th><th>symbol</th><th>predicted</th><th>conf</th>
+  <th>actual</th><th>fwd return</th><th>horizon</th>
+</tr></thead><tbody></tbody></table></div>
+
+<h2>upcoming catalysts</h2>
+<div class="card"><table id="catalysts"><thead><tr>
+  <th>symbol</th><th>date</th><th>type</th><th>timing</th><th>details</th>
+</tr></thead><tbody></tbody></table></div>
 <h2>equity curve</h2>
 <div class="card"><canvas id="chart"></canvas></div>
 <h2>closed trades</h2>
@@ -280,18 +564,44 @@ _INDEX_HTML = """<!DOCTYPE html>
   <th>time</th><th>symbol</th><th>regime</th><th>result</th><th>direction</th>
   <th>score</th><th>opposing</th><th>n inputs</th><th>reason</th>
 </tr></thead><tbody></tbody></table></div>
+
+<h2>logs &nbsp;·&nbsp; <span class="mut">last 200 lines from tradebot.out</span></h2>
+<div class="row">
+  <label>filter</label>
+  <input id="log-grep" type="text" placeholder="substring filter — e.g. ensemble_emit, fill, HALT"
+         style="background:#141a33;color:#e6e9f5;border:1px solid #2b3360;
+                border-radius:6px;padding:4px 8px;flex:1;max-width:500px;"/>
+  <button id="log-refresh" style="background:#2b3360;color:#e6e9f5;border:0;
+          padding:5px 14px;border-radius:6px;cursor:pointer;">refresh</button>
+</div>
+<div class="card" style="max-height:320px;overflow:auto;padding:10px;">
+  <pre id="log-view" style="white-space:pre-wrap;margin:0;font-size:12px;
+       font-family:ui-monospace,monospace;color:#cbd5ff;"></pre>
+</div>
 <script>
 let chart;
 function fmt(n, d=2) { return (n===null||n===undefined) ? '' : Number(n).toFixed(d); }
 function cls(n) { return n>0 ? 'pos' : (n<0 ? 'neg' : 'mut'); }
 async function refresh() {
   const d = document.getElementById('days').value;
-  const [m, eq, tr, en] = await Promise.all([
+  const [m, eq, tr, en, hlt, pos, ml, rg, at, cat] = await Promise.all([
     fetch('/api/metrics?days='+d).then(r=>r.json()),
     fetch('/api/equity?days='+d).then(r=>r.json()),
     fetch('/api/trades?days='+d+'&limit=200').then(r=>r.json()),
     fetch('/api/ensemble?days='+d+'&recent_limit=50').then(r=>r.json()).catch(()=>null),
+    fetch('/api/health').then(r=>r.json()).catch(()=>null),
+    fetch('/api/positions_open').then(r=>r.json()).catch(()=>null),
+    fetch('/api/ml_recent?days='+Math.min(parseInt(d)||30,90)+'&limit=50').then(r=>r.json()).catch(()=>null),
+    fetch('/api/regime_now').then(r=>r.json()).catch(()=>null),
+    fetch('/api/attribution?days='+d).then(r=>r.json()).catch(()=>null),
+    fetch('/api/catalysts_upcoming').then(r=>r.json()).catch(()=>null),
   ]);
+  renderHealth(hlt);
+  renderOpenPositions(pos);
+  renderRegime(rg, hlt);
+  renderAttribution(at);
+  renderMLRecent(ml);
+  renderCatalysts(cat);
   const mel = document.getElementById('metrics');
   mel.innerHTML = '';
   const cards = [
@@ -403,8 +713,178 @@ function renderEnsemble(en) {
     recTbody.appendChild(row);
   });
 }
+function renderHealth(h) {
+  const el = document.getElementById('health');
+  el.innerHTML = '';
+  if (!h) { el.innerHTML = '<div class="card"><div class="k">health</div><div class="v mut">n/a</div></div>'; return; }
+  const ts = v => v ? v.replace('T',' ').slice(0,19) : '—';
+  const pretty_bytes = n => n < 1024 ? n+'B' : n < 1.05e6 ? (n/1024).toFixed(1)+'K'
+      : n < 1.05e9 ? (n/1048576).toFixed(1)+'M' : (n/1073741824).toFixed(2)+'G';
+  const cards = [
+    ['backend', h.backend],
+    ['live trading', h.live_trading ? '🔴 LIVE' : 'paper'],
+    ['last tick', ts(h.last_equity_snapshot)],
+    ['last trade close', ts(h.last_trade_close)],
+    ['open positions', (h.broker_open_positions ?? 0)],
+    ['broker cash', h.broker_cash === null ? '—' : '$'+Number(h.broker_cash).toFixed(2)],
+    ['day pnl', h.broker_day_pnl === null ? '—' :
+        `<span class="${h.broker_day_pnl>=0?'pos':'neg'}">${h.broker_day_pnl>=0?'+':''}${Number(h.broker_day_pnl).toFixed(2)}</span>`],
+    ['log size', pretty_bytes(h.log_size_bytes||0)],
+  ];
+  cards.forEach(([k,v]) => {
+    const c = document.createElement('div'); c.className='card';
+    c.innerHTML = `<div class="k">${k}</div><div class="v">${v}</div>`;
+    el.appendChild(c);
+  });
+}
+
+function renderOpenPositions(p) {
+  const tb = document.querySelector('#open-pos tbody');
+  tb.innerHTML = '';
+  if (!p || !p.positions || p.positions.length === 0) {
+    tb.innerHTML = '<tr><td colspan="10" class="mut">no open positions</td></tr>';
+    return;
+  }
+  p.positions.forEach(pos => {
+    const row = document.createElement('tr');
+    row.innerHTML =
+      `<td>${pos.symbol}</td>`+
+      `<td class="${pos.qty>0?'pos':'neg'}">${pos.qty}</td>`+
+      `<td>${fmt(pos.avg_price)}</td>`+
+      `<td class="mut">${pos.is_option?(pos.right||'opt'):'stk'}</td>`+
+      `<td class="mut">${pos.strike??'—'}</td>`+
+      `<td class="mut">${pos.expiry??'—'}</td>`+
+      `<td>${fmt(pos.auto_profit_target)}</td>`+
+      `<td>${fmt(pos.auto_stop_loss)}</td>`+
+      `<td class="mut">${pos.consecutive_holds??0}</td>`+
+      `<td><span class="chip">${pos.entry_tag||'—'}</span></td>`;
+    tb.appendChild(row);
+  });
+}
+
+function renderRegime(r, h) {
+  const el = document.getElementById('regime-now');
+  el.innerHTML = '';
+  if (!r) { el.innerHTML = '<div class="card"><div class="k">regime</div><div class="v mut">n/a</div></div>'; return; }
+  const cards = [
+    ['current regime', r.regime ? `<span class="pill regime">${r.regime}</span>` : '—'],
+    ['as of', r.as_of ? r.as_of.replace('T',' ').slice(0,19) : '—'],
+    ['ensemble', h && h.ensemble_enabled ? '✓' : 'off'],
+    ['lstm',     h && h.lstm_enabled     ? '✓' : 'off'],
+  ];
+  cards.forEach(([k,v]) => {
+    const c = document.createElement('div'); c.className='card';
+    c.innerHTML = `<div class="k">${k}</div><div class="v">${v}</div>`;
+    el.appendChild(c);
+  });
+  if (r.recent_distribution && Object.keys(r.recent_distribution).length) {
+    const mix = Object.entries(r.recent_distribution)
+        .sort((a,b)=>b[1]-a[1])
+        .map(([k,v])=>`<span class="chip">${k}: ${v}</span>`).join(' ');
+    const c = document.createElement('div'); c.className='card';
+    c.style.gridColumn = 'span 4';
+    c.innerHTML = `<div class="k">last 200 decisions mix</div><div class="v" style="font-size:14px;">${mix}</div>`;
+    el.appendChild(c);
+  }
+}
+
+function renderAttribution(a) {
+  const tb = document.querySelector('#attribution tbody');
+  tb.innerHTML = '';
+  if (!a || !a.by_entry_tag || a.by_entry_tag.length === 0) {
+    tb.innerHTML = '<tr><td colspan="5" class="mut">no trades in window</td></tr>';
+    return;
+  }
+  a.by_entry_tag.forEach(r => {
+    const row = document.createElement('tr');
+    row.innerHTML =
+      `<td><span class="chip">${r.entry_tag}</span></td>`+
+      `<td>${r.n}</td>`+
+      `<td class="${r.win_rate>0.5?'pos':(r.win_rate<0.45?'neg':'mut')}">${(r.win_rate*100).toFixed(1)}%</td>`+
+      `<td class="${r.mean_pnl_pct>0?'pos':'neg'}">${(r.mean_pnl_pct*100).toFixed(2)}%</td>`+
+      `<td class="${r.total_pnl>0?'pos':'neg'}">$${Number(r.total_pnl).toFixed(2)}</td>`;
+    tb.appendChild(row);
+  });
+}
+
+function renderMLRecent(ml) {
+  const sum = document.getElementById('ml-summary');
+  const tb = document.querySelector('#ml-recent tbody');
+  sum.innerHTML = '';
+  tb.innerHTML = '';
+  if (!ml) { sum.innerHTML = '<div class="card"><div class="k">lstm</div><div class="v mut">n/a</div></div>'; return; }
+  const acc = ml.overall_accuracy;
+  const accCls = acc > 0.4 ? 'pos' : (acc > 0.37 ? 'mut' : 'neg');
+  const hitCls = ml.directional_hit_rate > 0.42 ? 'pos' : (ml.directional_hit_rate > 0.38 ? 'mut' : 'neg');
+  const wrCls = ml.directional_wrong_side_rate < 0.30 ? 'pos' : (ml.directional_wrong_side_rate < 0.35 ? 'mut' : 'neg');
+  const cards = [
+    ['resolved', ml.n_resolved],
+    ['unresolved', ml.n_unresolved],
+    ['overall accuracy', `<span class="${accCls}">${(acc*100).toFixed(1)}%</span>`],
+    ['directional hit', `<span class="${hitCls}">${(ml.directional_hit_rate*100).toFixed(1)}%</span>`],
+    ['wrong side', `<span class="${wrCls}">${(ml.directional_wrong_side_rate*100).toFixed(1)}%</span>`],
+  ];
+  cards.forEach(([k,v]) => {
+    const c = document.createElement('div'); c.className='card';
+    c.innerHTML = `<div class="k">${k}</div><div class="v">${v}</div>`;
+    sum.appendChild(c);
+  });
+  if (!ml.recent || ml.recent.length === 0) {
+    tb.innerHTML = '<tr><td colspan="7" class="mut">no resolved predictions</td></tr>';
+    return;
+  }
+  ml.recent.forEach(p => {
+    const row = document.createElement('tr');
+    const matchCls = p.pred === p.true ? 'pos' : 'neg';
+    row.innerHTML =
+      `<td class="mut">${(p.ts||'').replace('T',' ').slice(0,19)}</td>`+
+      `<td>${p.symbol}</td>`+
+      `<td>${p.pred}</td>`+
+      `<td>${(p.confidence*100).toFixed(1)}%</td>`+
+      `<td class="${matchCls}">${p.true||'—'}</td>`+
+      `<td class="${p.fwd_return>0?'pos':'neg'}">${p.fwd_return===null?'—':(p.fwd_return*100).toFixed(2)+'%'}</td>`+
+      `<td class="mut">${p.horizon_min}m</td>`;
+    tb.appendChild(row);
+  });
+}
+
+function renderCatalysts(c) {
+  const tb = document.querySelector('#catalysts tbody');
+  tb.innerHTML = '';
+  if (!c || !c.events || c.events.length === 0) {
+    tb.innerHTML = '<tr><td colspan="5" class="mut">no upcoming catalysts (run `tradebotctl.sh catalysts` to refresh)</td></tr>';
+    return;
+  }
+  c.events.slice(0, 40).forEach(e => {
+    const row = document.createElement('tr');
+    row.innerHTML =
+      `<td>${e.symbol}</td>`+
+      `<td>${e.date}</td>`+
+      `<td><span class="pill regime">${e.type}</span></td>`+
+      `<td class="mut">${e.timing}</td>`+
+      `<td class="mut">${e.details||''}</td>`;
+    tb.appendChild(row);
+  });
+}
+
+async function refreshLogs() {
+  const q = document.getElementById('log-grep').value;
+  const url = '/api/logs_tail?lines=200' + (q ? '&grep='+encodeURIComponent(q) : '');
+  const r = await fetch(url).then(r=>r.json()).catch(()=>null);
+  const view = document.getElementById('log-view');
+  if (!r || r.missing) { view.textContent = '(no log file)'; return; }
+  view.textContent = (r.lines || []).join('\n') || '(empty)';
+  view.scrollTop = view.scrollHeight;
+}
+document.getElementById('log-grep').addEventListener('keyup', e => {
+  if (e.key === 'Enter') refreshLogs();
+});
+document.getElementById('log-refresh').addEventListener('click', refreshLogs);
+
 document.getElementById('days').addEventListener('change', refresh);
-refresh(); setInterval(refresh, 60_000);
+refresh(); refreshLogs();
+setInterval(refresh, 60_000);
+setInterval(refreshLogs, 15_000);
 </script>
 </body></html>
 """

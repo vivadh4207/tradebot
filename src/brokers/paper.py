@@ -9,7 +9,7 @@ round-trip is persisted (SQLite by default, CockroachDB when wired).
 from __future__ import annotations
 
 import threading
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 
 from ..core.types import Order, Fill, Position, Side
@@ -21,7 +21,9 @@ class PaperBroker(BrokerAdapter):
                  slippage_bps: float = 2.0,
                  commission_per_option: float = 0.0,
                  commission_per_share: float = 0.0,
-                 journal=None):
+                 journal=None,
+                 snapshot_path: Optional[str] = None,
+                 slippage_model=None):
         self._equity = starting_equity
         self._cash = starting_equity
         self._day_pnl = 0.0
@@ -31,7 +33,11 @@ class PaperBroker(BrokerAdapter):
         self._comm_share = commission_per_share
         self._positions: Dict[str, Position] = {}
         self._journal = journal                    # optional TradeJournal
-        # RLock so the same thread can re-enter (e.g. submit() → _apply() → journal callbacks)
+        self._snapshot_path: Optional[str] = snapshot_path
+        # Optional stochastic cost model. When None, falls back to fixed-bps
+        # slippage (legacy behavior) for backward compatibility.
+        self._slippage_model = slippage_model
+        self._last_market_ctx: Dict[str, Any] = {}   # symbol → latest MarketContext
         self._lock = threading.RLock()
 
     # --- adapter interface ---
@@ -48,8 +54,22 @@ class PaperBroker(BrokerAdapter):
     def submit(self, order: Order) -> Optional[Fill]:
         if order.limit_price is None:
             return None
-        slip = order.limit_price * self._slippage_bps / 10_000.0
-        fill_price = order.limit_price + (slip if order.side == Side.BUY else -slip)
+        if self._slippage_model is not None:
+            ctx = self._last_market_ctx.get(order.symbol)
+            if ctx is None:
+                # synthesize a minimal context from the limit_price
+                from .slippage_model import MarketContext
+                px = float(order.limit_price)
+                ctx = MarketContext(
+                    bid=px * 0.9998, ask=px * 1.0002,
+                    bid_size=1000, ask_size=1000,
+                    vix=15.0, recent_spread_pct=0.0004,
+                )
+            cost = self._slippage_model.fill(order, ctx)
+            fill_price = cost.executed_price
+        else:
+            slip = order.limit_price * self._slippage_bps / 10_000.0
+            fill_price = order.limit_price + (slip if order.side == Side.BUY else -slip)
         fee = (self._comm_option if order.is_option else self._comm_share) * order.qty
         fill = Fill(order=order, price=fill_price, qty=order.qty, fee=fee)
         with self._lock:
@@ -58,6 +78,7 @@ class PaperBroker(BrokerAdapter):
         # loop on slow DB I/O. The fill object is immutable at this point so
         # there's no data race even across threads.
         self._log_fill(fill)
+        self._snapshot_if_configured()
         return fill
 
     def cancel_all(self) -> None:
@@ -173,7 +194,36 @@ class PaperBroker(BrokerAdapter):
                 )
             except Exception:
                 pass
+        self._snapshot_if_configured()
 
     def reset_day(self) -> None:
         with self._lock:
             self._day_pnl = 0.0
+        self._snapshot_if_configured()
+
+    def update_market_context(self, symbol: str, ctx) -> None:
+        """Ingest a `MarketContext` for the symbol so the next fill uses it."""
+        with self._lock:
+            self._last_market_ctx[symbol] = ctx
+
+    # --- snapshot hook ---
+    def _snapshot_if_configured(self) -> None:
+        if not self._snapshot_path:
+            return
+        try:
+            from ..storage.position_snapshot import save_snapshot
+            save_snapshot(self._snapshot_path, self)
+        except Exception:
+            pass   # best-effort — never let snapshot errors kill trading
+
+    def restore_from_snapshot(self, path: str) -> int:
+        """Load a broker state snapshot from disk into this instance.
+
+        Returns the number of positions restored (0 if file missing).
+        Thread-safe.
+        """
+        from ..storage.position_snapshot import load_snapshot, restore_into_paper_broker
+        snap = load_snapshot(path)
+        if snap is None:
+            return 0
+        return restore_into_paper_broker(self, snap)

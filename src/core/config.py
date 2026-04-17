@@ -54,10 +54,10 @@ class Settings:
         return cur
 
 
-def load_settings(path: str | Path = "config/settings.yaml") -> Settings:
+def load_settings(path: str | Path = "config/settings.yaml",
+                   validate: bool = True) -> Settings:
     p = Path(path)
     if not p.exists():
-        # search relative to this package's project root
         here = Path(__file__).resolve()
         for parent in here.parents:
             candidate = parent / "config" / "settings.yaml"
@@ -66,4 +66,18 @@ def load_settings(path: str | Path = "config/settings.yaml") -> Settings:
                 break
     with open(p, "r") as f:
         raw = yaml.safe_load(f)
-    return Settings(raw=raw or {})
+    raw = raw or {}
+    if validate:
+        try:
+            from .config_schema import validate_settings
+            validate_settings(raw)
+        except ValueError:
+            # Manual bounds violations ARE fatal — kill the bot rather than
+            # let invalid config destroy capital.
+            raise
+        except Exception as e:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "settings_schema_validation_failed: %s", e
+            )
+    return Settings(raw=raw)

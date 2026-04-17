@@ -49,3 +49,10 @@ Before merging:
 - Add new strategies as `SignalSource` subclasses in `src/signals/`.
 - Add new brokers as `BrokerAdapter` subclasses with lazy SDK imports.
 - Log filter decisions at `INFO` with the filter name and reason.
+
+## Research vs production
+
+- `research/` — notebooks, scratch, candidate signals not yet reviewed.
+- `src/` — production. Typed, tested, shippable.
+- Production code must NEVER import from `research/`. Graduation
+  checklist: `research/README.md`.

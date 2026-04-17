@@ -21,7 +21,7 @@ class MasterDecision:
 class MasterSignalStack:
     def __init__(self,
                  weights=None,
-                 decision_threshold: float = 0.3):
+                 decision_threshold: float = 0.15):
         self.weights = weights or {
             "vrp": 0.35, "iv_rank": 0.20, "term": 0.15,
             "skew": 0.15, "rv_regime": 0.15,

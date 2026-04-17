@@ -6,6 +6,7 @@ from .calculator import (
 )
 from .har_rv import har_rv_forecast, realized_vol
 from .svi import svi_total_variance, fit_svi_slice
+from .parity import check_parity, violations_in_chain, ParityCheckResult
 
 __all__ = [
     "bs_price", "bs_greeks", "implied_vol",
@@ -14,4 +15,5 @@ __all__ = [
     "breakeven_call", "breakeven_put",
     "har_rv_forecast", "realized_vol",
     "svi_total_variance", "fit_svi_slice",
+    "check_parity", "violations_in_chain", "ParityCheckResult",
 ]

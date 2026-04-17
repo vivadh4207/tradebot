@@ -17,18 +17,30 @@ from .options_chain import OptionsChainProvider, SyntheticOptionsChain
 
 
 class AlpacaOptionsChain(OptionsChainProvider):
+    # US equity options conventionally expire Friday. Ultra-liquid ETFs
+    # (SPY / QQQ / IWM / some mega-caps) also have Monday and Wednesday
+    # weeklies. Anything OUTSIDE {Mon, Wed, Fri} on a normal week is either
+    # bad data or a non-standard quarterly/end-of-month that we don't trade.
+    _STANDARD_WEEKDAYS = {0, 2, 4}   # Mon, Wed, Fri
+
     def __init__(self, api_key: str, api_secret: str,
                  fallback: Optional[OptionsChainProvider] = None,
-                 max_strikes_each_side: int = 10):
+                 max_strikes_each_side: int = 10,
+                 standard_cycles_only: bool = True):
         self._api_key = api_key
         self._api_secret = api_secret
         self._fallback = fallback or SyntheticOptionsChain()
         self._max_strikes = max_strikes_each_side
+        self._standard_cycles_only = bool(standard_cycles_only)
         self._client = None
         try:
             from alpaca.data.historical.option import OptionHistoricalDataClient
             self._client = OptionHistoricalDataClient(api_key, api_secret)
-        except Exception:
+        except Exception as _e:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "alpaca_options_client_init_failed: %s", _e
+            )
             self._client = None
 
     def chain(self, underlying: str, spot: float, *,
@@ -73,6 +85,13 @@ class AlpacaOptionsChain(OptionsChainProvider):
 
         # Filter to the expiry closest to target, then N strikes either side of spot.
         expiries = sorted({c.expiry for c in parsed})
+        if self._standard_cycles_only:
+            # Keep only {Mon, Wed, Fri} expiries. If that filter leaves us
+            # empty (rare — typically means synthetic data or an ill-formed
+            # feed), fall through to the full set.
+            std = [d for d in expiries if d.weekday() in self._STANDARD_WEEKDAYS]
+            if std:
+                expiries = std
         best_expiry = min(expiries, key=lambda d: abs((d - target_expiry).days))
         at_expiry = [c for c in parsed if c.expiry == best_expiry]
         at_expiry.sort(key=lambda c: abs(c.strike - spot))

@@ -51,6 +51,15 @@ def test_dashboard_endpoints_exist(tmp_path, monkeypatch):
     assert body["n_decisions"] == 0
     assert body["by_regime"] == {}
     assert body["recent"] == []
+    # NEW v2 endpoints — all return well-formed shapes even with no data
+    assert client.get("/api/health").status_code == 200
+    assert client.get("/api/positions_open").status_code == 200
+    r = client.get("/api/ml_recent?days=7")
+    assert r.status_code == 200 and "n_resolved" in r.json()
+    assert client.get("/api/regime_now").status_code == 200
+    assert client.get("/api/attribution?days=7").status_code == 200
+    r = client.get("/api/logs_tail?lines=10")
+    assert r.status_code == 200
 
 
 def test_dashboard_ensemble_endpoint_with_data(tmp_path, monkeypatch):

@@ -13,6 +13,7 @@ from .news_classifier_local import LocalLLMNewsClassifier
 from .econ_calendar import EconomicCalendar, ScheduledEvent
 from .regime import Regime, RegimeSnapshot, RegimeClassifier
 from .vix_probe import VixProbe, VixReading
+from .dividend_yield import DividendYieldProvider
 from .catalyst_calendar import (
     CatalystEvent, CatalystProvider, CatalystCalendar,
     StaticCatalystProvider, FinnhubCalendarProvider, YFinanceEarningsProvider,
@@ -32,6 +33,7 @@ __all__ = [
     "EconomicCalendar", "ScheduledEvent",
     "Regime", "RegimeSnapshot", "RegimeClassifier",
     "VixProbe", "VixReading",
+    "DividendYieldProvider",
     "CatalystEvent", "CatalystProvider", "CatalystCalendar",
     "StaticCatalystProvider", "FinnhubCalendarProvider", "YFinanceEarningsProvider",
     "build_default_catalyst_calendar",
