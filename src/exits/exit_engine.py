@@ -30,10 +30,14 @@ class ExitEngineConfig:
     hard_profit_cap_pct: float = 1.50
     max_consecutive_holds: int = 3
     claude_hold_conf_min: float = 0.70
-    # Scalping cap for same-day-expiry contracts. Forces a close after
-    # N minutes regardless of P&L. Set to 0 to disable (old behavior =
-    # hold until PT / SL / 15:45 ET EOD sweep).
+    # Scalping cap for same-day-expiry contracts. The effective window
+    # is DYNAMIC: contracts when the trade moves against you, expands
+    # when it works. Set base to 0 to disable entirely.
     zero_dte_max_hold_minutes: float = 30.0
+    zero_dte_favorable_pnl_threshold: float = 0.10
+    zero_dte_unfavorable_pnl_threshold: float = 0.10
+    zero_dte_favorable_extension_minutes: float = 15.0
+    zero_dte_unfavorable_reduction_minutes: float = 20.0
 
 
 class ExitEngine:
