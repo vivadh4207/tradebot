@@ -144,6 +144,12 @@ class Position:
     auto_profit_target: Optional[float] = None                 # absolute price
     auto_stop_loss: Optional[float] = None                     # absolute price
     consecutive_holds: int = 0
+    # Trailing-stop / scale-out state. `peak_price` = highest mark
+    # seen since entry (for longs). `scaled_out` flips true after the
+    # first 50% close at initial PT — from that tick forward the
+    # remainder rides a trailing stop instead of the static PT.
+    peak_price: Optional[float] = None
+    scaled_out: bool = False
 
     @property
     def is_long(self) -> bool:
@@ -184,3 +190,7 @@ class ExitDecision:
     reason: str
     layer: int
     allow_hold: bool = False
+    # Partial-close support: when not None, close ONLY this many
+    # contracts/shares instead of the full position. Used by the
+    # scale-out logic to close 50% at first PT and trail the rest.
+    close_qty: Optional[int] = None

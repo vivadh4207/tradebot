@@ -41,8 +41,13 @@ def _sandbox_production_state(tmp_path, monkeypatch):
 
     # 2. Strip webhook URLs so build_notifier() returns NullNotifier.
     #    Prevents tests from posting "startup: tradebot started" to the
-    #    user's Discord every time pytest runs.
+    #    user's Discord every time pytest runs. Also clear per-channel
+    #    overrides so MultiChannelNotifier isn't accidentally built.
     monkeypatch.delenv("DISCORD_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("DISCORD_WEBHOOK_URL_TRADES", raising=False)
+    monkeypatch.delenv("DISCORD_WEBHOOK_URL_CATALYSTS", raising=False)
+    monkeypatch.delenv("DISCORD_WEBHOOK_URL_ALERTS", raising=False)
+    monkeypatch.delenv("DISCORD_WEBHOOK_URL_CALIBRATION", raising=False)
     monkeypatch.delenv("SLACK_WEBHOOK_URL", raising=False)
 
     # 3. Disable the Cockroach backend for tests. Any TradeBot constructed

@@ -106,7 +106,7 @@ execution:
   # Pattern/momentum gates — require underlying to have moved in
   # signal direction before entering. Set *_enabled=false to disable.
   vwap_alignment_enabled: true
-  momentum_confirmation_enabled: true
+  momentum_confirmation_enabled: false
   momentum_confirmation_min_move: 0.002   # 0.2% over last 5 bars
 
 # ===== Position sizing =====

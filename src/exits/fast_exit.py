@@ -42,6 +42,15 @@ class FastExitConfig:
     zero_dte_unfavorable_pnl_threshold: float = 0.10    # -10% unrealized → trade is failing
     zero_dte_favorable_extension_minutes: float = 15.0  # add time when winning
     zero_dte_unfavorable_reduction_minutes: float = 20.0  # subtract time when losing
+    # Scale-out + trailing stop — lets winners run.
+    # At first PT hit, close `scale_out_fraction` of the position. The
+    # remainder then rides a trailing stop at peak * (1 - trailing_stop_pct).
+    # This is what momentum-options prop desks do: lock half the gain,
+    # let the rest chase higher highs, exit on first meaningful retrace.
+    scale_out_fraction: float = 0.50
+    trailing_stop_pct: float = 0.10
+    trailing_stop_enabled: bool = True
+    hard_cap_pct: float = 1.50
 
 
 class FastExitEvaluator:
@@ -84,8 +93,60 @@ class FastExitEvaluator:
             pt, sl = self.cfg.pt_short_pct, self.cfg.sl_short_pct
         else:
             pt, sl = self.cfg.pt_multi_pct, self.cfg.sl_multi_pct
-        if pnl >= pt:
-            return ExitDecision(True, f"fast_pt_hit:{pnl:.2%}", layer=0)
+
+        # Update peak price for trailing-stop math. Mutating pos here
+        # is intentional — main.py persists the state via the broker
+        # snapshot, and the next fast_loop tick reads the updated peak.
+        if pos.is_long:
+            if pos.peak_price is None or current_price > pos.peak_price:
+                pos.peak_price = current_price
+
+        # Hard cap: close fully at runaway wins.
+        if pnl >= self.cfg.hard_cap_pct:
+            return ExitDecision(True, f"fast_hard_cap:{pnl:.2%}", layer=0)
+
+        # Stop loss always fires first.
         if pnl <= -sl:
             return ExitDecision(True, f"fast_sl_hit:{pnl:.2%}", layer=0)
+
+        # Scale-out at first PT hit: close half, flag pos.scaled_out,
+        # let the remainder trail the high. Requires at least 2 contracts
+        # to split; with 1 contract we fall back to full close.
+        can_scale = (
+            self.cfg.scale_out_fraction > 0
+            and not pos.scaled_out
+            and abs(pos.qty) >= 2
+        )
+        if pnl >= pt:
+            if can_scale:
+                half = max(1, int(round(abs(pos.qty)
+                                          * self.cfg.scale_out_fraction)))
+                return ExitDecision(
+                    True,
+                    f"fast_scale_out_at_pt:{pnl:.2%}_closing_{half}of{abs(pos.qty)}",
+                    layer=0,
+                    close_qty=half,
+                )
+            # One contract, can't split → legacy full close at PT.
+            return ExitDecision(True, f"fast_pt_hit:{pnl:.2%}", layer=0)
+
+        # Trailing stop for the runner. Only active after scale-out.
+        # Close the remainder once price retraces from the peak beyond
+        # `trailing_stop_pct`. Captures the bulk of a big move, exits on
+        # the first real retrace.
+        if (self.cfg.trailing_stop_enabled
+                and pos.scaled_out
+                and pos.peak_price and pos.peak_price > 0):
+            if pos.is_long:
+                retrace = (pos.peak_price - current_price) / pos.peak_price
+            else:
+                retrace = (current_price - pos.peak_price) / pos.peak_price
+            if retrace >= self.cfg.trailing_stop_pct:
+                peak_pnl = pos.unrealized_pnl_pct(pos.peak_price)
+                return ExitDecision(
+                    True,
+                    f"fast_trailing_stop:peak_pnl={peak_pnl:+.2%}_now="
+                    f"{pnl:+.2%}_retrace={retrace:.2%}",
+                    layer=0,
+                )
         return None
