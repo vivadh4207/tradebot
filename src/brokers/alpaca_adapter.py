@@ -108,12 +108,27 @@ class AlpacaBroker(BrokerAdapter):
         def _call():
             out: List[Position] = []
             for p in self._client.get_all_positions():
+                # Alpaca reports positions with `qty` always positive and
+                # a separate `side` enum (LONG or SHORT). Our downstream
+                # code (reconcile, etc.) relies on sign-of-qty to
+                # determine direction. Coerce shorts to negative.
+                raw_qty = int(float(p.qty))
+                side = getattr(p, "side", None)
+                side_str = str(side).lower() if side is not None else ""
+                if "short" in side_str:
+                    raw_qty = -abs(raw_qty)
+                # Options detection: Alpaca symbols are OCC for options
+                # (contain a date + C/P + strike) — leverage length.
+                sym = str(p.symbol)
+                is_option = len(sym) > 8 and (
+                    "C" in sym[-10:] or "P" in sym[-10:]
+                )
                 out.append(Pos(
-                    symbol=p.symbol,
-                    qty=int(float(p.qty)),
+                    symbol=sym,
+                    qty=raw_qty,
                     avg_price=float(p.avg_entry_price),
-                    is_option=False,  # alpaca options are a separate feed
-                    multiplier=1,
+                    is_option=is_option,
+                    multiplier=100 if is_option else 1,
                 ))
             return out
         return _with_retry(_call, op="positions")
@@ -153,6 +168,22 @@ class AlpacaBroker(BrokerAdapter):
 
     def cancel_all(self) -> None:
         _with_retry(lambda: self._client.cancel_orders(), op="cancel_all")
+
+    def close_all_paper_positions(self) -> dict:
+        """Nuclear reset: close every open position on the Alpaca paper
+        account using Alpaca's `close_all_positions()` endpoint. Used
+        when zombie / bug-contaminated positions need to be cleaned
+        before starting fresh. Returns a summary dict."""
+        def _call():
+            return self._client.close_all_positions(cancel_orders=True)
+        try:
+            result = _with_retry(_call, op="close_all_paper_positions")
+            return {
+                "closed": len(result) if result else 0,
+                "ok": True,
+            }
+        except Exception as e:                               # noqa: BLE001
+            return {"closed": 0, "ok": False, "error": str(e)}
 
     def flatten_all(self, mark_prices=None) -> None:
         # `mark_prices` accepted for adapter-interface compatibility but

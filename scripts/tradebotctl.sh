@@ -285,6 +285,7 @@ case "${1:-}" in
   dashboard-uninstall) cmd_dashboard_uninstall ;;
   dashboard-status)    cmd_dashboard_status ;;
   wipe-journal)       shift; "$PY" "$ROOT/scripts/wipe_journal.py" "$@" ;;
+  reset-paper)        shift; "$PY" "$ROOT/scripts/reset_paper.py" "$@" ;;
   *)
     cat <<EOF
 usage: $(basename "$0") {start|stop|restart|status|logs|backtest|priors|walkforward|dashboard|testdb|
