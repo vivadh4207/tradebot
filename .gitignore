@@ -33,3 +33,10 @@ KILL
 
 # editor auto-saves
 *.save
+
+# macOS / Finder duplicates of sensitive files (this leaked once already)
+.env [0-9]*
+.env *
+*.env [0-9]*
+* .env.example
+* .env.local
