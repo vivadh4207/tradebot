@@ -103,6 +103,65 @@ class MirrorAlpacaBroker(PaperBroker):
         if self._mirror_thread is not None:
             self._mirror_thread.join(timeout=2.0)
 
+    def reconcile_with_alpaca(self) -> dict:
+        """Find Alpaca paper positions that don't exist in our local book
+        and send close orders for them. Runs at startup so zombie orders
+        (left behind when earlier close-mirrors were rejected due to
+        the IOC-tif bug etc.) get cleaned up automatically instead of
+        requiring manual clicks in the Alpaca UI.
+
+        Returns a summary dict: {reconciled: N, errors: M, local_only: X,
+        alpaca_only_symbols: [...]}.
+        """
+        from ..core.types import Order, Side
+        result = {"reconciled": 0, "errors": 0,
+                   "local_only": 0, "alpaca_only_symbols": []}
+        if self._alpaca is None:
+            return result
+        try:
+            alpaca_positions = self._alpaca.positions()
+        except Exception as e:                          # noqa: BLE001
+            _log.warning("alpaca_reconcile_fetch_failed err=%s", e)
+            return result
+        with self._lock:
+            local_symbols = set(self._positions.keys())
+        for ap in alpaca_positions:
+            sym = ap.symbol
+            if sym in local_symbols:
+                continue            # both books have it; no action
+            result["alpaca_only_symbols"].append(sym)
+            qty = abs(int(ap.qty))
+            if qty <= 0:
+                continue
+            # Alpaca holds a position we don't. Close it at market.
+            # side is opposite of what the position represents:
+            # if Alpaca shows long (qty>0), we need to SELL to close.
+            side = Side.SELL if ap.qty > 0 else Side.BUY
+            close = Order(
+                symbol=sym, side=side, qty=qty,
+                is_option=bool(ap.is_option),
+                # Use a conservative limit that'll almost certainly
+                # fill — 0.01 for a close (sell at any non-zero bid)
+                # works because Alpaca paper will cross the spread.
+                limit_price=0.01,
+                tif="DAY",      # options don't support IOC
+                tag="reconcile_zombie_close",
+            )
+            try:
+                self._alpaca.submit(close)
+                result["reconciled"] += 1
+                _log.info(
+                    "alpaca_reconcile_zombie_closed symbol=%s qty=%d side=%s",
+                    sym, qty, side.value,
+                )
+            except Exception as e:                      # noqa: BLE001
+                result["errors"] += 1
+                _log.warning(
+                    "alpaca_reconcile_close_failed symbol=%s err=%s",
+                    sym, e,
+                )
+        return result
+
     # --- internal ---
     def _mirror_worker(self) -> None:
         while not self._mirror_stop.is_set():

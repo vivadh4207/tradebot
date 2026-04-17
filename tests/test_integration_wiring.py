@@ -46,11 +46,16 @@ def test_tradebot_has_drawdown_guard_wired(monkeypatch):
 
 def test_drawdown_guard_scales_down_on_tick(monkeypatch):
     """Simulate an equity drop and confirm _check_halt_conditions updates
-    the size multiplier."""
+    the size multiplier. Explicitly enables the drawdown guard (which
+    defaults to OFF per operator preference)."""
     monkeypatch.chdir(Path(__file__).resolve().parents[1])
     from src.main import TradeBot
     from src.core.config import load_settings
     s = load_settings()
+    # Enable the drawdown guard for this test — the default is now off
+    # so that the bot keeps trading through DD events and uses per-trade
+    # stops to limit risk.
+    s.raw.setdefault("account", {})["drawdown_guard_enabled"] = True
     bot = TradeBot(s)
     # Seed a peak then drop equity by 9%
     bot._peak_equity = 10_000.0

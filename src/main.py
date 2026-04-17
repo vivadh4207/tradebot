@@ -306,6 +306,31 @@ class TradeBot:
         except Exception as e:                           # noqa: BLE001
             log.warning("broker_snapshot_restore_failed", err=str(e))
 
+        # Alpaca reconciliation: zombie cleanup. If the mirror broker
+        # is active and Alpaca paper holds positions we don't know
+        # about (usually from earlier sessions where close-orders
+        # bounced due to the IOC-tif bug), auto-close them so Alpaca's
+        # book matches ours. Fail-soft — reconcile errors never block
+        # startup.
+        try:
+            from .brokers.mirror_alpaca import MirrorAlpacaBroker
+            if isinstance(self.broker, MirrorAlpacaBroker):
+                summary = self.broker.reconcile_with_alpaca()
+                if summary.get("reconciled", 0) > 0 or summary.get("errors", 0) > 0:
+                    log.info("alpaca_reconcile", **summary)
+                    self.notifier.notify(
+                        f"Closed {summary['reconciled']} zombie position(s) "
+                        f"on Alpaca paper (errors: {summary['errors']})",
+                        title="reconcile", level="warn",
+                        meta={
+                            "reconciled": summary["reconciled"],
+                            "errors": summary["errors"],
+                            "symbols": ", ".join(summary["alpaca_only_symbols"][:10]),
+                        },
+                    )
+        except Exception as e:                           # noqa: BLE001
+            log.warning("alpaca_reconcile_failed_nonfatal", err=str(e))
+
         # Per-symbol dividend yield cache (only dividend-payers get non-zero).
         self.dividend_yield = DividendYieldProvider(
             cache_path=settings.get("pricing.dividend_cache",
@@ -515,13 +540,24 @@ class TradeBot:
             n = self.catalyst_calendar.hydrate_econ_calendar(self.econ_calendar)
             log.info("catalysts_refreshed", events=len(events), blackouts=n)
             if events:
-                summary = ", ".join(
-                    f"{e.symbol}:{e.event_type}:{e.when}" for e in events[:8]
-                )
+                # Group by symbol so the list stays scannable. With
+                # structured notifier `meta` we get one field per event
+                # — Discord embeds display up to 25 inline fields.
+                # Previous version truncated to 8 in a one-line text
+                # dump which made "23 catalysts" produce an unreadable
+                # string.
+                meta = {}
+                for e in events[:24]:     # Discord embed field cap
+                    key = f"{e.symbol} {e.event_type}"
+                    meta[key] = str(e.when)
+                if len(events) > 24:
+                    meta["_footer"] = f"{len(events) - 24} more not shown"
                 self.notifier.notify(
-                    f"{len(events)} upcoming catalysts — {summary}"
-                    + ("..." if len(events) > 8 else ""),
+                    f"{len(events)} upcoming catalysts in the next "
+                    f"{int(self.s.get('catalysts.lookahead_days', 14))} days",
                     title="catalysts",
+                    level="info",
+                    meta=meta,
                 )
         except Exception as e:   # noqa: BLE001
             log.warning("catalyst_refresh_failed", err=str(e))
@@ -560,12 +596,52 @@ class TradeBot:
                     d = self.fast.evaluate(pos, price)
                     if d and d.should_close:
                         side = Side.SELL if pos.qty > 0 else Side.BUY
-                        o = Order(symbol=pos.symbol, side=side, qty=abs(pos.qty),
+                        qty_abs = abs(pos.qty)
+                        entry_px = pos.avg_price
+                        o = Order(symbol=pos.symbol, side=side, qty=qty_abs,
                                   is_option=pos.is_option, limit_price=price,
                                   tag=f"fast:{d.reason}")
-                        self.broker.submit(o)
+                        fill = self.broker.submit(o)
+                        # Realized P&L + percentage for the notification.
+                        # For a long position closed at `price`:
+                        #   P&L = (price - avg_price) * qty * multiplier
+                        mult = pos.multiplier or (100 if pos.is_option else 1)
+                        realized_usd = ((float(fill.price) if fill else float(price))
+                                          - entry_px) * qty_abs * mult * (
+                            1 if pos.qty > 0 else -1
+                        )
+                        pnl_pct = (((float(fill.price) if fill else float(price))
+                                      - entry_px) / max(entry_px, 1e-9)) * (
+                            100 if pos.qty > 0 else -100
+                        )
                         log.info("fast_exit", symbol=pos.symbol,
-                                  reason=d.reason, price=price)
+                                  reason=d.reason, price=price,
+                                  realized_usd=round(realized_usd, 2),
+                                  pnl_pct=round(pnl_pct, 2))
+                        # Discord: green if profit, red if loss.
+                        underlying = pos.underlying or pos.symbol
+                        right_str = (pos.right.value.upper() if pos.right
+                                       else ("CALL" if pos.is_option else ""))
+                        self.notifier.notify(
+                            f"CLOSE {qty_abs} × {right_str} {underlying} "
+                            f"@ ${(fill.price if fill else price):.2f} "
+                            f"→ {pnl_pct:+.1f}% (${realized_usd:+,.2f})",
+                            title="exit",
+                            level="success" if realized_usd > 0 else (
+                                "error" if realized_usd < 0 else "info"
+                            ),
+                            meta={
+                                "symbol": underlying,
+                                "side": f"{right_str} (closed)",
+                                "qty": qty_abs,
+                                "entry_px": round(entry_px, 4),
+                                "exit_px": round(float(fill.price) if fill else float(price), 4),
+                                "pnl_pct": f"{pnl_pct:+.2f}%",
+                                "pnl_usd": f"${realized_usd:+,.2f}",
+                                "reason": d.reason,
+                                "_footer": f"OCC {pos.symbol}",
+                            },
+                        )
             except Exception as e:  # noqa: BLE001
                 log.warning("fast_loop_error", err=str(e))
             self._stop.wait(interval)
@@ -645,8 +721,14 @@ class TradeBot:
                 },
             )
             return
-        # Tiered drawdown guard: reduces size multiplier or HALTS if DD
-        # exceeds thresholds. Multiplier applied in _try_enter when sizing.
+        # Tiered drawdown guard (toggleable). When disabled via
+        # account.drawdown_guard_enabled=false, portfolio-wide DD halt
+        # and scale-down do NOT fire — per-trade stop losses
+        # (exits.stop_loss_*_pct) are the only risk bound. Operator
+        # preference: keep bot trading, let tight stops do the work.
+        if not bool(self.s.raw.get("account", {}).get(
+                "drawdown_guard_enabled", True)):
+            return
         state = self.drawdown_guard.evaluate(acct.equity, self._peak_equity)
         prev_mult = self._dd_size_multiplier
         self._dd_size_multiplier = state.size_multiplier

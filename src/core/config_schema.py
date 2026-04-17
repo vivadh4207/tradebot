@@ -34,7 +34,10 @@ if _HAS_PYDANTIC:
     class AccountSettings(BaseModel):
         paper_starting_equity: float = Field(gt=0)
         max_risk_per_trade_pct: float = Field(ge=0.0, le=0.10)
-        max_daily_loss_pct: float = Field(ge=0.0, le=0.20)
+        # Upper bound raised to 1.0 to support operator-disabled halts.
+        # At 0.5+ the circuit breaker effectively never fires; per-trade
+        # stops do the risk-bounding instead.
+        max_daily_loss_pct: float = Field(ge=0.0, le=1.0)
         max_open_positions: int = Field(ge=1, le=100)
 
     class SessionSettings(BaseModel):
@@ -126,7 +129,7 @@ def _manual_check(raw: Dict[str, Any]) -> None:
 
     bound("sizing.kelly_fraction_cap", 0.01, 1.0)
     bound("sizing.kelly_hard_cap_pct", 0.01, 0.25)
-    bound("account.max_daily_loss_pct", 0.0, 0.20)
+    bound("account.max_daily_loss_pct", 0.0, 1.0)
     bound("account.max_open_positions", 1, 100)
     bound("vix.halt_above", 10, 100)
     bound("exits.profit_target_short_dte_pct", 0.01, 5.0)

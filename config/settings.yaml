@@ -2,74 +2,51 @@
 account:
   paper_starting_equity: 10000.0  # USD, for paper sim
   max_risk_per_trade_pct: 0.01    # Kelly-lite cap
-  max_daily_loss_pct: 0.02        # halt entries if breached
+  # Daily-loss circuit breaker. Set high (0.50 = 50%) to effectively
+  # disable — losses are controlled per-trade via tight stops instead.
+  # Operator requested: "don't halt anything, close individual losers fast".
+  max_daily_loss_pct: 0.50
+  # Drawdown guard toggle. When false, portfolio-wide DD scale-down and
+  # halt tiers are disabled. Per-trade stops still fire.
+  drawdown_guard_enabled: false
   max_open_positions: 10
 
 # ===== Universe (top 10 liquid US names) =====
 universe:
+  # Top-tier liquidity only. These are the 20 most-options-traded
+  # tickers in the US — tight spreads, deep OI on every strike,
+  # reliable Alpaca chain data. The previous 60-name universe included
+  # low-options-volume names (LUV, AAL, DIS, HOOD, WFC, etc.) whose
+  # bid-ask spreads ate 5-10%/trade before any strategy signal could
+  # play out. That's not a signal-quality problem — it's a
+  # universe-selection problem. Fixed.
+  #
+  # Broad-market ETFs (the four most-options-traded instruments):
   - SPY
   - QQQ
   - IWM
+  - DIA
+  # Mega-cap tech — always in the top-10 options volume leaderboard:
   - AAPL
-  - MSFT
   - NVDA
   - TSLA
   - META
   - AMZN
+  - MSFT
   - GOOGL
-  - AAOI
   - AMD
-  - APLD
-  - INTC
-  - AVGO
-  - ASML
-  - LRCX
-  - MU
-  - TSM
-  - BABA
-  - BIDU
-  - PDD
-  - JD
-  - SHOP
-  - CRM
-  - ORCL
-  - IBM
-  - CSCO
-  - NFLX
-  - DIS
-  - BAC
+  # Liquid financials + payments:
   - JPM
-  - WFC
-  - C
-  - GS
-  - MS  
-  - VZ
-  - T
+  - BAC
   - V
   - MA
-  - PYPL
-  - ADBE
-  - CRM
-  - NOW 
-  - ZM
-  - DOCU
-  - TWLO
-  - UBER
-  - LYFT  
-  - ABNB
-  - BKNG
-  - EXPE
-  - MAR
-  - RCL
-  - CCL
-  - NCLH
-  - DAL
-  - LUV
-  - AAL
-  - UAL
-  - AXP
+  # Liquid sector ETFs (wide spreads on minor sector ETFs removed):
+  - XLF
   - XLE
-  - HOOD
+  - XLK
+  # Chip + high-vol names with deep options books:
+  - AVGO
+  - MU
 
 
 # ===== Session (US Eastern) =====
@@ -137,11 +114,17 @@ sizing:
     closing: 0.30
 
 # ===== Exit engine =====
+# Operator-requested: keep per-trade losses minimal + close fast.
+# Stops were 0.20 / 0.30; tightened to 0.10 / 0.15. At 10% SL, a $1.00
+# option closes at $0.90 (loss = $0.10/share × 100 × qty). Across 10
+# simultaneous positions (max_open_positions), worst-case session loss
+# is ~$1,000 = 10% of account. That's the implicit portfolio floor now
+# that the halt is disabled.
 exits:
   profit_target_short_dte_pct: 0.35  # 0DTE/1DTE
   profit_target_multi_dte_pct: 0.50  # 2+ DTE
-  stop_loss_short_dte_pct: 0.20
-  stop_loss_multi_dte_pct: 0.30
+  stop_loss_short_dte_pct: 0.10      # was 0.20 — tightened per operator
+  stop_loss_multi_dte_pct: 0.15      # was 0.30 — tightened per operator
   fast_thread_interval_sec: 5
   main_loop_interval_sec: 180
   hard_profit_cap_pct: 1.50
