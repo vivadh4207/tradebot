@@ -42,9 +42,10 @@ class MarketDataAdapter(abc.ABC):
 # closes; updated when the universe changes. Missing symbols fall through to
 # a hash-derived default so we don't concentrate everything at $500.
 _SYMBOL_START_PRICE: Dict[str, float] = {
-    # Index + broad-market ETFs
-    "SPY": 560.0, "QQQ": 490.0, "IWM": 225.0, "DIA": 445.0,
-    "VOO": 510.0, "VTI": 280.0, "IVV": 560.0,
+    # Index + broad-market ETFs (2026 levels — updated per operator
+    # feedback that SPY synthetic was ~$140 below real market)
+    "SPY": 720.0, "QQQ": 640.0, "IWM": 290.0, "DIA": 575.0,
+    "VOO": 680.0, "VTI": 360.0, "IVV": 720.0,
     # Sector SPDRs
     "XLF": 48.0, "XLE": 95.0, "XLK": 230.0, "XLV": 150.0,
     "XLY": 205.0, "XLC": 95.0, "XLI": 140.0, "XLB": 95.0,
@@ -187,8 +188,24 @@ class AlpacaDataAdapter(MarketDataAdapter):
             tf = TimeFrame(timeframe_minutes, TimeFrameUnit.Minute)
             end = end or datetime.now(tz=ET)
             start = end - timedelta(minutes=timeframe_minutes * (limit + 10))
-            req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=tf,
-                                   start=start, end=end, limit=limit)
+            # Free / paper Alpaca accounts get IEX data, not SIP.
+            # Without `feed="iex"` the default is SIP which gets rejected
+            # with "subscription does not permit querying recent SIP data".
+            # That fallback was silently dropping us to synthetic bars
+            # (with stale 2024 prices → SPY thought to be $560 when
+            # actual was ~$700 → bought deep-ITM puts by mistake).
+            # Override via ALPACA_DATA_FEED env if you have a SIP sub.
+            import os as _os
+            feed = _os.getenv("ALPACA_DATA_FEED", "iex").strip().lower()
+            kw = dict(symbol_or_symbols=symbol, timeframe=tf,
+                       start=start, end=end, limit=limit)
+            try:
+                from alpaca.data.enums import DataFeed as _DataFeed
+                kw["feed"] = _DataFeed(feed)
+            except Exception:
+                # Older alpaca-py: just pass the string
+                kw["feed"] = feed
+            req = StockBarsRequest(**kw)
             resp = self._client.get_stock_bars(req)
             bars_raw = resp.data.get(symbol, []) if hasattr(resp, "data") else []
             if not bars_raw:
