@@ -102,7 +102,7 @@ fi
 # ---- env vars (presence only, never value) ----
 hdr ".env keys present"
 if [[ -f "$ROOT/.env" ]]; then
-  for key in ALPACA_API_KEY_ID ALPACA_API_SECRET_KEY ALPACA_BASE_URL COCKROACH_DSN; do
+  for key in ALPACA_API_KEY_ID ALPACA_API_SECRET_KEY ALPACA_BASE_URL; do
     if grep -qE "^${key}=.+" "$ROOT/.env" 2>/dev/null; then
       emit "$key"     "$PASS" ""
     else

@@ -1,11 +1,11 @@
 from .journal import (
-    TradeJournal, SqliteJournal, CockroachJournal,
+    TradeJournal, SqliteJournal,
     ClosedTrade, MLPrediction, EnsembleRecord,
-    build_journal, resolve_cockroach_dsn,
+    build_journal,
 )
 
 __all__ = [
-    "TradeJournal", "SqliteJournal", "CockroachJournal",
+    "TradeJournal", "SqliteJournal",
     "ClosedTrade", "MLPrediction", "EnsembleRecord",
-    "build_journal", "resolve_cockroach_dsn",
+    "build_journal",
 ]

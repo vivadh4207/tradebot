@@ -2,8 +2,7 @@
 
 WHAT IT CLEARS (destructive, no undo):
   - Journal tables (fills, trades, equity_curve, ml_predictions,
-    ensemble_decisions) in whichever backend `settings.yaml` points at
-    (sqlite or cockroach).
+    ensemble_decisions) in the local SQLite database.
   - logs/slippage_calibration.jsonl
   - logs/calibration_history.jsonl
   - logs/backtest_runs.jsonl
@@ -16,7 +15,6 @@ WHAT IT DOES NOT TOUCH:
   - Your source code, settings, .env
   - logs/tradebot.out (so the process log stays appendable)
   - logs/tradebot.err
-  - CockroachDB schema (tables stay; only rows are truncated)
   - LSTM checkpoints, cache dirs
 
 REQUIRES TYPED CONFIRMATION so a fat-finger can't wipe by accident.
@@ -42,7 +40,7 @@ except Exception:
     pass
 
 from src.core.config import load_settings
-from src.storage.journal import build_journal, CockroachJournal, SqliteJournal
+from src.storage.journal import build_journal, SqliteJournal
 
 
 JOURNAL_TABLES = [
@@ -67,38 +65,15 @@ LOG_FILES_DELETE = [
 ]
 
 
-def _confirm() -> bool:
+def _confirm(scope_desc: str) -> bool:
     print("This will WIPE all paper trades, calibration history, and run logs.")
-    print(f"Target: backend='{backend}', scope='{scope_desc}'")
+    print(f"Target: {scope_desc}")
     print("Type the word DESTROY (case-sensitive) to continue, anything else aborts:")
     try:
         ans = input("> ").strip()
     except EOFError:
         return False
     return ans == "DESTROY"
-
-
-def _wipe_cockroach(j: CockroachJournal) -> None:
-    schema = getattr(j, "_schema", "tradebot")
-    with j._conn.cursor() as cur:
-        cur.execute(f"SET search_path = {schema}, public")
-        for t in JOURNAL_TABLES:
-            try:
-                cur.execute(f"TRUNCATE {schema}.{t}")
-                print(f"  cockroach: truncated {schema}.{t}")
-            except Exception as e:
-                # Table may not exist yet — not fatal.
-                print(f"  cockroach: skip {schema}.{t} ({e})")
-        # One-time cleanup: drop orphaned tradebot tables from `public`
-        # that used to live there before the schema isolation. Only
-        # drops tables whose names match ours, and only from public.
-        # Runs silently if already gone.
-        for t in JOURNAL_TABLES:
-            try:
-                cur.execute(f"DROP TABLE IF EXISTS public.{t}")
-            except Exception:
-                pass
-        print(f"  cockroach: dropped any orphan tradebot tables from public.*")
 
 
 def _wipe_sqlite(j: SqliteJournal) -> None:
@@ -133,30 +108,20 @@ def _delete_log(rel: str) -> None:
 
 if __name__ == "__main__":
     s = load_settings(ROOT / "config" / "settings.yaml")
-    backend = s.get("storage.backend", "sqlite").lower()
-    if backend == "sqlite":
-        scope_desc = f"sqlite → {s.get('storage.sqlite_path', 'logs/tradebot.sqlite')}"
-    else:
-        scope_desc = f"{backend} via env ${s.get('storage.cockroach_dsn_env', 'COCKROACH_DSN')}"
+    sqlite_path = s.get("storage.sqlite_path", "logs/tradebot.sqlite")
+    scope_desc = f"sqlite → {sqlite_path}"
 
-    if not _confirm():
+    if not _confirm(scope_desc):
         print("aborted — nothing changed.")
         sys.exit(1)
 
-    print(f"\n[1/3] wiping journal ({backend})...")
+    print(f"\n[1/3] wiping journal (sqlite)...")
     try:
-        j = build_journal(
-            backend=backend,
-            sqlite_path=s.get("storage.sqlite_path", str(ROOT / "logs" / "tradebot.sqlite")),
-            dsn_env_var=s.get("storage.cockroach_dsn_env", "COCKROACH_DSN"),
-            cockroach_schema=s.get("storage.cockroach_schema", "tradebot"),
-        )
+        j = build_journal(sqlite_path=sqlite_path)
     except Exception as e:
-        print(f"  ERROR: could not connect to journal: {e}")
+        print(f"  ERROR: could not open journal: {e}")
         sys.exit(2)
-    if isinstance(j, CockroachJournal):
-        _wipe_cockroach(j)
-    elif isinstance(j, SqliteJournal):
+    if isinstance(j, SqliteJournal):
         _wipe_sqlite(j)
     j.close()
 
@@ -169,4 +134,4 @@ if __name__ == "__main__":
         _delete_log(rel)
 
     print("\ndone. fresh-start paper session is ready.")
-    print("next: scripts/tradebotctl.sh watchdog-status  (watchdog should already be running)")
+    print("next: scripts/tradebotctl.sh watchdog-status")

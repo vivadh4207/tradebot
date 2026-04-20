@@ -143,21 +143,15 @@ def _build_news_sentiment(settings: Settings) -> Optional[CachedNewsSentiment]:
 
 
 def _build_journal_from_settings(settings: Settings) -> Optional[TradeJournal]:
-    # Test harness / ops override: TRADEBOT_STORAGE_BACKEND forces
-    # sqlite mode for tests so pytest runs never INSERT into the
-    # production Cockroach tables.
-    backend = (os.getenv("TRADEBOT_STORAGE_BACKEND", "").strip()
-               or settings.get("storage.backend", "sqlite"))
+    """Build the local SQLite journal. Path redirectable via
+    TRADEBOT_SANDBOX_LOGS (used by tests)."""
     sqlite_path = settings.get("storage.sqlite_path", "logs/tradebot.sqlite")
     _sandbox = os.getenv("TRADEBOT_SANDBOX_LOGS", "").strip()
-    if _sandbox and backend == "sqlite":
+    if _sandbox:
         sqlite_path = os.path.join(_sandbox, "tradebot.sqlite")
-    dsn_env = settings.get("storage.cockroach_dsn_env", "COCKROACH_DSN")
-    schema = settings.get("storage.cockroach_schema", "tradebot")
     try:
-        j = build_journal(backend=backend, sqlite_path=sqlite_path,
-                           dsn_env_var=dsn_env, cockroach_schema=schema)
-        log.info("journal", backend=backend, schema=schema if backend != "sqlite" else None)
+        j = build_journal(sqlite_path=sqlite_path)
+        log.info("journal", backend="sqlite", path=sqlite_path)
         return j
     except Exception as e:
         log.warning("journal_init_failed_fallback_to_none", err=str(e))
@@ -1761,13 +1755,10 @@ class TradeBot:
         #     env var didn't load).
         # (2) telemetry: each start is a restart event worth seeing.
         try:
-            backend = self.s.get("storage.backend", "sqlite")
-            schema = self.s.get("storage.cockroach_schema", "tradebot") if backend != "sqlite" else ""
             mode = "LIVE" if self.s.live_trading else "paper"
             if bool(self.s.get("notifier.startup_notify", False)):
                 self.notifier.notify(
-                    f"tradebot started — {mode}, broker={self.s.get('broker.name','paper')}"
-                    + (f", schema={schema}" if schema else ""),
+                    f"tradebot started — {mode}, broker={self.s.get('broker.name','paper')}",
                     level="info", title="startup",
                 )
         except Exception:

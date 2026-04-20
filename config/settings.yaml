@@ -273,25 +273,9 @@ regime:
   classifier: rule        # 'rule' (stable, fast) | 'hmm' (smoother, slower)
 
 # ===== Storage (trade journal) =====
-# Backend switch. Default is SQLite (local file, zero cloud cost,
-# unlimited writes). Cockroach is still supported for operators who
-# want a shared journal across hosts — but watch out for the free-tier
-# request-unit cap: our write frequency (ensemble decisions + LSTM
-# predictions + equity ticks + fills) adds up fast, and a $0/month
-# Cockroach Serverless cluster usually hits its monthly limit inside
-# ~2 weeks of live trading. SQLite has none of that.
-#
-# To migrate an existing Cockroach journal to SQLite before switching,
-# run:
-#   python scripts/migrate_cockroach_to_sqlite.py
-# which dumps every table and re-inserts into logs/tradebot.sqlite.
+# Local SQLite file. Zero setup, zero cost, no cloud request quotas.
 storage:
-  backend: sqlite                 # sqlite | cockroach
   sqlite_path: logs/tradebot.sqlite
-  cockroach_dsn_env: COCKROACH_DSN   # only used when backend=cockroach
-  # All tradebot tables live in this schema when Cockroach is used,
-  # isolated from any unrelated tables sharing the same database.
-  cockroach_schema: tradebot
 
 # ===== ML / LSTM signal =====
 ml:

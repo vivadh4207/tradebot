@@ -1,8 +1,8 @@
 """FastAPI read-only dashboard: equity curve, trades, open positions.
 
-Reads the configured journal (SQLite or CockroachDB). No authentication —
-bind to localhost and reach it through an SSH tunnel or a reverse-proxy
-with auth. Do NOT expose to the public internet.
+Reads the local SQLite journal. No authentication — bind to localhost
+and reach it through an SSH tunnel or a reverse-proxy with auth. Do
+NOT expose to the public internet.
 """
 from __future__ import annotations
 
@@ -29,10 +29,8 @@ def _load_journal():
     root = Path(__file__).resolve().parents[2]
     s = load_settings(root / "config" / "settings.yaml")
     return build_journal(
-        backend=s.get("storage.backend", "sqlite"),
-        sqlite_path=s.get("storage.sqlite_path", str(root / "logs" / "tradebot.sqlite")),
-        dsn_env_var=s.get("storage.cockroach_dsn_env", "COCKROACH_DSN"),
-        cockroach_schema=s.get("storage.cockroach_schema", "tradebot"),
+        sqlite_path=s.get("storage.sqlite_path",
+                           str(root / "logs" / "tradebot.sqlite")),
     )
 
 

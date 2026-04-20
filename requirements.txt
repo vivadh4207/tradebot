@@ -22,8 +22,7 @@ requests>=2.31
 # Utilities
 structlog>=24.1
 
-# Storage (CockroachDB / Postgres-wire)
-psycopg[binary]>=3.2
+# Storage: stdlib sqlite3 only — no external deps required.
 
 # Dashboard
 fastapi>=0.110

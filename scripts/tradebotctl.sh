@@ -482,7 +482,6 @@ case "${1:-}" in
   calibrate)        shift; "$PY" "$ROOT/scripts/calibrate_slippage.py" "$@" ;;
   daily-report)     shift; "$PY" "$ROOT/scripts/daily_report.py" "$@" ;;
   dashboard)    shift; exec "$PY" "$ROOT/scripts/run_dashboard.py" "$@" ;;
-  testdb)       shift; "$PY" "$ROOT/scripts/test_db_connection.py" "$@" ;;
   watchdog-install)   cmd_watchdog_install ;;
   watchdog-uninstall) cmd_watchdog_uninstall ;;
   watchdog-status)    cmd_watchdog_status ;;
@@ -494,7 +493,6 @@ case "${1:-}" in
   doctor)             exec /usr/bin/env bash "$ROOT/scripts/doctor.sh" ;;
   walkforward)        shift; "$PY" "$ROOT/scripts/nightly_walkforward_report.py" "$@" ;;
   putcall-oi)         shift; "$PY" "$ROOT/scripts/fetch_putcall_oi.py" "$@" ;;
-  migrate-to-sqlite)  shift; "$PY" "$ROOT/scripts/migrate_cockroach_to_sqlite.py" "$@" ;;
   *)
     cat <<EOF
 usage: $(basename "$0") {start|stop|restart|status|logs|backtest|priors|walkforward|dashboard|testdb|

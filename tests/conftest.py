@@ -1,26 +1,21 @@
-"""Test harness — isolates every test from the production journal, the
-real broker_state.json, and the live Cockroach connection.
+"""Test harness — isolates every test from the production journal,
+the real broker_state.json, and outbound network.
 
 WHY: tests that construct `TradeBot(s)` end up loading the real
-`config/settings.yaml` and reading env vars (COCKROACH_DSN, ALPACA keys,
-DISCORD webhook) from the real .env. Without the defensive
-overrides below, a test run would:
+`config/settings.yaml` and reading env vars (ALPACA keys, DISCORD
+webhook) from the real .env. Without the defensive overrides below,
+a test run would:
   - Write test positions to the live `logs/broker_state.json`
-  - INSERT test fills into the live Cockroach `tradebot.fills` table
+  - INSERT test fills into the live SQLite journal
   - Ping Discord with `startup: tradebot started` on every run
   - Call out to Alpaca (network) during unit tests
 
 The `_sandbox_production_state` autouse fixture forces every test to:
-  1. Set TRADEBOT_NO_NETWORK=1 (skips dividend_yield yfinance pulls,
-     news fetches, etc.)
+  1. Set TRADEBOT_NO_NETWORK=1 (skips yfinance pulls, news fetches, etc.)
   2. Clear the webhook env vars so build_notifier returns NullNotifier
-  3. Point `logs/broker_state.json`, `logs/heartbeat.txt`, and the
-     calibration JSONLs at per-test tmp paths
-  4. Force `storage.backend=sqlite` in loaded settings (no Cockroach)
-
-Tests that NEED the real settings can opt out with
-`@pytest.mark.uses_real_config` — currently unused, here for future
-integration tests.
+  3. Point broker_state.json, heartbeat.txt, and calibration JSONLs
+     at per-test tmp paths
+  4. Point the SQLite journal at a per-test tmp file
 """
 import os
 import sys
@@ -50,13 +45,7 @@ def _sandbox_production_state(tmp_path, monkeypatch):
     monkeypatch.delenv("DISCORD_WEBHOOK_URL_CALIBRATION", raising=False)
     monkeypatch.delenv("SLACK_WEBHOOK_URL", raising=False)
 
-    # 3. Disable the Cockroach backend for tests. Any TradeBot constructed
-    #    during the test will fall back to sqlite (in tmp_path).
-    monkeypatch.delenv("COCKROACH_DSN", raising=False)
-    monkeypatch.delenv("COCKROACH_HOST", raising=False)
-    monkeypatch.setenv("TRADEBOT_STORAGE_BACKEND", "sqlite")
-
-    # 4. Per-test sandbox dir for all on-disk state. Tests can read
+    # 3. Per-test sandbox dir for all on-disk state. Tests can read
     #    `tradebot_sandbox_logs` if they want to inspect what the bot
     #    wrote. Uses a uniquely-named subdir so tests that ALSO create
     #    `tmp_path/logs` themselves don't collide.
@@ -64,7 +53,7 @@ def _sandbox_production_state(tmp_path, monkeypatch):
     sandbox_logs.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("TRADEBOT_SANDBOX_LOGS", str(sandbox_logs))
 
-    # 5. Redirect calibration JSONLs to sandbox so our slippage tests
+    # 4. Redirect calibration JSONLs to sandbox so our slippage tests
     #    never write into the live calibration history.
     monkeypatch.setenv("TRADEBOT_SLIPPAGE_LOG",
                         str(sandbox_logs / "slippage_calibration.jsonl"))
