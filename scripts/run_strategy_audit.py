@@ -54,8 +54,17 @@ def main() -> int:
         print(f"[!] could not open journal: {e}")
         j = None
 
+    # Political news provider — pulls X/RSS/Alpaca if configured.
+    # Dormant when political_news.enabled=false; safe either way.
     try:
-        report = auditor.audit(s, journal=j)
+        from src.intelligence.political_news import build_political_news_provider
+        pol = build_political_news_provider(s)
+    except Exception as e:
+        print(f"[warn] political news provider failed to init: {e}")
+        pol = None
+
+    try:
+        report = auditor.audit(s, journal=j, political_news=pol)
     finally:
         if j is not None:
             try:

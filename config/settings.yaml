@@ -418,5 +418,38 @@ strategy_auditor:
   log_path: logs/strategy_audit.jsonl
   trade_lookback_days: 14
 
+# ===== Political news feed (inputs to the 70B auditor) =====
+# Aggregates headlines from Alpaca News (filtered by political keyword
+# density) + optional X/Twitter via Nitter RSS + optional arbitrary
+# RSS feeds (Truth Social archives, Fed/WH press, etc). All sources
+# are fail-graceful — one being down doesn't disable the others.
+# Feeds into StrategyAuditor so the 70B sees political risk alongside
+# config and trade history.
+political_news:
+  enabled: false                      # flip true after setting sources below
+  alpaca_enabled: true                # reuse existing Alpaca News auth
+  x_enabled: false                    # flip true + curate x_handles
+  rss_enabled: false                  # flip true + add rss_feeds
+  nitter_instance: https://nitter.privacydev.net
+  x_handles:
+    - WhiteHouse
+    - FederalReserve
+    - POTUS
+    - USTradeRep
+    - SecYellen
+    - SpeakerJohnson
+    - SenSchumer
+    - realDonaldTrump
+  rss_feeds:
+    # Example: put any RSS URL here. Truth Social archives, Fed
+    # speeches, White House press briefings, etc. Left empty by
+    # default — operator curates.
+    # - https://www.federalreserve.gov/feeds/speeches.xml
+    # - https://www.whitehouse.gov/feed/
+  lookback_hours: 24
+  max_headlines: 40
+  cache_seconds: 900                  # 15 min
+  http_timeout_sec: 8.0
+
 # ===== Live trading master switch =====
 live_trading: false       # Must be true AND broker != paper to route real orders

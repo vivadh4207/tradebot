@@ -104,27 +104,61 @@ else
 fi
 
 # ------------------------------------------------------------------ step 6
-step 6 9 "Download Llama 8B + 70B (skippable with SKIP_LLM_DL=1)"
+step 6 9 "Check / download Llama 8B + 70B GGUFs"
+# Rule: NEVER download a model that's already on disk > 1 MB.
+# SKIP_LLM_DL=1 forces skip even if files are absent (useful if you're
+# manually copying models in parallel).
+_has_model() {
+  # $1 = filesystem path
+  [ -f "$1" ] && [ "$(stat -c%s "$1" 2>/dev/null || echo 0)" -gt 1000000 ]
+}
+
+# Accept common alternate filenames (e.g. Q4_K_M, Instruct-Q4_K_M)
+# and symlink to the canonical names the bot expects. Saves the user
+# from having to rename a model they already downloaded.
+_find_and_link() {
+  # $1 = dir, $2 = glob pattern (match anything *8b*q4*.gguf), $3 = canonical target name
+  local dir="$1" pattern="$2" canonical="$3"
+  if _has_model "$dir/$canonical"; then
+    return 0
+  fi
+  # shellcheck disable=SC2086
+  for candidate in $dir/$pattern; do
+    [ -e "$candidate" ] || continue
+    if _has_model "$candidate"; then
+      echo "  found existing model: $(basename "$candidate") — linking as $canonical"
+      ln -sf "$(basename "$candidate")" "$dir/$canonical"
+      return 0
+    fi
+  done
+  return 1
+}
+
+MODEL_DIR="$SD_MNT/models"
+mkdir -p "$MODEL_DIR"
+
+# Auto-discover existing models with fuzzy names before deciding to download.
+_find_and_link "$MODEL_DIR" "*[8B]*[qQ]4*.gguf" "llama-3.1-8b-q4.gguf"   || true
+_find_and_link "$MODEL_DIR" "*[8B]*[qQ]5*.gguf" "llama-3.1-8b-q4.gguf"   || true   # Q5 works too
+_find_and_link "$MODEL_DIR" "*[7]0[bB]*[qQ]4*.gguf" "llama-3.1-70b-q4.gguf" || true
+
 if [ "${SKIP_LLM_DL:-0}" = "1" ]; then
   echo "  SKIP_LLM_DL=1 — skipping downloads."
 else
-  _dl() {
-    # _dl <url> <dest>
-    local url="$1" dest="$2"
-    if [ -f "$dest" ] && [ "$(stat -c%s "$dest" 2>/dev/null || echo 0)" -gt 1000000 ]; then
-      echo "  already have $(basename "$dest") ($(du -h "$dest" | cut -f1))"
-      return 0
-    fi
-    mkdir -p "$(dirname "$dest")"
-    echo "  downloading $(basename "$dest") ..."
-    # --continue so interrupted downloads can resume
-    wget --continue -O "$dest" "$url" || {
-      echo "  [!] wget failed; you can re-run bootstrap or download manually."
-      return 1
-    }
-  }
-  _dl "$LLM_8B_URL"  "$SD_MNT/models/llama-3.1-8b-q4.gguf"  || true
-  _dl "$LLM_70B_URL" "$SD_MNT/models/llama-3.1-70b-q4.gguf" || true
+  if _has_model "$MODEL_DIR/llama-3.1-8b-q4.gguf"; then
+    echo "  [ok] 8B model present: $(ls -lh "$MODEL_DIR/llama-3.1-8b-q4.gguf" | awk '{print $5}')"
+  else
+    echo "  downloading 8B GGUF ($(basename "$LLM_8B_URL"))..."
+    wget --continue -O "$MODEL_DIR/llama-3.1-8b-q4.gguf" "$LLM_8B_URL" || \
+      echo "  [!] 8B download failed — bot still runs with LLM brain disabled."
+  fi
+  if _has_model "$MODEL_DIR/llama-3.1-70b-q4.gguf"; then
+    echo "  [ok] 70B model present: $(ls -lh "$MODEL_DIR/llama-3.1-70b-q4.gguf" | awk '{print $5}')"
+  else
+    echo "  downloading 70B GGUF ($(basename "$LLM_70B_URL"))..."
+    wget --continue -O "$MODEL_DIR/llama-3.1-70b-q4.gguf" "$LLM_70B_URL" || \
+      echo "  [!] 70B download failed — strategy auditor will be unavailable."
+  fi
 fi
 
 # ------------------------------------------------------------------ step 7

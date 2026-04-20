@@ -94,10 +94,16 @@ class StrategyAuditorConfig:
 
 
 def _build_snapshot(settings, journal=None, extra_context: Optional[Dict] = None,
-                     cfg: Optional[StrategyAuditorConfig] = None) -> Dict[str, Any]:
+                     cfg: Optional[StrategyAuditorConfig] = None,
+                     political_news=None) -> Dict[str, Any]:
     """Compact structured snapshot for the auditor. NO raw bars, NO
     per-trade rows — just aggregates. Keeps the LLM's context usage low
-    and the signal-to-noise high."""
+    and the signal-to-noise high.
+
+    Args:
+      political_news: optional PoliticalNewsProvider whose
+        snapshot_for_auditor() output is included under "political_news".
+    """
     cfg = cfg or StrategyAuditorConfig()
     snap: Dict[str, Any] = {}
 
@@ -136,6 +142,16 @@ def _build_snapshot(settings, journal=None, extra_context: Optional[Dict] = None
 
     if extra_context:
         snap["current_market"] = extra_context
+
+    # Political news — structured headlines the 70B sees alongside the
+    # config/journal. Lets the auditor flag issues like "FOMC in 2 days
+    # but credit_spreads.enabled=true" or "tariff announcement —
+    # universe concentrated in SPY/QQQ is extra vulnerable".
+    if political_news is not None:
+        try:
+            snap["political_news"] = political_news.snapshot_for_auditor()
+        except Exception as e:
+            snap["political_news_error"] = str(e)
 
     return snap
 
@@ -205,11 +221,19 @@ class StrategyAuditor:
         self.cfg = cfg or StrategyAuditorConfig()
 
     def audit(self, settings, journal=None,
-               extra_context: Optional[Dict] = None) -> Optional[AuditReport]:
+               extra_context: Optional[Dict] = None,
+               political_news=None) -> Optional[AuditReport]:
         """Run one audit. Returns None if the model can't be loaded
-        (e.g. GGUF file not on disk) or if output is unparseable."""
+        (e.g. GGUF file not on disk) or if output is unparseable.
+
+        Args:
+          political_news: optional PoliticalNewsProvider whose recent
+            headlines are embedded in the prompt.
+        """
         snapshot = _build_snapshot(settings, journal=journal,
-                                     extra_context=extra_context, cfg=self.cfg)
+                                     extra_context=extra_context,
+                                     cfg=self.cfg,
+                                     political_news=political_news)
 
         if not self.cfg.model_path or not os.path.exists(self.cfg.model_path):
             _log.warning("strategy_auditor_model_missing path=%s", self.cfg.model_path)
