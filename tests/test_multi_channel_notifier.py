@@ -19,7 +19,8 @@ class _CapturingNotifier(Notifier):
         self.calls.append((title, text, level, meta))
 
 
-def _build(includes=("default", "trades", "catalysts", "alerts", "calibration")):
+def _build(includes=("default", "trades", "catalysts", "alerts",
+                     "calibration", "reason")):
     """Return a MultiChannelNotifier with only the named channels present."""
     channels = {name: _CapturingNotifier(name) for name in includes}
     return MultiChannelNotifier(channels), channels
@@ -70,6 +71,36 @@ def test_reconcile_goes_to_alerts_channel():
     mc, chans = _build()
     mc.notify("Closed 3 zombies on Alpaca", title="reconcile")
     assert len(chans["alerts"].calls) == 1
+
+
+def test_backtest_report_goes_to_reason_channel():
+    """Nightly walkforward posts title=backtest_report — must land in
+    the `reason-to-trade` channel, not alerts or default."""
+    mc, chans = _build()
+    mc.notify("EDGE CONFIRMED — 75% tradable", title="backtest_report")
+    assert len(chans["reason"].calls) == 1
+    assert not chans["alerts"].calls
+    assert not chans["default"].calls
+
+
+def test_edge_report_goes_to_reason_channel():
+    mc, chans = _build()
+    mc.notify("IC for momentum = 0.04", title="edge_report")
+    assert len(chans["reason"].calls) == 1
+
+
+def test_regime_shift_goes_to_reason_channel():
+    mc, chans = _build()
+    mc.notify("regime: range_lowvol → trend_highvol", title="regime_shift")
+    assert len(chans["reason"].calls) == 1
+
+
+def test_backtest_report_falls_back_to_default_when_reason_unset():
+    """If DISCORD_WEBHOOK_URL_REASON isn't configured, report must still
+    land in the default channel rather than vanishing."""
+    mc, chans = _build(includes=("default",))
+    mc.notify("EDGE CONFIRMED", title="backtest_report")
+    assert len(chans["default"].calls) == 1
 
 
 def test_unknown_title_falls_back_to_default():

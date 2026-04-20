@@ -70,11 +70,14 @@ def build_notifier() -> Notifier:
 
     # Check for any per-channel overrides. Each optional; missing →
     # falls back to default (or to Null if no default either).
+    # `reason` = "why is the bot trading (or not)" — holds nightly
+    # walkforward verdicts, ensemble rationale, drawdown edge reports.
     per_channel = {
         "trades":      _clean(os.getenv("DISCORD_WEBHOOK_URL_TRADES", "")),
         "catalysts":   _clean(os.getenv("DISCORD_WEBHOOK_URL_CATALYSTS", "")),
         "alerts":      _clean(os.getenv("DISCORD_WEBHOOK_URL_ALERTS", "")),
         "calibration": _clean(os.getenv("DISCORD_WEBHOOK_URL_CALIBRATION", "")),
+        "reason":      _clean(os.getenv("DISCORD_WEBHOOK_URL_REASON", "")),
     }
     any_per_channel = any(per_channel.values())
 
@@ -106,6 +109,11 @@ _TITLE_TO_CHANNEL = {
     "alerts":      {"halt", "shutdown", "startup", "watchdog",
                      "news block", "reconcile", "error", "risk"},
     "calibration": {"calibration"},
+    # "reason-to-trade" channel — high-signal, low-frequency posts that
+    # explain *why* the bot would (or would not) be trading. Nightly
+    # walk-forward edge report, regime-shift notices, ensemble
+    # attribution summaries. Should never be spammy.
+    "reason":      {"backtest_report", "edge_report", "regime_shift"},
 }
 
 

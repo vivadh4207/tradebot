@@ -10,15 +10,13 @@ strategy_mode: directional
 
 # Wheel-specific config (used only when strategy_mode=wheel)
 wheel:
-  # Tiered universe — expensive names first (for big accounts), cheap
-  # names as fallback (affordable at $10-20k equity). Wheel runner
-  # walks this list in order and picks the first affordable name.
-  #   SPY ($720), QQQ ($640) → need $60-70k collateral per CSP
-  #   DIA ($575)              → ~$55k
-  #   AMD ($170), AAPL ($230) → ~$18-23k (mid-tier)
-  #   BAC ($45), HOOD ($50)   → ~$4-5k  (works on $10k account)
-  #   INTC ($22), F ($12), T ($22) → ~$1-3k (small-account friendly)
-  universe: [SPY, QQQ, DIA, AMD, AAPL, BAC, HOOD, INTC, T]
+  # Operator decision 2026-04-17: universe locked to SPY + QQQ only
+  # across ALL strategy modes. Expand only after 100+ round-trips prove
+  # measurable edge on these two. SPY/QQQ have 10× the options
+  # liquidity of anything else and the cleanest data. Each CSP requires
+  # ~$60-70k collateral — wheel is only viable on a funded paper/live
+  # account matched to that scale.
+  universe: [SPY, QQQ]
   target_dte: 35                 # aim for 30-45 DTE puts
   target_delta: 0.30             # 30-delta = ~3% OTM
   profit_target_pct: 0.50        # close when we've captured 50% of premium
@@ -44,42 +42,16 @@ account:
   drawdown_guard_enabled: false
   max_open_positions: 10
 
-# ===== Universe (top 10 liquid US names) =====
+# ===== Universe — locked to SPY + QQQ =====
 universe:
-  # Top-tier liquidity only. These are the 20 most-options-traded
-  # tickers in the US — tight spreads, deep OI on every strike,
-  # reliable Alpaca chain data. The previous 60-name universe included
-  # low-options-volume names (LUV, AAL, DIS, HOOD, WFC, etc.) whose
-  # bid-ask spreads ate 5-10%/trade before any strategy signal could
-  # play out. That's not a signal-quality problem — it's a
-  # universe-selection problem. Fixed.
-  #
-  # Broad-market ETFs (the four most-options-traded instruments):
+  # Operator decision 2026-04-17 (confirmed): universe is SPY + QQQ
+  # ONLY. No dynamic expansion, no auto-discovery, no alt-symbols.
+  # SPY + QQQ have 10× the options liquidity of anything else and the
+  # cleanest data. Adding symbols adds parameters without adding
+  # information and fractures statistics across a fixed sample budget.
+  # Expand back only after 100+ round-trips prove measurable edge.
   - SPY
   - QQQ
-  - IWM
-  - DIA
-  # Mega-cap tech — always in the top-10 options volume leaderboard:
-  - AAPL
-  - NVDA
-  - TSLA
-  - META
-  - AMZN
-  - MSFT
-  - GOOGL
-  - AMD
-  # Liquid financials + payments:
-  - JPM
-  - BAC
-  - V
-  - MA
-  # Liquid sector ETFs (wide spreads on minor sector ETFs removed):
-  - XLF
-  - XLE
-  - XLK
-  # Chip + high-vol names with deep options books:
-  - AVGO
-  - MU
 
 
 # ===== Session (US Eastern) =====
@@ -91,7 +63,18 @@ session:
 
 # ===== VIX gates =====
 vix:
-  halt_above: 40.0
+  halt_above: 40.0                    # hard crash halt (panic-mode)
+  # Quant-advisor recommendation: stand down in VIX > 25 regimes.
+  # In high-vol regimes directional alpha compresses (everything
+  # correlates), bid-ask widens, theta compresses IV — long-option
+  # strategies underperform markedly. Trade only in calm regimes.
+  regime_halt_vix: 25.0
+  # Backwardation halt — fires when VIX > VIX3M (spot > 3-month future),
+  # a proven crisis precursor. Requires VIX3M feed (we don't have one
+  # wired yet); set backwardation_halt_enabled: true + populate
+  # vix3m_override manually to test.
+  backwardation_halt_enabled: false
+  vix3m_override: 0                   # manual override for testing
   no_short_premium_above: 30.0
   no_0dte_long_below: 12.0
   # Live VIX probe — reads ^VIX from Alpaca or yfinance.
@@ -130,8 +113,11 @@ execution:
   # DTE strategy. Fixed (target_dte) OR diversified (target_dte_pool).
   # If target_dte_pool is a non-empty list, each entry randomly picks
   # a DTE from it — lets us compare which DTE bucket wins over time.
-  target_dte: 7
-  target_dte_pool: [0, 1, 7, 14, 30]
+  # Quant-advisor recommendation: drop 0DTE/1DTE. Theta at 30-40%/day
+  # makes them a losing lottery. 14-45 DTE gives directional thesis
+  # time to play out (2-5%/day theta) without capital tied up forever.
+  target_dte: 14
+  target_dte_pool: [7, 14, 30]
   # Entry spread aggressiveness. 0.00 = pay bid (won't fill), 1.00 =
   # pay ask, 0.30 = bid + 30% of spread (aggressive buyer, saves ~70%
   # of spread vs crossing ask).
@@ -287,13 +273,24 @@ regime:
   classifier: rule        # 'rule' (stable, fast) | 'hmm' (smoother, slower)
 
 # ===== Storage (trade journal) =====
+# Backend switch. Default is SQLite (local file, zero cloud cost,
+# unlimited writes). Cockroach is still supported for operators who
+# want a shared journal across hosts — but watch out for the free-tier
+# request-unit cap: our write frequency (ensemble decisions + LSTM
+# predictions + equity ticks + fills) adds up fast, and a $0/month
+# Cockroach Serverless cluster usually hits its monthly limit inside
+# ~2 weeks of live trading. SQLite has none of that.
+#
+# To migrate an existing Cockroach journal to SQLite before switching,
+# run:
+#   python scripts/migrate_cockroach_to_sqlite.py
+# which dumps every table and re-inserts into logs/tradebot.sqlite.
 storage:
-  backend: cockroach              # sqlite | cockroach
-  cockroach_dsn_env: COCKROACH_DSN   # name of env var holding the connection string
-  # All tradebot tables live in this schema, isolated from any unrelated
-  # tables sharing the same database. A CREATE SCHEMA IF NOT EXISTS runs
-  # on every connect; search_path is pinned to `<schema>, public` so
-  # writes land here and shared extensions (pgcrypto etc.) still resolve.
+  backend: sqlite                 # sqlite | cockroach
+  sqlite_path: logs/tradebot.sqlite
+  cockroach_dsn_env: COCKROACH_DSN   # only used when backend=cockroach
+  # All tradebot tables live in this schema when Cockroach is used,
+  # isolated from any unrelated tables sharing the same database.
   cockroach_schema: tradebot
 
 # ===== ML / LSTM signal =====
@@ -322,6 +319,75 @@ ensemble:
     range_highvol: {momentum: 0.50, orb: 0.90, vwap_reversion: 1.10, vrp: 1.40, wheel: 1.30, lstm: 0.70, claude_ai: 0.80}
     opening: {momentum: 0.80, orb: 1.50, vwap_reversion: 0.80, vrp: 0.60, wheel: 0.60, lstm: 0.80, claude_ai: 0.90}
     closing: {momentum: 0.30, orb: 0.30, vwap_reversion: 0.30, vrp: 0.20, wheel: 0.20, lstm: 0.30, claude_ai: 0.30}
+
+# ===== Extra signal sources + ORB retest + breadth =====
+# All off by default — operator flips each to true when ready to test.
+# See the per-module docstrings for the reasoning behind each knob.
+signals:
+  orb:
+    retest_required: false       # wait for breakout + pullback + reclaim
+    retest_band_pct: 0.0015       # 0.15% band around OR boundary for retest
+  extreme_momentum:
+    enabled: false                # shock-pattern detector, complementary to momentum
+    lookback_bars: 5
+    baseline_bars: 20
+    min_move_pct: 0.03             # 3% move in lookback window
+    min_volume_multiple: 3.0       # 3× baseline volume
+    confidence: 0.85
+
+breadth:
+  enabled: false                   # composite risk-on/off probe
+  cache_seconds: 60
+  risk_off_threshold: -0.3         # credit-spread runners stand down below this
+
+# ===== Credit-spread strategies =====
+# Additive to the directional / wheel paths. Each runner has its own
+# time-of-day gates, its own position budget, and its own exit engine.
+# Strategies recommended by the advanced quant review as the highest-
+# Sharpe additions for a $100K retail account on SPY/QQQ.
+credit_spreads:
+  enabled: false                 # set to true to activate — off by default
+                                 # so first live deploy is opt-in
+  weekly_enabled: true           # 30-45 DTE put credit spreads, 0.20 delta
+  zero_dte_enabled: false        # 0DTE support + RSI spreads (enable after
+                                 # weekly has 30+ days of paper track record)
+  universe: [SPY, QQQ]
+  weekly:
+    dte_min: 30
+    dte_max: 45
+    short_delta: 0.20
+    long_delta: 0.08
+    max_wing_width: 10.0         # dollars — reject if chain too thin
+    min_credit_pct_of_wing: 0.15 # $0.75 credit on a $5 wing = 15%
+    max_open_positions: 2        # 1 per symbol
+    profit_target_pct: 0.50      # close at 50% of max profit
+    dte_close_threshold: 21      # force-close at 21 DTE (gamma wall)
+  zero_dte:
+    short_delta: 0.12
+    wing_width: 5.0
+    max_open_positions: 3
+    rsi_oversold: 35.0
+    support_band_pct: 0.005      # spot within 0.5% of recent low
+    support_lookback_bars: 20
+    profit_target_pct: 0.50
+    stop_loss_pct: 1.50          # stop when unrealized = -1.5× credit
+  exits:
+    # Shared by both runners. zero_dte honors force_close_et at 15:45.
+    profit_target_pct: 0.50
+    stop_loss_pct: 1.50
+    dte_close_threshold: 21
+
+# ===== Macro put/call OI risk switch =====
+# Daily script (scripts/fetch_putcall_oi.py) pulls CBOE EOD ETF put/call
+# OI. When ratio exceeds threshold AND 5d avg is rising, writes a
+# risk-off state that multiplies position sizing by `size_multiplier`
+# for `duration_days`. Shrinks exposure during broad hedging regimes.
+# The position sizer reads logs/putcall_state.json on every entry.
+putcall_oi:
+  risk_off_ratio_threshold: 2.0
+  lookback_days: 5
+  risk_off_duration_days: 3
+  risk_off_size_multiplier: 0.70
 
 # ===== Live trading master switch =====
 live_trading: false       # Must be true AND broker != paper to route real orders

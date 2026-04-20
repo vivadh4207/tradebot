@@ -62,6 +62,152 @@ def test_dashboard_endpoints_exist(tmp_path, monkeypatch):
     assert r.status_code == 200
 
 
+def test_bot_status_endpoint_returns_state(tmp_path, monkeypatch):
+    """Sanity: /api/bot/status returns a well-formed shape. tradebotctl
+    may or may not be reachable in test env — we just assert the shape."""
+    try:
+        from fastapi.testclient import TestClient
+    except ImportError:
+        pytest.skip("fastapi not installed")
+    from src.dashboard import app as dash
+
+    def fake_run_ctl(action, timeout=25.0):
+        return {"ok": True, "rc": 0, "stdout": "stopped", "stderr": "", "action": action}
+
+    monkeypatch.setattr(dash, "_run_ctl", fake_run_ctl)
+    monkeypatch.setattr(dash, "_dashboard_controls_enabled", lambda: False)
+
+    client = TestClient(dash.app)
+    r = client.get("/api/bot/status")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["state"] == "stopped"
+    assert body["controls_enabled"] is False
+
+
+def test_bot_controls_disabled_by_default(monkeypatch):
+    """Dashboard is unauthenticated; start/stop/restart MUST return 403
+    unless TRADEBOT_DASHBOARD_CONTROLS=1 is set."""
+    try:
+        from fastapi.testclient import TestClient
+    except ImportError:
+        pytest.skip("fastapi not installed")
+    from src.dashboard import app as dash
+
+    monkeypatch.setattr(dash, "_dashboard_controls_enabled", lambda: False)
+
+    client = TestClient(dash.app)
+    for action in ("start", "stop", "restart"):
+        r = client.post(f"/api/bot/{action}")
+        assert r.status_code == 403, f"{action} must require opt-in"
+        assert r.json()["ok"] is False
+
+
+def test_bot_controls_enabled_invokes_ctl(monkeypatch):
+    """With the env flag set, start/stop/restart shell out to tradebotctl
+    and return its stdout."""
+    try:
+        from fastapi.testclient import TestClient
+    except ImportError:
+        pytest.skip("fastapi not installed")
+    from src.dashboard import app as dash
+
+    calls = []
+
+    def fake_run_ctl(action, timeout=25.0):
+        calls.append(action)
+        return {"ok": True, "rc": 0, "stdout": f"{action} ok", "stderr": "", "action": action}
+
+    monkeypatch.setattr(dash, "_run_ctl", fake_run_ctl)
+    monkeypatch.setattr(dash, "_dashboard_controls_enabled", lambda: True)
+
+    client = TestClient(dash.app)
+    for action in ("start", "stop", "restart"):
+        r = client.post(f"/api/bot/{action}")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] is True
+        assert action in body["stdout"]
+    assert calls == ["start", "stop", "restart"]
+
+
+def test_run_ctl_rejects_unsafe_actions():
+    """The whitelist guards against an attacker crafting a path like
+    'start;rm -rf /' even if they bypass routing."""
+    from src.dashboard.app import _run_ctl
+    r = _run_ctl("delete")
+    assert r["ok"] is False and "not allowed" in r["error"]
+    r = _run_ctl("start; rm -rf /")
+    assert r["ok"] is False
+
+
+def test_run_ctl_whitelist_includes_flow_actions():
+    """The expanded whitelist must include the dashboard flow actions
+    (reset-paper, walkforward, putcall-oi). Non-existent ones still
+    rejected."""
+    from src.dashboard.app import _run_ctl
+    for allowed in ("walkforward", "putcall-oi", "reset-paper"):
+        # These resolve — whether they succeed depends on the env, but
+        # they must NOT be rejected as "not allowed".
+        r = _run_ctl(allowed, timeout=1.0)
+        # Either it worked (ok=True), or failed for real reasons (timeout,
+        # script crash). The one thing it MUST NOT do is return the
+        # whitelist-rejection message.
+        assert "not allowed" not in (r.get("error") or "")
+
+
+def test_flow_endpoints_gated_by_controls_env(monkeypatch):
+    """reset_paper, walkforward, refresh_risk_switch — all require the
+    same TRADEBOT_DASHBOARD_CONTROLS gate as start/stop."""
+    try:
+        from fastapi.testclient import TestClient
+    except ImportError:
+        pytest.skip("fastapi not installed")
+    from src.dashboard import app as dash
+
+    monkeypatch.setattr(dash, "_dashboard_controls_enabled", lambda: False)
+
+    client = TestClient(dash.app)
+    for path in ("reset_paper", "walkforward", "refresh_risk_switch"):
+        r = client.post(f"/api/bot/{path}")
+        assert r.status_code == 403, f"{path} must require opt-in"
+        assert r.json()["ok"] is False
+
+
+def test_flow_endpoints_call_ctl_when_enabled(monkeypatch):
+    """With the env flag set, flow endpoints shell out with the correct
+    action strings (reset-paper gets --yes so it skips interactive
+    confirm)."""
+    try:
+        from fastapi.testclient import TestClient
+    except ImportError:
+        pytest.skip("fastapi not installed")
+    from src.dashboard import app as dash
+
+    calls = []
+
+    def fake_run_ctl(action, timeout=25.0, extra_args=None):
+        calls.append((action, list(extra_args) if extra_args else []))
+        return {"ok": True, "rc": 0, "stdout": f"{action} ok",
+                "stderr": "", "action": action}
+
+    monkeypatch.setattr(dash, "_run_ctl", fake_run_ctl)
+    monkeypatch.setattr(dash, "_dashboard_controls_enabled", lambda: True)
+
+    client = TestClient(dash.app)
+    for path, expected_action in (("reset_paper",          "reset-paper"),
+                                    ("walkforward",          "walkforward"),
+                                    ("refresh_risk_switch",  "putcall-oi")):
+        r = client.post(f"/api/bot/{path}")
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
+    # Verify the actions that were routed, + reset-paper got --yes
+    actions = {c[0] for c in calls}
+    assert {"reset-paper", "walkforward", "putcall-oi"}.issubset(actions)
+    reset_call = next(c for c in calls if c[0] == "reset-paper")
+    assert "--yes" in reset_call[1]
+
+
 def test_dashboard_ensemble_endpoint_with_data(tmp_path, monkeypatch):
     try:
         from fastapi.testclient import TestClient

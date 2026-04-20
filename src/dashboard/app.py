@@ -9,14 +9,16 @@ from __future__ import annotations
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import json
 import os
 from collections import Counter, defaultdict
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+import subprocess
+import shlex
 
 from ..core.config import load_settings
 from ..storage.journal import build_journal
@@ -396,6 +398,14 @@ def catalysts_upcoming():
     return out
 
 
+@app.get("/api/signal_audit", response_class=JSONResponse)
+def signal_audit_tail(limit: int = Query(100, ge=1, le=2000)):
+    """Tail of the per-signal audit log. Requires TRADEBOT_SIGNAL_AUDIT=1
+    at bot + dashboard startup; otherwise returns empty."""
+    from src.core.signal_audit import read_tail
+    return {"entries": read_tail(limit)}
+
+
 @app.get("/api/logs_tail", response_class=JSONResponse)
 def logs_tail(lines: int = Query(200, ge=10, le=5000),
                grep: str = Query("", max_length=256)):
@@ -591,6 +601,201 @@ def watchdog(limit: int = Query(25, ge=1, le=500)):
     }
 
 
+def _ctl_path() -> Path:
+    """Path to tradebotctl.sh. Resolved from repo root, not CWD."""
+    return Path(__file__).resolve().parents[2] / "scripts" / "tradebotctl.sh"
+
+
+def _dashboard_controls_enabled() -> bool:
+    """Dashboard start/stop buttons disabled unless explicitly opted in.
+
+    Safety: the dashboard has no auth. Exposing process control on an
+    open port would let anyone on the network stop the bot. Default is
+    OFF; set TRADEBOT_DASHBOARD_CONTROLS=1 in .env to enable.
+    """
+    return os.getenv("TRADEBOT_DASHBOARD_CONTROLS", "").strip() in ("1", "true", "yes", "on")
+
+
+def _run_ctl(action: str, timeout: float = 25.0,
+              extra_args: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Shell out to tradebotctl.sh and return {ok, stdout, stderr, rc}.
+
+    Supervisor-aware: tradebotctl internally detects whether the watchdog
+    is running under launchd (Mac) or systemd --user (Linux) and routes
+    start/stop accordingly instead of spawning a second bot alongside
+    the supervised one.
+
+    Whitelist prevents an attacker who bypasses routing from invoking
+    arbitrary shell commands via the action string.
+    """
+    allowed = {
+        "start", "stop", "restart", "status",
+        "wipe-journal", "reset-paper",
+        "walkforward", "putcall-oi", "doctor",
+    }
+    if action not in allowed:
+        return {"ok": False, "error": f"action not allowed: {action}"}
+    ctl = _ctl_path()
+    if not ctl.exists():
+        return {"ok": False, "error": f"tradebotctl.sh not found at {ctl}"}
+    cmd = ["/bin/bash", str(ctl), action]
+    if extra_args:
+        # Extra args are appended as-is but each one is passed via list,
+        # so shell-metacharacter injection is impossible.
+        cmd.extend(str(a) for a in extra_args)
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(ctl.parent.parent),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return {
+            "ok": proc.returncode == 0,
+            "rc": proc.returncode,
+            "stdout": proc.stdout.strip(),
+            "stderr": proc.stderr.strip(),
+            "action": action,
+        }
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": f"{action} timed out after {timeout}s"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/bot/status", response_class=JSONResponse)
+def bot_status():
+    """Is the paper bot process currently running? Uses tradebotctl status
+    which checks the PID file (portable on Mac + Linux)."""
+    result = _run_ctl("status", timeout=5.0)
+    # Parse "running (pid 12345)" vs "stopped"
+    out = (result.get("stdout") or "").lower()
+    state = "running" if "running" in out else "stopped"
+    return {
+        "state": state,
+        "raw": result.get("stdout"),
+        "controls_enabled": _dashboard_controls_enabled(),
+    }
+
+
+@app.post("/api/bot/start", response_class=JSONResponse)
+def bot_start():
+    """Start the paper bot. Requires TRADEBOT_DASHBOARD_CONTROLS=1."""
+    if not _dashboard_controls_enabled():
+        return JSONResponse(
+            status_code=403,
+            content={"ok": False, "error":
+                     "dashboard controls disabled — set TRADEBOT_DASHBOARD_CONTROLS=1 in .env"},
+        )
+    return _run_ctl("start")
+
+
+@app.post("/api/bot/stop", response_class=JSONResponse)
+def bot_stop():
+    """Stop the paper bot. Cooperative shutdown: writes KILL file + SIGTERM."""
+    if not _dashboard_controls_enabled():
+        return JSONResponse(
+            status_code=403,
+            content={"ok": False, "error":
+                     "dashboard controls disabled — set TRADEBOT_DASHBOARD_CONTROLS=1 in .env"},
+        )
+    return _run_ctl("stop")
+
+
+@app.post("/api/bot/restart", response_class=JSONResponse)
+def bot_restart():
+    """Stop + start. Useful after config changes."""
+    if not _dashboard_controls_enabled():
+        return JSONResponse(
+            status_code=403,
+            content={"ok": False, "error":
+                     "dashboard controls disabled — set TRADEBOT_DASHBOARD_CONTROLS=1 in .env"},
+        )
+    return _run_ctl("restart", timeout=45.0)
+
+
+@app.post("/api/bot/reset_paper", response_class=JSONResponse)
+def bot_reset_paper():
+    """Nuclear reset: flatten Alpaca paper positions + wipe journal +
+    restart the bot with a clean slate. DANGEROUS — wipes trade history.
+    Requires TRADEBOT_DASHBOARD_CONTROLS=1."""
+    if not _dashboard_controls_enabled():
+        return JSONResponse(
+            status_code=403,
+            content={"ok": False, "error":
+                     "dashboard controls disabled — set TRADEBOT_DASHBOARD_CONTROLS=1 in .env"},
+        )
+    # reset_paper.py accepts --yes to skip its interactive confirm;
+    # without it the script refuses to run. We pass it explicitly
+    # because the UI button already required a confirm dialog.
+    return _run_ctl("reset-paper", timeout=120.0, extra_args=["--yes"])
+
+
+@app.post("/api/bot/walkforward", response_class=JSONResponse)
+def bot_walkforward():
+    """Run the nightly walk-forward edge report on demand. Posts the
+    result to the #tradebot-reason Discord channel."""
+    if not _dashboard_controls_enabled():
+        return JSONResponse(
+            status_code=403,
+            content={"ok": False, "error":
+                     "dashboard controls disabled — set TRADEBOT_DASHBOARD_CONTROLS=1 in .env"},
+        )
+    return _run_ctl("walkforward", timeout=180.0)
+
+
+@app.post("/webhook/tradingview", response_class=JSONResponse)
+async def tradingview_webhook(req: Request):
+    """Receive an alert from TradingView. Validated by shared secret,
+    schema-checked, and appended to the bot's signal queue.
+
+    TradingView alert 'Message' field should be JSON, e.g.
+      {
+        "secret": "your-long-shared-secret",
+        "symbol": "SPY",
+        "side": "buy",
+        "reason": "rsi_oversold + vwap_reversion",
+        "confidence": 0.7,
+        "tf": "5m",
+        "spot": {{close}},
+        "ts": "{{time}}"
+      }
+    Configure the webhook URL as http://<host>:8000/webhook/tradingview
+    (bound to localhost by default — use an SSH tunnel or a reverse-
+    proxy with auth to expose it to TradingView's servers).
+    """
+    from src.signals.tradingview_webhook import ingest
+    try:
+        body = await req.json()
+    except Exception:
+        return JSONResponse(status_code=400,
+                             content={"ok": False, "error": "invalid JSON body"})
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400,
+                             content={"ok": False, "error": "body must be a JSON object"})
+    result = ingest(body)
+    return JSONResponse(
+        status_code=result.status_code,
+        content={"ok": result.ok, "error": result.error,
+                 "alert_id": result.alert_id},
+    )
+
+
+@app.post("/api/bot/refresh_risk_switch", response_class=JSONResponse)
+def bot_refresh_risk_switch():
+    """Pull today's CBOE put/call OI and recompute the macro risk-off
+    state. Normally driven by cron; this button lets the operator
+    refresh it on demand."""
+    if not _dashboard_controls_enabled():
+        return JSONResponse(
+            status_code=403,
+            content={"ok": False, "error":
+                     "dashboard controls disabled — set TRADEBOT_DASHBOARD_CONTROLS=1 in .env"},
+        )
+    return _run_ctl("putcall-oi", timeout=30.0)
+
+
 @app.get("/api/attribution", response_class=JSONResponse)
 def attribution(days: int = Query(30, ge=1, le=365)):
     """Per-entry-tag performance attribution. Maps entry_tag → win rate, mean pnl,
@@ -657,10 +862,43 @@ _INDEX_HTML = """<!DOCTYPE html>
   .pill.regime { background: #182045; color: #a2b7ff; font-family: ui-monospace, monospace; }
   .chip { display: inline-block; background: #1a2142; color: #cbd5ff;
           border-radius: 4px; padding: 1px 6px; font-size: 11px; margin-right: 4px; }
+  .ctl-row { display: flex; gap: 10px; align-items: center; margin: 8px 0 18px;
+             flex-wrap: wrap; padding: 12px 14px; background: #141a33;
+             border: 1px solid #223; border-radius: 10px; }
+  .ctl-row .label { color: #9aa3c7; font-size: 11px; text-transform: uppercase;
+                    letter-spacing: .08em; margin-right: 4px; }
+  .ctl-btn { background: #2b3360; color: #e6e9f5; border: 0; padding: 7px 18px;
+             border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500; }
+  .ctl-btn:hover:not(:disabled) { background: #3a4680; }
+  .ctl-btn.start { background: #1f4d37; }
+  .ctl-btn.start:hover:not(:disabled) { background: #2a6b4c; }
+  .ctl-btn.stop  { background: #5a2633; }
+  .ctl-btn.stop:hover:not(:disabled)  { background: #7a3344; }
+  .ctl-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  .ctl-state { font-family: ui-monospace, monospace; font-size: 12px;
+               padding: 3px 9px; border-radius: 10px; }
+  .ctl-state.running { background: #14291e; color: #6ee7b7; }
+  .ctl-state.stopped { background: #2a1a1f; color: #fca5a5; }
+  .ctl-state.unknown { background: #2b2f44; color: #9aa3c7; }
+  .ctl-msg { color: #9aa3c7; font-size: 12px; font-family: ui-monospace, monospace; }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head><body>
 <h1>tradebot &nbsp;·&nbsp; <span class="mut">executive view</span></h1>
+
+<div class="ctl-row" id="ctl-row">
+  <span class="label">bot process</span>
+  <span id="ctl-state" class="ctl-state unknown">checking…</span>
+  <button id="ctl-start"   class="ctl-btn start" disabled>start</button>
+  <button id="ctl-stop"    class="ctl-btn stop"  disabled>stop</button>
+  <button id="ctl-restart" class="ctl-btn"       disabled>restart</button>
+  <span style="width: 18px;"></span>
+  <span class="label">flow</span>
+  <button id="ctl-walkforward" class="ctl-btn" disabled>run walkforward</button>
+  <button id="ctl-riskswitch"  class="ctl-btn" disabled>refresh risk switch</button>
+  <button id="ctl-reset"       class="ctl-btn stop" disabled>reset paper</button>
+  <span id="ctl-msg" class="ctl-msg"></span>
+</div>
 
 <h2>health</h2>
 <div class="grid" id="health"></div>
@@ -1159,6 +1397,79 @@ document.getElementById('days').addEventListener('change', refresh);
 refresh(); refreshLogs();
 setInterval(refresh, 60000);
 setInterval(refreshLogs, 15000);
+
+// ---- bot process controls + full-flow actions ----
+const CTL_BTN_IDS = [
+  'ctl-start', 'ctl-stop', 'ctl-restart',
+  'ctl-walkforward', 'ctl-riskswitch', 'ctl-reset',
+];
+async function refreshBotStatus() {
+  const stateEl = document.getElementById('ctl-state');
+  const msgEl   = document.getElementById('ctl-msg');
+  const start   = document.getElementById('ctl-start');
+  const stop    = document.getElementById('ctl-stop');
+  const restart = document.getElementById('ctl-restart');
+  const walk    = document.getElementById('ctl-walkforward');
+  const risk    = document.getElementById('ctl-riskswitch');
+  const reset   = document.getElementById('ctl-reset');
+  try {
+    const r = await fetch('/api/bot/status').then(r=>r.json());
+    const running = r.state === 'running';
+    stateEl.className = 'ctl-state ' + (running ? 'running' : 'stopped');
+    stateEl.textContent = r.raw || (running ? 'running' : 'stopped');
+    if (!r.controls_enabled) {
+      CTL_BTN_IDS.forEach(id => document.getElementById(id).disabled = true);
+      msgEl.textContent = 'controls disabled — set TRADEBOT_DASHBOARD_CONTROLS=1 in .env + restart dashboard';
+      return;
+    }
+    start.disabled   = running;
+    stop.disabled    = !running;
+    restart.disabled = false;
+    // flow actions are always available when controls are enabled —
+    // they run regardless of bot state (walkforward reads the journal,
+    // riskswitch pulls daily data, reset is its own thing)
+    walk.disabled = false;
+    risk.disabled = false;
+    reset.disabled = false;
+    msgEl.textContent = '';
+  } catch (e) {
+    stateEl.className = 'ctl-state unknown';
+    stateEl.textContent = 'error';
+    msgEl.textContent = String(e);
+  }
+}
+async function botAction(path, confirmMsg, timeoutHint) {
+  if (confirmMsg && !window.confirm(confirmMsg)) return;
+  const msgEl = document.getElementById('ctl-msg');
+  CTL_BTN_IDS.forEach(id => document.getElementById(id).disabled = true);
+  msgEl.textContent = (timeoutHint || (path + '…'));
+  try {
+    const r = await fetch('/api/bot/'+path, {method:'POST'}).then(r=>r.json());
+    const txt = (r.stdout || r.error || '') + (r.stderr ? (' · ' + r.stderr) : '');
+    const brief = (txt || (r.ok ? 'ok' : 'failed')).split('\\n').slice(0, 3).join(' · ');
+    msgEl.textContent = brief;
+  } catch (e) {
+    msgEl.textContent = String(e);
+  }
+  // small delay so any state file catches up, then refresh
+  setTimeout(refreshBotStatus, 1500);
+}
+document.getElementById('ctl-start').addEventListener('click',
+  () => botAction('start'));
+document.getElementById('ctl-stop').addEventListener('click',
+  () => botAction('stop', 'Stop the paper bot process?\\nOpen positions stay open in the journal but stops will not be monitored until restart.'));
+document.getElementById('ctl-restart').addEventListener('click',
+  () => botAction('restart', 'Restart the paper bot?\\n(stop + start — loads the latest config)'));
+document.getElementById('ctl-walkforward').addEventListener('click',
+  () => botAction('walkforward', null, 'running walkforward (takes ~1 min)…'));
+document.getElementById('ctl-riskswitch').addEventListener('click',
+  () => botAction('refresh_risk_switch', null, 'pulling CBOE put/call OI…'));
+document.getElementById('ctl-reset').addEventListener('click',
+  () => botAction('reset_paper',
+    'DANGEROUS: flattens all Alpaca paper positions AND truncates the trade journal. This is irreversible.\\n\\nContinue?',
+    'resetting paper account (this takes ~30s)…'));
+refreshBotStatus();
+setInterval(refreshBotStatus, 10000);
 </script>
 </body></html>
 """
