@@ -28,34 +28,34 @@ DEFAULT_WEIGHTS: Dict[Regime, Dict[str, float]] = {
     Regime.TREND_LOWVOL: {
         "momentum": 1.30, "orb": 0.80, "vwap_reversion": 0.60,
         "vrp": 0.70, "wheel": 0.70, "lstm": 0.00, "claude_ai": 1.10,
-        "candle_patterns": 1.00,
+        "candle_patterns": 1.00, "technical_analysis": 1.10,
     },
     Regime.TREND_HIGHVOL: {
         "momentum": 1.10, "orb": 0.70, "vwap_reversion": 0.50,
         "vrp": 0.80, "wheel": 0.60, "lstm": 0.00, "claude_ai": 0.90,
-        "candle_patterns": 1.10,
+        "candle_patterns": 1.10, "technical_analysis": 1.20,
     },
     Regime.RANGE_LOWVOL: {
         "momentum": 0.60, "orb": 1.00, "vwap_reversion": 1.30,
         "vrp": 1.00, "wheel": 1.00, "lstm": 0.00, "claude_ai": 0.90,
-        "candle_patterns": 1.30,           # patterns matter most in range
+        "candle_patterns": 1.30, "technical_analysis": 1.40,
     },
     Regime.RANGE_HIGHVOL: {
         "momentum": 0.50, "orb": 0.90, "vwap_reversion": 1.10,
         "vrp": 1.40, "wheel": 1.30, "lstm": 0.00, "claude_ai": 0.80,
-        "candle_patterns": 1.20,
+        "candle_patterns": 1.20, "technical_analysis": 1.30,
     },
     Regime.OPENING: {
         "momentum": 0.80, "orb": 1.50, "vwap_reversion": 0.80,
         "vrp": 0.60, "wheel": 0.60, "lstm": 0.00, "claude_ai": 0.90,
-        "candle_patterns": 0.90,
+        "candle_patterns": 0.90, "technical_analysis": 0.80,
     },
     Regime.CLOSING: {
         # Effectively shut down new entries in the last 30 min — let the
         # session filter + EOD sweep own this window.
         "momentum": 0.30, "orb": 0.30, "vwap_reversion": 0.30,
         "vrp": 0.20, "wheel": 0.20, "lstm": 0.00, "claude_ai": 0.30,
-        "candle_patterns": 0.30,
+        "candle_patterns": 0.30, "technical_analysis": 0.30,
     },
 }
 

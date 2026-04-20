@@ -519,6 +519,24 @@ class TradeBot:
                     ),
                 ))
                 log.info("candle_patterns_signal_enabled")
+            # Optional technical-analysis signal — RSI divergence,
+            # double top/bottom, median break, Bollinger reclaim,
+            # multi-timeframe RSI confluence. Catches the kind of
+            # setups discretionary chart traders watch.
+            ta_cfg = settings.raw.get("signals", {}).get("technical_analysis", {}) or {}
+            if ta_cfg.get("enabled", False):
+                from .signals.technical_analysis import TechnicalAnalysisSignal
+                self.strategies.append(TechnicalAnalysisSignal(
+                    min_bars=int(ta_cfg.get("min_bars", 60)),
+                    rsi_period=int(ta_cfg.get("rsi_period", 14)),
+                    bb_period=int(ta_cfg.get("bb_period", 20)),
+                    bb_std=float(ta_cfg.get("bb_std", 2.0)),
+                    sma_period=int(ta_cfg.get("sma_period", 50)),
+                    short_tf_group=int(ta_cfg.get("short_tf_group", 5)),
+                    long_tf_group=int(ta_cfg.get("long_tf_group", 15)),
+                    low_vol_damp=float(ta_cfg.get("low_vol_damp", 0.15)),
+                ))
+                log.info("technical_analysis_signal_enabled")
             # Optional TradingView webhook signal. The ingest side runs
             # in the dashboard process (POST /webhook/tradingview). This
             # source polls the file-backed queue each tick. The bot

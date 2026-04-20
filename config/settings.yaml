@@ -334,6 +334,19 @@ signals:
     near_vwap_bps: 50.0            # within 0.50% of VWAP = "near"
     near_vwap_boost: 0.05
     continuation_require_volume: true   # drop low-vol breakouts
+  # Technical analysis layer: RSI divergence, double top/bottom, 50-SMA
+  # (median-line) break with volume, Bollinger-band reclaim, and
+  # multi-timeframe RSI confluence (5-min + 15-min agreement).
+  technical_analysis:
+    enabled: true
+    min_bars: 60
+    rsi_period: 14
+    bb_period: 20
+    bb_std: 2.0
+    sma_period: 50                 # median line
+    short_tf_group: 5              # ~5-min equivalent on 1-min bars
+    long_tf_group: 15             # ~15-min equivalent
+    low_vol_damp: 0.15
 
 breadth:
   enabled: true                    # composite risk-on/off probe
