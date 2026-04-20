@@ -348,6 +348,18 @@ signals:
     long_tf_group: 15             # ~15-min equivalent
     low_vol_damp: 0.15
 
+# ===== Price-action liveness gate =====
+# Blocks entries when the underlying isn't moving. Options decay
+# faster than a flat tape can reward — a long call on a frozen SPY
+# bleeds theta while the stock does nothing. Filter f19 checks:
+#   - ATR(20) / spot < atr_floor_pct  → stagnant, block
+#   - (hi20 - lo20) / mid < range_floor_pct → tight range, block
+price_action:
+  enabled: true
+  window: 20                          # bars to measure
+  atr_floor_pct: 0.0010              # 0.10% ATR/spot floor for SPY/QQQ
+  range_floor_pct: 0.0025            # 0.25% range/mid floor
+
 breadth:
   enabled: true                    # composite risk-on/off probe
   cache_seconds: 60

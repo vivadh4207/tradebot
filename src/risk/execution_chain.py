@@ -360,6 +360,69 @@ class ExecutionChain:
                 log.warning("scalp_via_greek_calc_failed err=%s", e)
         return FilterResult(True, "scalp_via_ok")
 
+    def f19_price_action_liveness(self, ctx: ExecutionContext) -> FilterResult:
+        """Block entries when the underlying is stagnant.
+
+        An option only profits when the underlying moves. If SPY/QQQ has
+        been essentially frozen for 20 bars, long calls/puts decay
+        faster than intrinsic value accrues — dead premium.
+
+        Thresholds (from settings.price_action, defaults chosen for
+        SPY/QQQ on 1-min bars):
+          - ATR(20) / spot < atr_floor_pct (default 0.10%) → block
+          - (hi20 - lo20) / mid < range_floor_pct (default 0.25%) → block
+
+        Skip gracefully when we don't have enough bars.
+        """
+        pa_cfg = (self._s.get("price_action", {}) or {})
+        if not pa_cfg.get("enabled", True):
+            return FilterResult(True, "price_action_disabled")
+        bars = ctx.recent_bars or []
+        n = int(pa_cfg.get("window", 20))
+        if len(bars) < n:
+            return FilterResult(True, f"price_action_skip:insufficient_bars({len(bars)}/{n})")
+        # ATR
+        trs = []
+        prev_close = None
+        for b in bars[-n:]:
+            hi = getattr(b, "high", None)
+            lo = getattr(b, "low", None)
+            cl = getattr(b, "close", None)
+            if hi is None or lo is None or cl is None:
+                continue
+            tr = hi - lo
+            if prev_close is not None:
+                tr = max(tr, abs(hi - prev_close), abs(lo - prev_close))
+            trs.append(tr)
+            prev_close = cl
+        if not trs:
+            return FilterResult(True, "price_action_skip:no_trs")
+        atr = sum(trs) / len(trs)
+        spot = ctx.spot if ctx.spot > 0 else (prev_close or 1.0)
+        atr_pct = atr / max(1e-9, spot)
+        atr_floor = float(pa_cfg.get("atr_floor_pct", 0.0010))
+        if atr_pct < atr_floor:
+            return FilterResult(
+                False,
+                f"price_action_stagnant: atr%={atr_pct*100:.3f}<{atr_floor*100:.3f}",
+            )
+        # Range(n)
+        highs = [getattr(b, "high", 0.0) for b in bars[-n:]]
+        lows = [getattr(b, "low", 0.0) for b in bars[-n:]]
+        hi20 = max(highs) if highs else 0.0
+        lo20 = min(lows) if lows else 0.0
+        mid = (hi20 + lo20) / 2.0 if (hi20 + lo20) > 0 else spot
+        range_pct = (hi20 - lo20) / max(1e-9, mid)
+        range_floor = float(pa_cfg.get("range_floor_pct", 0.0025))
+        if range_pct < range_floor:
+            return FilterResult(
+                False,
+                f"price_action_tight: range%={range_pct*100:.3f}<{range_floor*100:.3f}",
+            )
+        return FilterResult(
+            True, f"price_action_ok: atr%={atr_pct*100:.3f} range%={range_pct*100:.3f}",
+        )
+
     # ---------- runner ----------
     def run(self, ctx: ExecutionContext) -> List[FilterResult]:
         filters: List[Callable[[ExecutionContext], FilterResult]] = [
@@ -373,6 +436,7 @@ class ExecutionChain:
             self.f15_news_filter,
             self.f16_vwap_alignment, self.f17_momentum_confirmation,
             self.f18_option_scalp_viability,
+            self.f19_price_action_liveness,
         ]
         results: List[FilterResult] = []
         for f in filters:
