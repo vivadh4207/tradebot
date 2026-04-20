@@ -1,0 +1,39 @@
+  GNU nano 4.8                    requirements.txt                              
+# Core
+numpy>=1.24.4
+pandas>=1.5.3
+scipy>=1.10.1
+pytz>=2024.1
+python-dateutil>=2.8
+
+# Data + config
+pyyaml>=6.0
+python-dotenv>=1.0
+
+# Stats / modeling
+statsmodels>=0.14
+
+# Brokers (optional - alpaca only needed for paper/live)
+alpaca-py>=0.21
+
+# Market data fallbacks
+yfinance>=0.2.28
+#multitasking
+requests>=2.31.0
+
+# Utilities
+structlog>=24.1
+
+# Storage: stdlib sqlite3 only — no external deps required.
+
+# Dashboard
+fastapi>=0.100.00
+uvicorn>0.29.0
+httpx>=0.27                   # required by FastAPI TestClient + async HTTP
+
+# Config schema validation
+pydantic>=2.0
+
+# Testing
+pytest>=8.0
+pytest-asyncio>=0.23

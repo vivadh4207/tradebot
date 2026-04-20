@@ -1,0 +1,21 @@
+# Custom catalyst overrides.
+#
+# yfinance + Finnhub will auto-fill earnings for symbols in your universe.
+# Use this file for:
+#   - FDA PDUFA / advisory-committee dates (not covered by earnings feeds).
+#   - Manual overrides when a feed is wrong.
+#   - One-off custom events (analyst days, product launches).
+#
+# Dates are ISO format (YYYY-MM-DD).
+# `timing` (for earnings) is 'bmo' | 'amc' | 'unknown'.
+
+fda: []
+  # - symbol: MRNA
+  #   date: 2026-05-15
+  #   event: PDUFA decision
+
+earnings: []
+  # - symbol: AAPL
+  #   date: 2026-05-02
+  #   timing: amc
+  #   event: Q2 earnings

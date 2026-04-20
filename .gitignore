@@ -1,0 +1,62 @@
+# Secrets / environment
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# macOS / Finder duplicates of sensitive files. Finder creates these as
+# "filename 2.ext", "filename 3.ext", etc. when you copy-in-place.
+# Without these globs, `git add -A` will pick up ".env 2.example" (which
+# is a full copy of your real .env) and commit live credentials.
+# Incident: commit b411544, 2026-04-17 — leaked Alpaca + Cockroach keys.
+.env [0-9]*
+.env *
+* .env
+* .env.example
+* .env.local
+*.env [0-9]*
+*.env.example [0-9]*
+*.env.local [0-9]*
+*.pem [0-9]*
+*.pem *
+*.key [0-9]*
+*.key *
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local data / runtime
+logs/
+data_cache/
+*.sqlite
+*.sqlite3
+*.db
+KILL
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# editor auto-saves
+*.save
+
+# macOS / Finder duplicates of sensitive files (this leaked once already)
+.env [0-9]*
+.env *
+*.env [0-9]*
+* .env.example
+* .env.local
+_teabot_review/
+docs/expert_memo.md

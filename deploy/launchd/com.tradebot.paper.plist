@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS launchd agent: runs the tradebot paper loop under the local
+  watchdog (scripts/watchdog_run.py), which:
+    - spawns run_paper.py as a child
+    - fires a Discord/Slack alert on crash (via src.notify)
+    - records every start/exit to logs/watchdog_events.jsonl
+    - restarts the child if heartbeat (logs/heartbeat.txt) goes stale
+  launchd provides KeepAlive so the watchdog *itself* comes back if it
+  dies (or macOS reboots). The bot handles market hours internally, so
+  running 24/7 is safe.
+
+  INSTALL:
+    scripts/tradebotctl.sh watchdog-install
+  (or manually:)
+    1) Edit the <string> paths below if your checkout isn't at
+       /Users/vivekadhikari/Documents/Claude/Projects/tradebot.
+    2) cp deploy/launchd/com.tradebot.paper.plist ~/Library/LaunchAgents/
+    3) launchctl load ~/Library/LaunchAgents/com.tradebot.paper.plist
+    4) launchctl start com.tradebot.paper       # optional, RunAtLoad=true
+  STATUS:
+    launchctl list | grep tradebot              # or: tradebotctl watchdog-status
+  STOP (temporary):
+    launchctl stop com.tradebot.paper
+  UNLOAD (permanent until reloaded):
+    launchctl unload ~/Library/LaunchAgents/com.tradebot.paper.plist
+
+  NB: launchd considers >= 10 exits in 10s a crash loop and gives up.
+  If that happens, check logs/tradebot.err + logs/watchdog_events.jsonl.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.tradebot.paper</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/vivekadhikari/Documents/Claude/Projects/tradebot</string>
+
+  <!-- Run the watchdog, not run_paper.py directly. The watchdog spawns
+       run_paper.py, monitors the heartbeat, and alerts on crash. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/vivekadhikari/Documents/Claude/Projects/tradebot/.venv/bin/python</string>
+    <string>/Users/vivekadhikari/Documents/Claude/Projects/tradebot/scripts/watchdog_run.py</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    <key>TZ</key>
+    <string>America/New_York</string>
+    <!-- Point the watchdog at the same interpreter as launchd uses; this
+         keeps `subprocess.Popen([python, run_paper.py])` on the venv. -->
+    <key>TRADEBOT_PY</key>
+    <string>/Users/vivekadhikari/Documents/Claude/Projects/tradebot/.venv/bin/python</string>
+  </dict>
+
+  <!-- Keep alive across crashes and reboots. -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- If the wrapper exits too fast, don't hot-loop restart. -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <!-- stdout/stderr land in the repo's logs/ dir. The watchdog tails
+       tradebot.err after a crash to include the last traceback in the
+       Discord/Slack alert. -->
+  <key>StandardOutPath</key>
+  <string>/Users/vivekadhikari/Documents/Claude/Projects/tradebot/logs/tradebot.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/vivekadhikari/Documents/Claude/Projects/tradebot/logs/tradebot.err</string>
+</dict>
+</plist>
