@@ -21,12 +21,59 @@ class OptionsChainProvider(abc.ABC):
               target_dte: int = 1) -> List[OptionContract]: ...
 
 
+# Real-world strike increments (in dollars) for liquid ETFs / indices.
+# Adding a symbol here makes the synthetic chain generate strikes that
+# match what's actually listed at CBOE — otherwise Alpaca rejects with
+# "asset not found" when the bot tries to submit a fractional strike.
+_FIXED_STRIKE_STEP: dict = {
+    "SPY": 1.0,
+    "QQQ": 1.0,
+    "IWM": 1.0,
+    "DIA": 1.0,
+    "XLF": 0.5,
+    "XLE": 0.5,
+    "XLK": 1.0,
+    "TLT": 1.0,
+    "GLD": 1.0,
+    "SLV": 0.5,
+}
+
+
+def _strike_step_for(underlying: str, spot: float,
+                      default_pct: float) -> float:
+    """Pick a realistic strike increment. Liquid ETFs use fixed $1
+    (or $0.50) increments regardless of spot. Others fall back to a
+    percentage of spot, clamped to at least $0.50 and rounded to a
+    clean $0.50 multiple so the resulting strikes are plausible."""
+    fixed = _FIXED_STRIKE_STEP.get(underlying.upper())
+    if fixed is not None:
+        return float(fixed)
+    # Stocks: derive step from spot but quantize to $0.50 / $1 / $2.50
+    # grid so we never produce fractional strikes like $87.37.
+    raw = max(spot * default_pct, 0.5)
+    if raw <= 0.75:
+        return 0.5
+    if raw <= 1.5:
+        return 1.0
+    if raw <= 3.5:
+        return 2.5
+    return 5.0
+
+
+def _snap_strike(raw: float, step: float) -> float:
+    """Snap a raw strike to the nearest valid step on the real-world
+    grid (anchored at 0, i.e. strikes at k*step)."""
+    return round(round(raw / step) * step, 2)
+
+
 class SyntheticOptionsChain(OptionsChainProvider):
     def __init__(self, base_iv: float = 0.22, r: float = 0.045, q: float = 0.015,
                  strike_step_pct: float = 0.01, strikes_each_side: int = 10):
         self.base_iv = base_iv
         self.r = r
         self.q = q
+        # strike_step_pct is now a FALLBACK — liquid names use the
+        # fixed-step table in _strike_step_for.
         self.strike_step_pct = strike_step_pct
         self.strikes_each_side = strikes_each_side
 
@@ -37,9 +84,16 @@ class SyntheticOptionsChain(OptionsChainProvider):
         T = max(target_dte, 0) / 365.0 or 1 / 365.0
 
         contracts: List[OptionContract] = []
-        step = max(spot * self.strike_step_pct, 0.5)
+        step = _strike_step_for(underlying, spot, self.strike_step_pct)
+        # Anchor the chain at the nearest-valid-strike to spot so every
+        # generated K is on the real-world grid (e.g. $708, $709, $710).
+        atm = _snap_strike(spot, step)
+        seen: set = set()
         for i in range(-self.strikes_each_side, self.strikes_each_side + 1):
-            K = round(spot + i * step, 2)
+            K = _snap_strike(atm + i * step, step)
+            if K <= 0 or K in seen:
+                continue
+            seen.add(K)
             log_m = np.log(K / spot)
             # simple smile: puts more expensive than calls, OTM wings lifted
             iv = self.base_iv + 0.05 * (log_m * log_m) + (-0.02 if log_m < 0 else 0.0)
@@ -49,7 +103,7 @@ class SyntheticOptionsChain(OptionsChainProvider):
                 spread = max(0.02, mid * 0.04)
                 bid = max(0.01, mid - spread / 2)
                 ask = mid + spread / 2
-                occ = f"{underlying}{expiry.strftime('%y%m%d')}{rt[0].upper()}{int(K*1000):08d}"
+                occ = f"{underlying}{expiry.strftime('%y%m%d')}{rt[0].upper()}{int(round(K*1000)):08d}"
                 contracts.append(OptionContract(
                     symbol=occ, underlying=underlying,
                     strike=K, expiry=expiry, right=right,
