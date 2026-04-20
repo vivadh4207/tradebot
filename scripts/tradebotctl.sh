@@ -39,8 +39,10 @@ DASHBOARD_INSTALLED_PLIST="$HOME/Library/LaunchAgents/${DASHBOARD_LABEL}.plist"
 SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 SYSTEMD_WATCHDOG_UNIT="tradebot-watchdog.service"
 SYSTEMD_DASHBOARD_UNIT="tradebot-dashboard.service"
+SYSTEMD_DISCORD_UNIT="tradebot-discord-terminal.service"
 SYSTEMD_WATCHDOG_SRC="$ROOT/deploy/systemd/${SYSTEMD_WATCHDOG_UNIT}"
 SYSTEMD_DASHBOARD_SRC="$ROOT/deploy/systemd/${SYSTEMD_DASHBOARD_UNIT}"
+SYSTEMD_DISCORD_SRC="$ROOT/deploy/systemd/${SYSTEMD_DISCORD_UNIT}"
 
 # Host OS — drives which supervisor we wire up.
 HOST_OS="$(uname -s)"
@@ -442,6 +444,78 @@ _dashboard_status_systemd() {
   echo "open:      http://127.0.0.1:8000"
 }
 
+# ----- Discord terminal service (Linux only — uses systemd --user) -----
+cmd_discord_install() {
+  if [[ "$HOST_OS" != "Linux" ]]; then
+    echo "discord-install is Linux-only (uses systemd --user)."
+    return 2
+  fi
+  _require_systemctl || return 1
+  if [[ ! -f "$SYSTEMD_DISCORD_SRC" ]]; then
+    echo "source unit missing: $SYSTEMD_DISCORD_SRC"; return 1
+  fi
+  mkdir -p "$SYSTEMD_USER_DIR"
+  _write_systemd_unit "$SYSTEMD_DISCORD_SRC" "$SYSTEMD_USER_DIR/$SYSTEMD_DISCORD_UNIT"
+  systemctl --user daemon-reload
+  if systemctl --user enable --now "$SYSTEMD_DISCORD_UNIT"; then
+    echo "discord terminal installed + started: $SYSTEMD_USER_DIR/$SYSTEMD_DISCORD_UNIT"
+    echo "logs: journalctl --user -u $SYSTEMD_DISCORD_UNIT -f"
+  else
+    echo "systemctl --user enable failed"; return 1
+  fi
+}
+
+cmd_discord_uninstall() {
+  if [[ "$HOST_OS" != "Linux" ]]; then
+    echo "discord-uninstall is Linux-only."; return 2
+  fi
+  _require_systemctl || return 1
+  systemctl --user disable --now "$SYSTEMD_DISCORD_UNIT" 2>/dev/null || true
+  rm -f "$SYSTEMD_USER_DIR/$SYSTEMD_DISCORD_UNIT"
+  systemctl --user daemon-reload
+  echo "discord terminal unloaded + removed"
+}
+
+cmd_discord_status() {
+  if [[ "$HOST_OS" != "Linux" ]]; then
+    echo "discord-status is Linux-only."; return 2
+  fi
+  _require_systemctl || return 1
+  if [[ ! -f "$SYSTEMD_USER_DIR/$SYSTEMD_DISCORD_UNIT" ]]; then
+    echo "discord terminal: not installed"
+    echo "install:  tradebotctl discord-install"
+    return 0
+  fi
+  local active; active="$(systemctl --user is-active "$SYSTEMD_DISCORD_UNIT" 2>/dev/null || echo "inactive")"
+  local pid; pid="$(systemctl --user show -p MainPID --value "$SYSTEMD_DISCORD_UNIT" 2>/dev/null)"
+  echo "discord terminal: $active (pid=${pid:-0})"
+}
+
+# Subcommands invoked BY the discord terminal (not for humans to type):
+# They expose internal state the bot formats for the user.
+cmd_logs_tail() {
+  tail -n 200 "$LOG_FILE" 2>/dev/null || echo "no logs yet"
+}
+
+cmd_positions_print() {
+  "$PY" -c "
+import json, sys
+try:
+    with open('logs/broker_state.json') as f:
+        d = json.load(f)
+    ps = d.get('positions', [])
+    if not ps:
+        print('no open positions'); sys.exit(0)
+    for p in ps:
+        print(f\"{p.get('symbol','?')}  qty={p.get('qty','?')}  avg=\${p.get('avg_price',0):.2f}\")
+    print(f\"cash=\${d.get('cash',0):,.2f}  day_pnl=\${d.get('day_pnl',0):+,.2f}\")
+except FileNotFoundError:
+    print('no broker snapshot yet')
+except Exception as e:
+    print(f'snapshot read failed: {e}')
+"
+}
+
 # Heartbeat freshness + last watchdog event. OS-agnostic — just reads
 # logs/heartbeat.txt and logs/watchdog_events.jsonl.
 _print_heartbeat_age() {
@@ -494,6 +568,11 @@ case "${1:-}" in
   walkforward)        shift; "$PY" "$ROOT/scripts/nightly_walkforward_report.py" "$@" ;;
   putcall-oi)         shift; "$PY" "$ROOT/scripts/fetch_putcall_oi.py" "$@" ;;
   strategy-audit)     shift; "$PY" "$ROOT/scripts/run_strategy_audit.py" "$@" ;;
+  logs-tail)          cmd_logs_tail ;;
+  positions-print)    cmd_positions_print ;;
+  discord-install)    cmd_discord_install ;;
+  discord-uninstall)  cmd_discord_uninstall ;;
+  discord-status)     cmd_discord_status ;;
   *)
     cat <<EOF
 usage: $(basename "$0") {start|stop|restart|status|logs|backtest|priors|walkforward|dashboard|testdb|

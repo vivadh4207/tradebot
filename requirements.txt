@@ -24,6 +24,10 @@ structlog>=24.1
 
 # Storage: stdlib sqlite3 only — no external deps required.
 
+# Discord terminal bot (optional — only needed if you run the terminal).
+# Not in the hot path; the webhook notifier alone does not need this.
+discord.py>=2.3
+
 # Dashboard
 fastapi>=0.110
 uvicorn[standard]>=0.29

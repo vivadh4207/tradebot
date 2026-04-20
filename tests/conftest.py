@@ -34,16 +34,15 @@ def _sandbox_production_state(tmp_path, monkeypatch):
     # 1. Block any yfinance / Alpaca SDK / external HTTP that tests trigger.
     monkeypatch.setenv("TRADEBOT_NO_NETWORK", "1")
 
-    # 2. Strip webhook URLs so build_notifier() returns NullNotifier.
-    #    Prevents tests from posting "startup: tradebot started" to the
-    #    user's Discord every time pytest runs. Also clear per-channel
-    #    overrides so MultiChannelNotifier isn't accidentally built.
-    monkeypatch.delenv("DISCORD_WEBHOOK_URL", raising=False)
-    monkeypatch.delenv("DISCORD_WEBHOOK_URL_TRADES", raising=False)
-    monkeypatch.delenv("DISCORD_WEBHOOK_URL_CATALYSTS", raising=False)
-    monkeypatch.delenv("DISCORD_WEBHOOK_URL_ALERTS", raising=False)
-    monkeypatch.delenv("DISCORD_WEBHOOK_URL_CALIBRATION", raising=False)
-    monkeypatch.delenv("SLACK_WEBHOOK_URL", raising=False)
+    # 2. Strip EVERY DISCORD_WEBHOOK_URL* + SLACK_WEBHOOK_URL so
+    #    build_notifier() returns NullNotifier by default. Prevents
+    #    tests from posting to real webhooks AND prevents the dynamic
+    #    DISCORD_WEBHOOK_URL_<NAME> scan in base.py from accidentally
+    #    building a MultiChannelNotifier from a leaked env var.
+    for key in list(os.environ.keys()):
+        if key.startswith("DISCORD_WEBHOOK_URL") or key == "SLACK_WEBHOOK_URL":
+            monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("DISCORD_EXTRA_CHANNEL_ROUTES", raising=False)
 
     # 3. Per-test sandbox dir for all on-disk state. Tests can read
     #    `tradebot_sandbox_logs` if they want to inspect what the bot

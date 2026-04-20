@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import abc
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
 
 class Notifier(abc.ABC):
@@ -70,8 +70,10 @@ def build_notifier() -> Notifier:
 
     # Check for any per-channel overrides. Each optional; missing →
     # falls back to default (or to Null if no default either).
-    # `reason` = "why is the bot trading (or not)" — holds nightly
-    # walkforward verdicts, ensemble rationale, drawdown edge reports.
+    # The named channels below have built-in title routing; additional
+    # fully-operator-defined channels can be added with
+    # DISCORD_WEBHOOK_URL_X=<url> and a tag=channel mapping in
+    # DISCORD_EXTRA_CHANNEL_ROUTES (see _parse_extra_routes below).
     per_channel = {
         "trades":      _clean(os.getenv("DISCORD_WEBHOOK_URL_TRADES", "")),
         "catalysts":   _clean(os.getenv("DISCORD_WEBHOOK_URL_CATALYSTS", "")),
@@ -79,6 +81,26 @@ def build_notifier() -> Notifier:
         "calibration": _clean(os.getenv("DISCORD_WEBHOOK_URL_CALIBRATION", "")),
         "reason":      _clean(os.getenv("DISCORD_WEBHOOK_URL_REASON", "")),
     }
+
+    # --- operator-defined extra channels ---
+    # Every env var named `DISCORD_WEBHOOK_URL_<NAME>` becomes a
+    # channel keyed by the lowercased <NAME>. That way the operator
+    # can add an arbitrary number of new channels (e.g. "_LLM",
+    # "_AUDIT", "_POLITICAL", "_GAMMA", "_HEADS_UP") without touching
+    # the code. Routing from title keywords to those channels is
+    # controlled by DISCORD_EXTRA_CHANNEL_ROUTES="title1:channel,
+    # title2:channel".
+    _known = {"TRADES", "CATALYSTS", "ALERTS", "CALIBRATION", "REASON"}
+    for env_key, env_val in os.environ.items():
+        if not env_key.startswith("DISCORD_WEBHOOK_URL_"):
+            continue
+        tail = env_key[len("DISCORD_WEBHOOK_URL_"):]
+        if not tail or tail in _known:
+            continue
+        url = _clean(env_val)
+        if url:
+            per_channel[tail.lower()] = url
+
     any_per_channel = any(per_channel.values())
 
     if default_dsc and any_per_channel:
@@ -87,7 +109,8 @@ def build_notifier() -> Notifier:
         for ch, url in per_channel.items():
             if url:
                 channels[ch] = WebhookNotifier(url=url, flavor="discord")
-        return MultiChannelNotifier(channels)
+        return MultiChannelNotifier(channels,
+                                      extra_routes=_load_extra_routes())
 
     if default_dsc:
         return WebhookNotifier(url=default_dsc, flavor="discord")
@@ -117,6 +140,32 @@ _TITLE_TO_CHANNEL = {
 }
 
 
+def _load_extra_routes() -> dict:
+    """Parse DISCORD_EXTRA_CHANNEL_ROUTES='title1:channel1,title2:channel2'
+    so operators can point new titles at their new channels without
+    touching the built-in `_TITLE_TO_CHANNEL` map.
+
+    Example: DISCORD_EXTRA_CHANNEL_ROUTES='llm_review:llm,political_alert:political'
+    paired with DISCORD_WEBHOOK_URL_LLM=... and DISCORD_WEBHOOK_URL_POLITICAL=...
+    gives the bot two brand-new output channels.
+    """
+    raw = os.getenv("DISCORD_EXTRA_CHANNEL_ROUTES", "").strip()
+    if not raw:
+        return {}
+    extras = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair or ":" not in pair:
+            continue
+        title, channel = pair.split(":", 1)
+        title = title.strip().lower()
+        channel = channel.strip().lower()
+        if not title or not channel:
+            continue
+        extras.setdefault(channel, set()).add(title)
+    return extras
+
+
 class MultiChannelNotifier(Notifier):
     """Route notify() calls to one of several WebhookNotifiers based on
     the `title` kwarg AND `level`. Falls back to the `default` channel
@@ -126,14 +175,26 @@ class MultiChannelNotifier(Notifier):
     fills in one channel, catalysts in another, and alerts in a third —
     without flooding a single channel."""
 
-    def __init__(self, channels: dict):
-        """`channels` = {channel_name: Notifier}. Must include key "default"."""
+    def __init__(self, channels: dict, extra_routes: Optional[dict] = None):
+        """`channels` = {channel_name: Notifier}. Must include key "default".
+
+        `extra_routes` = {channel_name: {title_keyword, ...}} — operator-
+        supplied additional title → channel mappings stitched on top of
+        the built-in _TITLE_TO_CHANNEL map. Loaded from the env var
+        DISCORD_EXTRA_CHANNEL_ROUTES when built via `build_notifier`.
+        """
         assert "default" in channels, "MultiChannelNotifier requires a 'default' channel"
         self._channels = channels
+        self._extra_routes = extra_routes or {}
 
     def _pick(self, title: str, level: str = "info") -> Notifier:
         t = (title or "").lower().strip()
+        # Built-in routes first
         for chan, keywords in _TITLE_TO_CHANNEL.items():
+            if t in keywords and chan in self._channels:
+                return self._channels[chan]
+        # Operator-supplied routes next (via DISCORD_EXTRA_CHANNEL_ROUTES)
+        for chan, keywords in self._extra_routes.items():
             if t in keywords and chan in self._channels:
                 return self._channels[chan]
         # Any error-level message without a specific channel goes to

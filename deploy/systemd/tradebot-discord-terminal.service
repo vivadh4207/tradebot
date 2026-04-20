@@ -1,0 +1,25 @@
+# systemd USER unit for the Discord-terminal bot.
+# Installed by scripts/tradebotctl.sh discord-install on Linux/Jetson.
+[Unit]
+Description=tradebot Discord terminal bot
+After=network-online.target
+Wants=network-online.target
+# Storm-protect: if the bot crashes 5 times in 60s, stop. Prevents a
+# broken token or revoked auth from hammering Discord's login endpoint.
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+WorkingDirectory=__TRADEBOT_ROOT__
+Environment=TZ=America/New_York
+ExecStart=__TRADEBOT_PY__ __TRADEBOT_ROOT__/scripts/discord_terminal.py
+KillSignal=SIGTERM
+TimeoutStopSec=10
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:__TRADEBOT_ROOT__/logs/discord_terminal.out
+StandardError=append:__TRADEBOT_ROOT__/logs/discord_terminal.err
+
+[Install]
+WantedBy=default.target

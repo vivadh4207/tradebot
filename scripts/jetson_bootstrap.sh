@@ -191,6 +191,11 @@ if command -v loginctl >/dev/null 2>&1; then
 fi
 bash "$REPO/scripts/tradebotctl.sh" watchdog-install  || true
 bash "$REPO/scripts/tradebotctl.sh" dashboard-install || true
+# Discord terminal — installed but only USEFUL if the user fills in
+# DISCORD_BOT_TOKEN + DISCORD_TERMINAL_CHANNEL_IDS + AUTHORIZED_USERS.
+# If those are blank the service will log an error and exit; systemd
+# respects the StartLimitBurst so it won't spin on a broken config.
+bash "$REPO/scripts/tradebotctl.sh" discord-install   || true
 
 # ------------------------------------------------------------------ step 9
 step 9 9 "Doctor"

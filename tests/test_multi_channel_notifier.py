@@ -103,6 +103,45 @@ def test_backtest_report_falls_back_to_default_when_reason_unset():
     assert len(chans["default"].calls) == 1
 
 
+def test_extra_operator_defined_channel_routes():
+    """Operator adds a new channel like 'political' plus a custom route
+    via DISCORD_EXTRA_CHANNEL_ROUTES. MultiChannelNotifier should honor it."""
+    from src.notify.base import MultiChannelNotifier
+    chans = {
+        "default":   _CapturingNotifier("default"),
+        "political": _CapturingNotifier("political"),
+    }
+    mc = MultiChannelNotifier(
+        chans,
+        extra_routes={"political": {"political_alert", "geopolitical"}},
+    )
+    mc.notify("Iran drone strike escalation", title="political_alert")
+    assert len(chans["political"].calls) == 1
+    assert not chans["default"].calls
+
+    # A title NOT in the extra route or builtins falls to default
+    mc.notify("random status blip", title="random")
+    assert len(chans["default"].calls) == 1
+
+
+def test_extra_routes_do_not_override_builtin_routes():
+    """If an operator accidentally tries to redirect 'entry' to
+    their new channel, the builtin 'trades' route still wins."""
+    from src.notify.base import MultiChannelNotifier
+    chans = {
+        "default":   _CapturingNotifier("default"),
+        "trades":    _CapturingNotifier("trades"),
+        "political": _CapturingNotifier("political"),
+    }
+    mc = MultiChannelNotifier(
+        chans,
+        extra_routes={"political": {"entry"}},   # attempted hijack
+    )
+    mc.notify("BUY 3 × CALL SPY", title="entry")
+    assert len(chans["trades"].calls) == 1
+    assert not chans["political"].calls
+
+
 def test_unknown_title_falls_back_to_default():
     mc, chans = _build()
     mc.notify("some random event", title="something_weird")
