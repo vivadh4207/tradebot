@@ -128,6 +128,72 @@ class Fill:
     ts: float = field(default_factory=time.time)
 
 
+# ----------- multi-leg option structures (credit spreads, wheels, etc.)
+
+@dataclass
+class OptionLeg:
+    """One leg of a multi-leg option structure.
+
+    `ratio` is the per-combo quantity of THIS leg. A vertical spread
+    has both legs at ratio=1. A ratio spread might have 1 and 2.
+    The actual contract count placed = combo.qty * leg.ratio.
+    """
+    contract: OptionContract
+    side: Side
+    ratio: int = 1
+
+
+@dataclass
+class ComboOrder:
+    """A multi-leg option order submitted atomically.
+
+    `net_limit` is the NET limit price per one combo, signed:
+      > 0 = net DEBIT  (pay this much per combo) — e.g. long spread
+      < 0 = net CREDIT (receive this much)        — e.g. short spread
+      = 0 = net-zero structures (rare)
+    `qty` is the number of combos; each leg is scaled by its ratio.
+
+    Example — short put credit spread (sell 450P, buy 440P):
+      legs = [
+        OptionLeg(contract=P450, side=SELL, ratio=1),
+        OptionLeg(contract=P440, side=BUY,  ratio=1),
+      ]
+      qty = 1
+      net_limit = -0.85    # receive $85 per spread
+    """
+    legs: list                                     # list[OptionLeg]
+    qty: int
+    net_limit: float
+    tag: str = ""
+    tif: str = "DAY"
+    ts: float = field(default_factory=time.time)
+
+    @property
+    def is_credit(self) -> bool:
+        return self.net_limit < 0
+
+    @property
+    def is_debit(self) -> bool:
+        return self.net_limit > 0
+
+    @property
+    def max_loss_per_combo(self) -> float:
+        """Capital at risk per combo for a vertical spread.
+        For a credit spread: wing_width * 100 - credit_received.
+        For a debit spread:  debit_paid  * 100.
+        Returns 0 for non-vertical structures (strategy must compute its own).
+        """
+        if len(self.legs) != 2:
+            return 0.0
+        a, b = self.legs
+        if a.contract.right != b.contract.right:
+            return 0.0  # not a vertical — caller must compute
+        wing_width = abs(a.contract.strike - b.contract.strike)
+        if self.is_credit:
+            return wing_width * 100 - abs(self.net_limit) * 100
+        return abs(self.net_limit) * 100
+
+
 @dataclass
 class Position:
     symbol: str

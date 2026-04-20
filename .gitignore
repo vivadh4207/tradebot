@@ -58,3 +58,5 @@ KILL
 *.env [0-9]*
 * .env.example
 * .env.local
+_teabot_review/
+docs/expert_memo.md

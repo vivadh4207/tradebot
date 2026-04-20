@@ -68,4 +68,13 @@ class PositionSizer:
         if regime and self.regime_multipliers:
             mult = self.regime_multipliers.get(regime, 1.0)
             n = int(n * mult)
+        # Macro put/call OI risk switch — reads the state file written
+        # by scripts/fetch_putcall_oi.py. In "risk-off" periods this
+        # shrinks the final contract count (default 0.7x for 3 days
+        # after trigger). Safe no-op when the state file is missing.
+        try:
+            from .putcall_oi_switch import current_size_multiplier
+            n = int(n * current_size_multiplier())
+        except Exception:
+            pass
         return max(0, min(n, max_c))
