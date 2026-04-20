@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import queue
+import re
 import threading
 import urllib.request
 import urllib.error
@@ -27,6 +28,17 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from .base import Notifier
 
 _log = logging.getLogger(__name__)
+
+# structlog writes ANSI color codes even to files; Discord renders
+# them as garbage. Strip at the notifier boundary so every downstream
+# caller gets clean text whether it knew to strip or not.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _strip_ansi(s: Optional[str]) -> str:
+    if not s:
+        return ""
+    return _ANSI_RE.sub("", s)
 
 
 # Discord embed colors (integer RGB). Chosen to match a dark-mode theme
@@ -126,8 +138,15 @@ class WebhookNotifier(Notifier):
     def notify(self, text: str, *, level: str = "info", title: str = "",
                 meta: Optional[Dict[str, Any]] = None) -> None:
         """Queue a message for async delivery. Never blocks, never raises."""
+        # Strip any ANSI escapes the caller accidentally included (e.g.
+        # raw structlog output from a crash-alert tail).
+        clean_text = _strip_ansi(text)
+        clean_meta: Optional[Dict[str, Any]] = None
+        if meta:
+            clean_meta = {k: (_strip_ansi(v) if isinstance(v, str) else v)
+                          for k, v in meta.items()}
         payload: Tuple[str, str, str, Optional[Dict[str, Any]]] = (
-            text, level, title, meta,
+            clean_text, level, title, clean_meta,
         )
         try:
             self._q.put_nowait(payload)

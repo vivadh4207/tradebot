@@ -72,8 +72,15 @@ def _record_event(event: dict) -> None:
         pass  # best-effort
 
 
+# structlog writes colored output via ANSI escape codes even when
+# stderr is a file. Discord renders those codes as garbage like
+# "[32m[1minfo[0m", so we strip them before posting.
+_ANSI_RE = __import__("re").compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
 def _tail_stderr(n: int = 20) -> str:
-    """Grab the last `n` lines of the captured stderr file if present."""
+    """Grab the last `n` lines of the captured stderr file if present.
+    Strips ANSI color codes so the result is Discord-readable."""
     if not STDERR_CAPTURE.exists():
         return ""
     try:
@@ -83,7 +90,8 @@ def _tail_stderr(n: int = 20) -> str:
             block = min(size, 16 * 1024)
             f.seek(size - block)
             chunk = f.read().decode("utf-8", errors="replace")
-        return "\n".join(chunk.splitlines()[-n:])
+        clean = _ANSI_RE.sub("", chunk)
+        return "\n".join(clean.splitlines()[-n:])
     except Exception:
         return ""
 
