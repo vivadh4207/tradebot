@@ -81,8 +81,28 @@ class LSTMSignal(SignalSource):
 
     @staticmethod
     def _pick_device(torch):
+        """Device preference: CUDA > MPS (Apple Silicon) > CPU.
+
+        CUDA handles Jetson (aarch64 + NVIDIA). MPS accelerates Apple
+        Silicon Macs that don't expose CUDA. CPU is the universal
+        fallback — older Macs, Linux x86_64 without a GPU, CI runners.
+
+        Env overrides:
+          TRADEBOT_TORCH_DEVICE=cpu   — force CPU (useful for debugging)
+          TRADEBOT_TORCH_DEVICE=cuda  — fail loudly if CUDA missing
+          TRADEBOT_TORCH_DEVICE=mps   — likewise for MPS
+        """
+        import os as _os
+        forced = _os.getenv("TRADEBOT_TORCH_DEVICE", "").strip().lower()
+        if forced in ("cpu", "cuda", "mps"):
+            return torch.device(forced)
         if torch.cuda.is_available():
             return torch.device("cuda")
+        # MPS = Metal Performance Shaders backend on Apple Silicon. Guarded
+        # with getattr because older torch builds don't have the attribute.
+        mps_mod = getattr(torch.backends, "mps", None)
+        if mps_mod is not None and getattr(mps_mod, "is_available", lambda: False)():
+            return torch.device("mps")
         return torch.device("cpu")
 
     def emit(self, ctx: SignalContext) -> Optional[Signal]:

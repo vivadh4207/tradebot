@@ -34,6 +34,31 @@ DASHBOARD_LABEL="com.tradebot.dashboard"
 DASHBOARD_SRC_PLIST="$ROOT/deploy/launchd/${DASHBOARD_LABEL}.plist"
 DASHBOARD_INSTALLED_PLIST="$HOME/Library/LaunchAgents/${DASHBOARD_LABEL}.plist"
 
+# systemd user units (Linux / Jetson). Installed to ~/.config/systemd/user/
+# so no sudo is required. Works for Jetson + any headless Linux.
+SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+SYSTEMD_WATCHDOG_UNIT="tradebot-watchdog.service"
+SYSTEMD_DASHBOARD_UNIT="tradebot-dashboard.service"
+SYSTEMD_WATCHDOG_SRC="$ROOT/deploy/systemd/${SYSTEMD_WATCHDOG_UNIT}"
+SYSTEMD_DASHBOARD_SRC="$ROOT/deploy/systemd/${SYSTEMD_DASHBOARD_UNIT}"
+
+# Host OS — drives which supervisor we wire up.
+HOST_OS="$(uname -s)"
+
+_write_systemd_unit() {
+  # $1 = source template path ; $2 = installed path
+  # Rewrites __TRADEBOT_ROOT__ and __TRADEBOT_PY__ placeholders with the
+  # current checkout's paths. Both macOS (BSD awk) and Linux (GNU awk)
+  # accept this syntax.
+  awk -v new_root="$ROOT" -v new_py="$PY" '
+    {
+      gsub("__TRADEBOT_ROOT__", new_root);
+      gsub("__TRADEBOT_PY__", new_py);
+      print;
+    }
+  ' "$1" > "$2"
+}
+
 mkdir -p "$ROOT/logs"
 
 # .env is intentionally NOT sourced here. Shell parsing is fragile with
@@ -46,7 +71,43 @@ _is_running() {
   [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
 }
 
+# ----- supervisor detection -----------------------------------------------
+# If the watchdog is installed under launchd (macOS) or systemd --user
+# (Linux), start/stop/status MUST route through that supervisor rather
+# than spawning a second PID-file-tracked process alongside it. Otherwise
+# clicking "start" in the dashboard while the watchdog is running would
+# end up with two bots sharing the journal + double-filling paper.
+_active_supervisor() {
+  # Prints one of: "launchd" | "systemd" | "pid" (fallback)
+  if [[ "$HOST_OS" == "Darwin" && -f "$LAUNCHD_INSTALLED_PLIST" ]]; then
+    if launchctl list 2>/dev/null | awk '{print $3}' | grep -qx "$LAUNCHD_LABEL"; then
+      echo "launchd"; return
+    fi
+  fi
+  if [[ "$HOST_OS" == "Linux" && -f "$SYSTEMD_USER_DIR/$SYSTEMD_WATCHDOG_UNIT" ]]; then
+    if command -v systemctl >/dev/null 2>&1; then
+      echo "systemd"; return
+    fi
+  fi
+  echo "pid"
+}
+
 cmd_start() {
+  local sup; sup="$(_active_supervisor)"
+  case "$sup" in
+    launchd)
+      # launchd's KeepAlive wants the job loaded; `start` just kicks it
+      launchctl start "$LAUNCHD_LABEL" 2>/dev/null
+      echo "started via launchd ($LAUNCHD_LABEL)"
+      return 0 ;;
+    systemd)
+      if systemctl --user start "$SYSTEMD_WATCHDOG_UNIT"; then
+        echo "started via systemd ($SYSTEMD_WATCHDOG_UNIT)"
+        return 0
+      fi
+      echo "systemctl start failed"; return 1 ;;
+  esac
+  # --- PID-file fallback (no supervisor installed) ---
   if _is_running; then
     echo "already running (pid $(cat "$PID_FILE"))"
     return 0
@@ -66,11 +127,24 @@ cmd_start() {
 }
 
 cmd_stop() {
+  local sup; sup="$(_active_supervisor)"
+  case "$sup" in
+    launchd)
+      launchctl stop "$LAUNCHD_LABEL" 2>/dev/null
+      echo "stop sent to launchd ($LAUNCHD_LABEL)"
+      return 0 ;;
+    systemd)
+      if systemctl --user stop "$SYSTEMD_WATCHDOG_UNIT"; then
+        echo "stopped via systemd ($SYSTEMD_WATCHDOG_UNIT)"
+        return 0
+      fi
+      echo "systemctl stop failed"; return 1 ;;
+  esac
+  # --- PID-file fallback ---
   if _is_running; then
     local pid; pid="$(cat "$PID_FILE")"
     touch "$KILL_FILE"                    # cooperative shutdown signal
     kill "$pid" 2>/dev/null || true
-    # give it up to 10s to exit cleanly
     for _ in $(seq 1 10); do
       if ! kill -0 "$pid" 2>/dev/null; then break; fi
       sleep 1
@@ -88,6 +162,27 @@ cmd_stop() {
 }
 
 cmd_status() {
+  local sup; sup="$(_active_supervisor)"
+  case "$sup" in
+    launchd)
+      local entry; entry="$(launchctl list 2>/dev/null | awk -v l="$LAUNCHD_LABEL" '$3 == l')"
+      local pid; pid="$(awk '{print $1}' <<< "$entry")"
+      if [[ -n "$entry" && "$pid" != "-" ]]; then
+        echo "running (launchd pid=$pid)"
+      else
+        echo "stopped (launchd loaded, not running)"
+      fi
+      return 0 ;;
+    systemd)
+      if systemctl --user is-active "$SYSTEMD_WATCHDOG_UNIT" >/dev/null 2>&1; then
+        local pid; pid="$(systemctl --user show -p MainPID --value "$SYSTEMD_WATCHDOG_UNIT" 2>/dev/null)"
+        echo "running (systemd pid=$pid)"
+      else
+        echo "stopped (systemd inactive)"
+      fi
+      return 0 ;;
+  esac
+  # --- PID-file fallback ---
   if _is_running; then
     echo "running (pid $(cat "$PID_FILE"))"
   else
@@ -100,22 +195,70 @@ cmd_logs() {
   tail -f "$LOG_FILE"
 }
 
-# ----- launchd watchdog (macOS only) -------------------------------------
-# Install, uninstall, and inspect the com.tradebot.paper LaunchAgent. The
-# agent runs scripts/watchdog_run.py, which supervises run_paper.py.
+# ----- supervisor install/uninstall/status ------------------------------
+# macOS → launchd LaunchAgent.  Linux → systemd --user unit.  Both modes
+# wrap scripts/watchdog_run.py, which supervises run_paper.py. This makes
+# the same tradebotctl command work on a dev Mac and on a Jetson without
+# host-specific tweaks.
 cmd_watchdog_install() {
-  if [[ "$(uname)" != "Darwin" ]]; then
-    echo "watchdog-install is macOS-only (uses launchd). On Linux use systemd."
-    return 2
-  fi
+  case "$HOST_OS" in
+    Darwin) _watchdog_install_launchd ;;
+    Linux)  _watchdog_install_systemd ;;
+    *) echo "unsupported OS for watchdog-install: $HOST_OS"; return 2 ;;
+  esac
+}
+
+cmd_watchdog_uninstall() {
+  case "$HOST_OS" in
+    Darwin) _watchdog_uninstall_launchd ;;
+    Linux)  _watchdog_uninstall_systemd ;;
+    *) echo "unsupported OS for watchdog-uninstall: $HOST_OS"; return 2 ;;
+  esac
+}
+
+cmd_watchdog_status() {
+  case "$HOST_OS" in
+    Darwin) _watchdog_status_launchd ;;
+    Linux)  _watchdog_status_systemd ;;
+    *) echo "unsupported OS for watchdog-status: $HOST_OS"; return 2 ;;
+  esac
+  _print_heartbeat_age
+}
+
+cmd_dashboard_install() {
+  case "$HOST_OS" in
+    Darwin) _dashboard_install_launchd ;;
+    Linux)  _dashboard_install_systemd ;;
+    *) echo "unsupported OS for dashboard-install: $HOST_OS"; return 2 ;;
+  esac
+}
+
+cmd_dashboard_uninstall() {
+  case "$HOST_OS" in
+    Darwin) _dashboard_uninstall_launchd ;;
+    Linux)  _dashboard_uninstall_systemd ;;
+    *) echo "unsupported OS for dashboard-uninstall: $HOST_OS"; return 2 ;;
+  esac
+}
+
+cmd_dashboard_status() {
+  case "$HOST_OS" in
+    Darwin) _dashboard_status_launchd ;;
+    Linux)  _dashboard_status_systemd ;;
+    *) echo "unsupported OS for dashboard-status: $HOST_OS"; return 2 ;;
+  esac
+}
+
+# ----- macOS launchd helpers --------------------------------------------
+_watchdog_install_launchd() {
   if [[ ! -f "$LAUNCHD_SRC_PLIST" ]]; then
-    echo "source plist missing: $LAUNCHD_SRC_PLIST"
-    return 1
+    echo "source plist missing: $LAUNCHD_SRC_PLIST"; return 1
   fi
   mkdir -p "$(dirname "$LAUNCHD_INSTALLED_PLIST")"
-  # Rewrite the hardcoded path in the shipped plist to match this checkout.
-  # sed -i '' for BSD (macOS); temp file for portability.
-  tmp_plist="$(mktemp)"
+  # Rewrite the baked-in dev path to this checkout's path. macOS only
+  # needs this substitution; the template was authored on the original dev
+  # box.
+  local tmp_plist; tmp_plist="$(mktemp)"
   awk -v new_root="$ROOT" -v new_py="$PY" '
     {
       gsub("/Users/vivekadhikari/Documents/Claude/Projects/tradebot/.venv/bin/python", new_py);
@@ -124,7 +267,6 @@ cmd_watchdog_install() {
     }
   ' "$LAUNCHD_SRC_PLIST" > "$tmp_plist"
   mv "$tmp_plist" "$LAUNCHD_INSTALLED_PLIST"
-  # If a previous version is loaded, unload first so we pick up changes.
   launchctl unload "$LAUNCHD_INSTALLED_PLIST" 2>/dev/null || true
   if launchctl load "$LAUNCHD_INSTALLED_PLIST"; then
     echo "watchdog installed + loaded: $LAUNCHD_INSTALLED_PLIST"
@@ -136,11 +278,7 @@ cmd_watchdog_install() {
   fi
 }
 
-cmd_watchdog_uninstall() {
-  if [[ "$(uname)" != "Darwin" ]]; then
-    echo "watchdog-uninstall is macOS-only."
-    return 2
-  fi
+_watchdog_uninstall_launchd() {
   if [[ -f "$LAUNCHD_INSTALLED_PLIST" ]]; then
     launchctl unload "$LAUNCHD_INSTALLED_PLIST" 2>/dev/null || true
     rm -f "$LAUNCHD_INSTALLED_PLIST"
@@ -150,17 +288,29 @@ cmd_watchdog_uninstall() {
   fi
 }
 
-cmd_dashboard_install() {
-  if [[ "$(uname)" != "Darwin" ]]; then
-    echo "dashboard-install is macOS-only (uses launchd)."
-    return 2
+_watchdog_status_launchd() {
+  local entry; entry="$(launchctl list 2>/dev/null | awk -v l="$LAUNCHD_LABEL" '$3 == l')"
+  if [[ -z "$entry" ]]; then
+    echo "watchdog: not loaded (launchd)"
+    echo "install:  tradebotctl watchdog-install"
+    return 0
   fi
+  local pid status
+  pid="$(awk '{print $1}' <<< "$entry")"
+  status="$(awk '{print $2}' <<< "$entry")"
+  if [[ "$pid" == "-" ]]; then
+    echo "watchdog: loaded but not running (last exit=$status)"
+  else
+    echo "watchdog: running (pid=$pid, last exit=$status)"
+  fi
+}
+
+_dashboard_install_launchd() {
   if [[ ! -f "$DASHBOARD_SRC_PLIST" ]]; then
-    echo "source plist missing: $DASHBOARD_SRC_PLIST"
-    return 1
+    echo "source plist missing: $DASHBOARD_SRC_PLIST"; return 1
   fi
   mkdir -p "$(dirname "$DASHBOARD_INSTALLED_PLIST")"
-  tmp_plist="$(mktemp)"
+  local tmp_plist; tmp_plist="$(mktemp)"
   awk -v new_root="$ROOT" -v new_py="$PY" '
     {
       gsub("/Users/vivekadhikari/Documents/Claude/Projects/tradebot/.venv/bin/python", new_py);
@@ -173,19 +323,12 @@ cmd_dashboard_install() {
   if launchctl load "$DASHBOARD_INSTALLED_PLIST"; then
     echo "dashboard installed + loaded: $DASHBOARD_INSTALLED_PLIST"
     echo "access:   http://127.0.0.1:8000"
-    echo "status:   tradebotctl dashboard-status"
-    echo "logs:     tail -f $ROOT/logs/dashboard.out"
   else
-    echo "launchctl load failed — see logs/dashboard.err"
-    return 1
+    echo "launchctl load failed — see logs/dashboard.err"; return 1
   fi
 }
 
-cmd_dashboard_uninstall() {
-  if [[ "$(uname)" != "Darwin" ]]; then
-    echo "dashboard-uninstall is macOS-only."
-    return 2
-  fi
+_dashboard_uninstall_launchd() {
   if [[ -f "$DASHBOARD_INSTALLED_PLIST" ]]; then
     launchctl unload "$DASHBOARD_INSTALLED_PLIST" 2>/dev/null || true
     rm -f "$DASHBOARD_INSTALLED_PLIST"
@@ -195,14 +338,10 @@ cmd_dashboard_uninstall() {
   fi
 }
 
-cmd_dashboard_status() {
-  if [[ "$(uname)" != "Darwin" ]]; then
-    echo "dashboard-status is macOS-only."
-    return 2
-  fi
+_dashboard_status_launchd() {
   local entry; entry="$(launchctl list 2>/dev/null | awk -v l="$DASHBOARD_LABEL" '$3 == l')"
   if [[ -z "$entry" ]]; then
-    echo "dashboard: not loaded"
+    echo "dashboard: not loaded (launchd)"
     echo "install:  tradebotctl dashboard-install"
     return 0
   fi
@@ -217,29 +356,96 @@ cmd_dashboard_status() {
   fi
 }
 
-cmd_watchdog_status() {
-  if [[ "$(uname)" != "Darwin" ]]; then
-    echo "watchdog-status is macOS-only."
-    return 2
+# ----- Linux systemd --user helpers -------------------------------------
+# No sudo required. Units live in ~/.config/systemd/user/. To survive
+# logout (e.g. when SSH-ing into a Jetson), enable linger once per user:
+#   sudo loginctl enable-linger $USER
+_require_systemctl() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "systemctl not found — Linux install needs systemd."; return 1
   fi
-  local entry; entry="$(launchctl list 2>/dev/null | awk -v l="$LAUNCHD_LABEL" '$3 == l')"
-  if [[ -z "$entry" ]]; then
-    echo "watchdog: not loaded"
+}
+
+_watchdog_install_systemd() {
+  _require_systemctl || return 1
+  if [[ ! -f "$SYSTEMD_WATCHDOG_SRC" ]]; then
+    echo "source unit missing: $SYSTEMD_WATCHDOG_SRC"; return 1
+  fi
+  mkdir -p "$SYSTEMD_USER_DIR"
+  _write_systemd_unit "$SYSTEMD_WATCHDOG_SRC" "$SYSTEMD_USER_DIR/$SYSTEMD_WATCHDOG_UNIT"
+  systemctl --user daemon-reload
+  if systemctl --user enable --now "$SYSTEMD_WATCHDOG_UNIT"; then
+    echo "watchdog installed + started: $SYSTEMD_USER_DIR/$SYSTEMD_WATCHDOG_UNIT"
+    echo "check:    tradebotctl watchdog-status"
+    echo "logs:     journalctl --user -u $SYSTEMD_WATCHDOG_UNIT -f"
+    echo "linger:   sudo loginctl enable-linger \$USER   # survive logout"
+  else
+    echo "systemctl --user enable failed"; return 1
+  fi
+}
+
+_watchdog_uninstall_systemd() {
+  _require_systemctl || return 1
+  systemctl --user disable --now "$SYSTEMD_WATCHDOG_UNIT" 2>/dev/null || true
+  rm -f "$SYSTEMD_USER_DIR/$SYSTEMD_WATCHDOG_UNIT"
+  systemctl --user daemon-reload
+  echo "watchdog unloaded + removed"
+}
+
+_watchdog_status_systemd() {
+  _require_systemctl || return 1
+  if [[ ! -f "$SYSTEMD_USER_DIR/$SYSTEMD_WATCHDOG_UNIT" ]]; then
+    echo "watchdog: not installed (systemd user)"
     echo "install:  tradebotctl watchdog-install"
     return 0
   fi
-  # columns: PID STATUS LABEL
-  local pid status
-  pid="$(awk '{print $1}' <<< "$entry")"
-  status="$(awk '{print $2}' <<< "$entry")"
-  if [[ "$pid" == "-" ]]; then
-    echo "watchdog: loaded but not running (last exit=$status)"
-  else
-    echo "watchdog: running (pid=$pid, last exit=$status)"
+  local active; active="$(systemctl --user is-active "$SYSTEMD_WATCHDOG_UNIT" 2>/dev/null || echo "inactive")"
+  local pid; pid="$(systemctl --user show -p MainPID --value "$SYSTEMD_WATCHDOG_UNIT" 2>/dev/null)"
+  echo "watchdog: $active (pid=${pid:-0})"
+}
+
+_dashboard_install_systemd() {
+  _require_systemctl || return 1
+  if [[ ! -f "$SYSTEMD_DASHBOARD_SRC" ]]; then
+    echo "source unit missing: $SYSTEMD_DASHBOARD_SRC"; return 1
   fi
-  # Heartbeat freshness — tells you if the child is alive, not just the wrapper.
+  mkdir -p "$SYSTEMD_USER_DIR"
+  _write_systemd_unit "$SYSTEMD_DASHBOARD_SRC" "$SYSTEMD_USER_DIR/$SYSTEMD_DASHBOARD_UNIT"
+  systemctl --user daemon-reload
+  if systemctl --user enable --now "$SYSTEMD_DASHBOARD_UNIT"; then
+    echo "dashboard installed + started: $SYSTEMD_USER_DIR/$SYSTEMD_DASHBOARD_UNIT"
+    echo "access:   http://127.0.0.1:8000"
+    echo "logs:     journalctl --user -u $SYSTEMD_DASHBOARD_UNIT -f"
+  else
+    echo "systemctl --user enable failed"; return 1
+  fi
+}
+
+_dashboard_uninstall_systemd() {
+  _require_systemctl || return 1
+  systemctl --user disable --now "$SYSTEMD_DASHBOARD_UNIT" 2>/dev/null || true
+  rm -f "$SYSTEMD_USER_DIR/$SYSTEMD_DASHBOARD_UNIT"
+  systemctl --user daemon-reload
+  echo "dashboard unloaded + removed"
+}
+
+_dashboard_status_systemd() {
+  _require_systemctl || return 1
+  if [[ ! -f "$SYSTEMD_USER_DIR/$SYSTEMD_DASHBOARD_UNIT" ]]; then
+    echo "dashboard: not installed (systemd user)"
+    echo "install:  tradebotctl dashboard-install"
+    return 0
+  fi
+  local active; active="$(systemctl --user is-active "$SYSTEMD_DASHBOARD_UNIT" 2>/dev/null || echo "inactive")"
+  local pid; pid="$(systemctl --user show -p MainPID --value "$SYSTEMD_DASHBOARD_UNIT" 2>/dev/null)"
+  echo "dashboard: $active (pid=${pid:-0})"
+  echo "open:      http://127.0.0.1:8000"
+}
+
+# Heartbeat freshness + last watchdog event. OS-agnostic — just reads
+# logs/heartbeat.txt and logs/watchdog_events.jsonl.
+_print_heartbeat_age() {
   if [[ -f "$ROOT/logs/heartbeat.txt" ]]; then
-    # portable stat: macOS uses -f, Linux -c
     local hb_mtime now age
     hb_mtime="$(stat -f %m "$ROOT/logs/heartbeat.txt" 2>/dev/null || stat -c %Y "$ROOT/logs/heartbeat.txt" 2>/dev/null)"
     now="$(date +%s)"
@@ -248,7 +454,6 @@ cmd_watchdog_status() {
   else
     echo "heartbeat: (never written yet)"
   fi
-  # Last event from the watchdog's own log
   if [[ -f "$ROOT/logs/watchdog_events.jsonl" ]]; then
     echo "last event:"
     tail -n 1 "$ROOT/logs/watchdog_events.jsonl"
@@ -286,19 +491,31 @@ case "${1:-}" in
   dashboard-status)    cmd_dashboard_status ;;
   wipe-journal)       shift; "$PY" "$ROOT/scripts/wipe_journal.py" "$@" ;;
   reset-paper)        shift; "$PY" "$ROOT/scripts/reset_paper.py" "$@" ;;
+  doctor)             exec /usr/bin/env bash "$ROOT/scripts/doctor.sh" ;;
+  walkforward)        shift; "$PY" "$ROOT/scripts/nightly_walkforward_report.py" "$@" ;;
+  putcall-oi)         shift; "$PY" "$ROOT/scripts/fetch_putcall_oi.py" "$@" ;;
+  migrate-to-sqlite)  shift; "$PY" "$ROOT/scripts/migrate_cockroach_to_sqlite.py" "$@" ;;
   *)
     cat <<EOF
 usage: $(basename "$0") {start|stop|restart|status|logs|backtest|priors|walkforward|dashboard|testdb|
                         watchdog-install|watchdog-uninstall|watchdog-status|
                         dashboard-install|dashboard-uninstall|dashboard-status|
-                        wipe-journal}
+                        wipe-journal|reset-paper}
 
-The watchdog-* / dashboard-* subcommands are macOS-only; they manage
-launchd agents. watchdog supervises the bot; dashboard supervises the
+The watchdog-* / dashboard-* subcommands auto-detect the OS:
+  macOS  → install as launchd LaunchAgents (~/Library/LaunchAgents/)
+  Linux  → install as systemd --user units (~/.config/systemd/user/)
+
+watchdog supervises scripts/run_paper.py; dashboard supervises the
 FastAPI read-only UI on http://127.0.0.1:8000.
 
+On Linux/Jetson, survive logout with:
+  sudo loginctl enable-linger \$USER
+
 Environment:
-  TRADEBOT_PY   override python interpreter (default: \$ROOT/.venv/bin/python)
+  TRADEBOT_PY             override python interpreter (default: \$ROOT/.venv/bin/python)
+  TRADEBOT_TORCH_DEVICE   force LSTM device: cpu|cuda|mps (default: auto-detect)
+  TRADEBOT_DASHBOARD_CONTROLS  set to 1 to enable start/stop buttons in the dashboard UI
 EOF
     exit 2
     ;;
