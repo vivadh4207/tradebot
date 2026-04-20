@@ -493,6 +493,7 @@ case "${1:-}" in
   doctor)             exec /usr/bin/env bash "$ROOT/scripts/doctor.sh" ;;
   walkforward)        shift; "$PY" "$ROOT/scripts/nightly_walkforward_report.py" "$@" ;;
   putcall-oi)         shift; "$PY" "$ROOT/scripts/fetch_putcall_oi.py" "$@" ;;
+  strategy-audit)     shift; "$PY" "$ROOT/scripts/run_strategy_audit.py" "$@" ;;
   *)
     cat <<EOF
 usage: $(basename "$0") {start|stop|restart|status|logs|backtest|priors|walkforward|dashboard|testdb|

@@ -373,5 +373,50 @@ putcall_oi:
   risk_off_duration_days: 3
   risk_off_size_multiplier: 0.70
 
+# ===== Local LLM layer (Jetson) =====
+# Two LLMs, each with a specific role:
+#
+#   llm_brain        — 8B model, runs on every entry as a review/synthesis
+#                       layer AFTER the rule-based signals decide. Soft mode
+#                       (default): can scale confidence up/down within
+#                       [min_clamp, max_clamp]. Hard mode: can veto.
+#                       Latency-sensitive, rate-limited, cached.
+#
+#   strategy_auditor — 70B model, runs nightly (cron) + on demand (dashboard
+#                       button). Reviews the WHOLE setup — settings, recent
+#                       trade journal, market state — and returns an
+#                       overall-health score + prioritized issues list.
+#                       Never in the hot path; too slow (~3-6 tok/sec).
+#
+# Both models live on the SD card under $TRADEBOT_DATA_ROOT/models/.
+# Both are OFF by default — flip `enabled: true` after
+# scripts/jetson_bootstrap.sh has downloaded the GGUF files.
+llm_brain:
+  enabled: false
+  model_name: llama-3.1-8b-q4
+  # model_path auto-resolves to data_root/models/llama-3.1-8b-q4.gguf if empty
+  model_path: ""
+  hard_gate: false                  # true → LLM can veto. Audit soft-mode first.
+  rate_limit_sec_per_symbol: 30.0
+  cache_ttl_sec: 20.0
+  max_tokens: 180
+  temperature: 0.1
+  min_clamp: 0.30                   # confidence_multiplier floor
+  max_clamp: 1.30                   # confidence_multiplier ceiling
+  timeout_sec: 3.0
+  n_ctx: 2048
+  n_gpu_layers: -1                  # all layers on GPU (Jetson CUDA)
+
+strategy_auditor:
+  # model_path auto-resolves to data_root/models/llama-3.1-70b-q4.gguf if empty
+  model_path: ""
+  model_name: llama-3.1-70b-q4
+  n_ctx: 4096
+  n_gpu_layers: -1
+  max_tokens: 900
+  temperature: 0.15
+  log_path: logs/strategy_audit.jsonl
+  trade_lookback_days: 14
+
 # ===== Live trading master switch =====
 live_trading: false       # Must be true AND broker != paper to route real orders

@@ -404,6 +404,36 @@ def signal_audit_tail(limit: int = Query(100, ge=1, le=2000)):
     return {"entries": read_tail(limit)}
 
 
+@app.get("/api/llm_brain_tail", response_class=JSONResponse)
+def llm_brain_tail(limit: int = Query(50, ge=1, le=500)):
+    """Most recent LLM brain reviews from the signal_audit log. Filters
+    down to source='llm_brain'."""
+    from src.core.signal_audit import read_tail
+    all_entries = read_tail(limit * 20)   # oversample, then filter
+    brain = [e for e in all_entries if e.get("source") == "llm_brain"]
+    return {"entries": brain[-limit:]}
+
+
+@app.get("/api/strategy_audit", response_class=JSONResponse)
+def strategy_audit_tail(limit: int = Query(20, ge=1, le=200)):
+    """Most recent strategy-audit reports from the 70B auditor."""
+    from src.intelligence.strategy_auditor import read_recent_audits
+    return {"reports": read_recent_audits(limit)}
+
+
+@app.post("/api/bot/strategy_audit", response_class=JSONResponse)
+def run_strategy_audit():
+    """On-demand strategy audit. Kicks off the 70B run synchronously;
+    the endpoint can take 30-120s depending on GPU + context size."""
+    if not _dashboard_controls_enabled():
+        return JSONResponse(
+            status_code=403,
+            content={"ok": False, "error":
+                     "dashboard controls disabled — set TRADEBOT_DASHBOARD_CONTROLS=1 in .env"},
+        )
+    return _run_ctl("strategy-audit", timeout=300.0)
+
+
 @app.get("/api/logs_tail", response_class=JSONResponse)
 def logs_tail(lines: int = Query(200, ge=10, le=5000),
                grep: str = Query("", max_length=256)):
@@ -630,6 +660,7 @@ def _run_ctl(action: str, timeout: float = 25.0,
         "start", "stop", "restart", "status",
         "wipe-journal", "reset-paper",
         "walkforward", "putcall-oi", "doctor",
+        "strategy-audit",
     }
     if action not in allowed:
         return {"ok": False, "error": f"action not allowed: {action}"}
@@ -895,8 +926,27 @@ _INDEX_HTML = """<!DOCTYPE html>
   <button id="ctl-walkforward" class="ctl-btn" disabled>run walkforward</button>
   <button id="ctl-riskswitch"  class="ctl-btn" disabled>refresh risk switch</button>
   <button id="ctl-reset"       class="ctl-btn stop" disabled>reset paper</button>
+  <span style="width: 18px;"></span>
+  <span class="label">LLM</span>
+  <button id="ctl-audit"       class="ctl-btn" disabled>run 70B audit</button>
   <span id="ctl-msg" class="ctl-msg"></span>
 </div>
+
+<h2>strategy audit &nbsp;·&nbsp; <span class="mut">70B LLM review of the whole setup</span></h2>
+<div class="card" id="audit-latest">
+  <div class="mut" style="font-size:12px;">No audits yet — click "run 70B audit" above, or wait for the nightly cron.</div>
+</div>
+<div class="card" style="margin-top:8px;">
+  <div class="mut" style="margin-bottom:6px;font-size:12px;">recent audits</div>
+  <table id="audit-history"><thead><tr>
+    <th>time</th><th>health</th><th>issues</th><th>summary</th>
+  </tr></thead><tbody></tbody></table>
+</div>
+
+<h2>LLM brain reviews &nbsp;·&nbsp; <span class="mut">per-trade 8B sanity check</span></h2>
+<div class="card"><table id="brain-tail"><thead><tr>
+  <th>time</th><th>symbol</th><th>action</th><th>mult</th><th>latency</th><th>cached</th><th>reason</th>
+</tr></thead><tbody></tbody></table></div>
 
 <h2>health</h2>
 <div class="grid" id="health"></div>
@@ -1400,6 +1450,7 @@ setInterval(refreshLogs, 15000);
 const CTL_BTN_IDS = [
   'ctl-start', 'ctl-stop', 'ctl-restart',
   'ctl-walkforward', 'ctl-riskswitch', 'ctl-reset',
+  'ctl-audit',
 ];
 async function refreshBotStatus() {
   const stateEl = document.getElementById('ctl-state');
@@ -1410,6 +1461,7 @@ async function refreshBotStatus() {
   const walk    = document.getElementById('ctl-walkforward');
   const risk    = document.getElementById('ctl-riskswitch');
   const reset   = document.getElementById('ctl-reset');
+  const audit   = document.getElementById('ctl-audit');
   try {
     const r = await fetch('/api/bot/status').then(r=>r.json());
     const running = r.state === 'running';
@@ -1429,6 +1481,7 @@ async function refreshBotStatus() {
     walk.disabled = false;
     risk.disabled = false;
     reset.disabled = false;
+    audit.disabled = false;
     msgEl.textContent = '';
   } catch (e) {
     stateEl.className = 'ctl-state unknown';
@@ -1466,8 +1519,106 @@ document.getElementById('ctl-reset').addEventListener('click',
   () => botAction('reset_paper',
     'DANGEROUS: flattens all Alpaca paper positions AND truncates the trade journal. This is irreversible.\\n\\nContinue?',
     'resetting paper account (this takes ~30s)…'));
+document.getElementById('ctl-audit').addEventListener('click',
+  () => botAction('strategy_audit', null,
+    'running 70B strategy audit (this takes 30-120s)…'));
 refreshBotStatus();
 setInterval(refreshBotStatus, 10000);
+
+// ---- strategy audit panels ----
+async function refreshAuditPanels() {
+  try {
+    const r = await fetch('/api/strategy_audit?limit=20').then(r=>r.json());
+    const reports = (r && r.reports) || [];
+    const latestCard = document.getElementById('audit-latest');
+    const histTbody = document.querySelector('#audit-history tbody');
+    if (reports.length === 0) {
+      latestCard.innerHTML = '<div class="mut" style="font-size:12px;">No audits yet — click "run 70B audit" above, or wait for the nightly cron.</div>';
+      histTbody.innerHTML = '';
+      return;
+    }
+    const latest = reports[0];
+    const cls = latest.overall_health >= 80 ? 'pos' :
+                latest.overall_health >= 50 ? 'mut' : 'neg';
+    let issuesHtml = '';
+    (latest.issues || []).slice(0, 5).forEach(i => {
+      const sevColor = i.severity === 'high' ? '#fca5a5' :
+                        i.severity === 'medium' ? '#f2c46b' : '#9aa3c7';
+      issuesHtml += `<div style="margin:6px 0;padding:6px 8px;background:#141a33;border-left:3px solid ${sevColor};border-radius:4px;">`
+                  + `<div style="font-size:11px;color:${sevColor};text-transform:uppercase;">${i.severity} · ${i.area}</div>`
+                  + `<div style="font-size:13px;margin-top:2px;">${(i.detail||'').replace(/</g,'&lt;')}</div>`
+                  + (i.fix ? `<div style="font-size:12px;margin-top:3px;color:#6ee7b7;">Fix: ${(i.fix||'').replace(/</g,'&lt;')}</div>` : '')
+                  + `</div>`;
+    });
+    let strengthsHtml = '';
+    (latest.strengths || []).forEach(s => {
+      strengthsHtml += `<span class="chip" style="margin:2px;">${(s||'').replace(/</g,'&lt;')}</span>`;
+    });
+    latestCard.innerHTML =
+      `<div style="display:flex;align-items:baseline;gap:12px;">`+
+        `<div class="v" style="font-size:32px;font-weight:600;" class="${cls}">${latest.overall_health}<span style="font-size:14px;color:#9aa3c7;">/100</span></div>`+
+        `<div class="mut" style="font-size:12px;">${(latest.ts||'').replace('T',' ').slice(0,19)} · ${latest.model} · ${latest.latency_sec}s</div>`+
+      `</div>`+
+      `<div style="margin-top:6px;font-size:14px;">${(latest.summary||'').replace(/</g,'&lt;')}</div>`+
+      (issuesHtml ? `<div style="margin-top:10px;"><div class="mut" style="font-size:11px;text-transform:uppercase;">issues</div>${issuesHtml}</div>` : '')+
+      (strengthsHtml ? `<div style="margin-top:10px;"><div class="mut" style="font-size:11px;text-transform:uppercase;">strengths</div><div style="margin-top:4px;">${strengthsHtml}</div></div>` : '');
+    histTbody.innerHTML = '';
+    reports.slice(0, 20).forEach(rep => {
+      const c = rep.overall_health >= 80 ? 'pos' :
+                 rep.overall_health >= 50 ? 'mut' : 'neg';
+      const nIssues = (rep.issues||[]).length;
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        `<td class="mut">${(rep.ts||'').replace('T',' ').slice(0,19)}</td>`+
+        `<td class="${c}">${rep.overall_health}</td>`+
+        `<td>${nIssues}</td>`+
+        `<td class="mut">${(rep.summary||'').substring(0,120)}</td>`;
+      histTbody.appendChild(tr);
+    });
+  } catch (e) {
+    // silent — no audits is a normal state
+  }
+}
+
+// ---- LLM brain tail ----
+async function refreshBrainTail() {
+  try {
+    const r = await fetch('/api/llm_brain_tail?limit=40').then(r=>r.json());
+    const tbody = document.querySelector('#brain-tail tbody');
+    tbody.innerHTML = '';
+    const entries = (r && r.entries) || [];
+    if (entries.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="7" class="mut">No LLM reviews yet. Enable with LLM_BRAIN_ENABLED=1 + TRADEBOT_SIGNAL_AUDIT=1 and restart the bot.</td></tr>';
+      return;
+    }
+    entries.slice().reverse().forEach(e => {
+      const meta = e.meta || {};
+      const action = meta.action || '?';
+      const cls = action === 'veto' ? 'neg' :
+                   action === 'confirm' ? 'pos' : 'mut';
+      const mult = e.confidence != null ? Number(e.confidence).toFixed(2)+'x' : '—';
+      const cached = meta.from_cache ? '✓' : '';
+      const latency = meta.latency_ms != null ? meta.latency_ms + 'ms' : '—';
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        `<td class="mut">${(e.ts||'').replace('T',' ').slice(0,19)}</td>`+
+        `<td>${e.symbol||'—'}</td>`+
+        `<td class="${cls}">${action}</td>`+
+        `<td>${mult}</td>`+
+        `<td class="mut">${latency}</td>`+
+        `<td class="mut">${cached}</td>`+
+        `<td class="mut">${(e.rationale||'').replace(/</g,'&lt;')}</td>`;
+      tbody.appendChild(tr);
+    });
+  } catch (e) {
+    // silent
+  }
+}
+
+refreshAuditPanels();
+refreshBrainTail();
+setInterval(refreshAuditPanels, 60000);
+setInterval(refreshBrainTail, 15000);
 </script>
 </body></html>
 """

@@ -1,107 +1,50 @@
 # Storage — Trade Journal
 
+## Backend
+
+**Local SQLite file, zero setup.** Previous versions supported
+CockroachDB as a second backend; it was removed because the bot's write
+frequency (ensemble decisions + LSTM predictions + equity ticks + fills
+per symbol per loop tick) outran Cockroach Serverless's free-tier
+request-unit cap within about two weeks of live paper trading. SQLite
+on local disk handles 10k+ writes/sec — well past anything the bot can
+generate — and has no cloud-cost surface.
+
 ## What gets persisted
 
-Three tables, defined in `src/storage/schema.sql`:
+Defined in `src/storage/schema.sql`:
 
 - **`fills`** — every raw broker fill (buy/sell, qty, price, fee, tag).
 - **`trades`** — realized round-trips (entry + exit collapsed), with `pnl`,
   `pnl_pct`, `entry_tag`, `exit_reason`. This is what `compute_priors.py`
   reads.
-- **`equity_curve`** — per-tick snapshots of equity, cash, and intraday P&L.
+- **`equity_curve`** — per-tick snapshots of equity, cash, intraday P&L.
+- **`ml_predictions`** — every LSTM inference for post-hoc calibration.
+- **`ensemble_decisions`** — every regime-weighted decision emit/block.
 
-All timestamps are stored as UTC.
+All timestamps stored as UTC.
 
-## Backends
-
-Same `TradeJournal` interface; pick a backend by config.
-
-### SQLite (default)
-
-Zero setup. File-backed. Ideal for paper trading on a laptop.
+## Config
 
 ```yaml
 # config/settings.yaml
 storage:
-  backend: sqlite
   sqlite_path: logs/tradebot.sqlite
 ```
 
-### CockroachDB (recommended for long-term / multi-machine / production)
-
-Postgres-wire-compatible. Works identically with plain Postgres, Neon, or Supabase.
-
-**You have two options for connecting. Pick one.**
-
-#### Option A — full connection string (simplest, recommended)
-
-In CockroachDB Cloud Console → **Connect → General connection string** → copy
-the entire `postgresql://...` line. That single string contains
-`host + port + user + password + database + sslmode` — nothing else needed.
-
-Paste it into your `.env`:
-
-```
-COCKROACH_DSN=postgresql://user:password@host:26257/defaultdb?sslmode=verify-full
-```
-
-Leave every `COCKROACH_HOST` / `COCKROACH_USER` / `COCKROACH_PASSWORD` line
-alone; they are ignored when `COCKROACH_DSN` is set.
-
-#### Option B — individual fields
-
-If you don't have the one-line DSN, fill the parts and the bot assembles the
-DSN for you:
-
-```
-COCKROACH_DSN=
-COCKROACH_HOST=your-cluster-host.cockroachlabs.cloud
-COCKROACH_PORT=26257
-COCKROACH_USER=your-sql-user
-COCKROACH_PASSWORD=your-sql-password
-COCKROACH_DATABASE=tradebot
-COCKROACH_SSLMODE=verify-full
-# Optional, only if your cluster requires a CA cert:
-COCKROACH_SSLROOTCERT=
-# Optional, multi-tenant Serverless routing:
-COCKROACH_CLUSTER=
-```
-
-#### Common final steps
-
-1. Switch the backend in `config/settings.yaml`:
-   ```yaml
-   storage:
-     backend: cockroach
-     cockroach_dsn_env: COCKROACH_DSN
-   ```
-2. Install the driver:
-   ```bash
-   pip install 'psycopg[binary]'
-   ```
-3. Verify before running the bot:
-   ```bash
-   python scripts/test_db_connection.py
-   ```
-   You should see `[connect] ok`, `[schema] ok`, and three table row counts
-   (all zero on first run). The password is redacted in the printed DSN so
-   logs stay safe.
-
-Schema initialization happens automatically on first connection via
-`journal.init_schema()` — tables are created idempotently (`IF NOT EXISTS`).
+On Jetson with SD-card data root set (`TRADEBOT_DATA_ROOT=/media/orin/tradebot-data`),
+the SQLite file lives under the SD card instead of the repo `logs/`. See
+`docs/jetson_plug_and_play.md` for the one-command setup.
 
 ## Computing priors from the journal
 
 ```bash
-# default: SQLite, last 90 days, all symbols
-python scripts/compute_priors.py
-
-# CockroachDB, last 30 days, SPY only, require 50+ trades
-python scripts/compute_priors.py --backend cockroach --days 30 --symbol SPY --min-trades 50
+python scripts/compute_priors.py               # last 90 days, all symbols
+python scripts/compute_priors.py --days 30 --symbol SPY --min-trades 50
 ```
 
-Output is both a human-readable summary and a paste-ready YAML block. Keep
-a running note of how priors evolve — large swings month-over-month mean
+Output is a human-readable summary plus a paste-ready YAML block. Keep a
+running note of how priors evolve — large swings month-over-month mean
 your sample is too small for Kelly to trust.
 
 ## Wiring the journal into the bot
@@ -110,24 +53,32 @@ your sample is too small for Kelly to trust.
 from src.storage.journal import build_journal
 from src.brokers.paper import PaperBroker
 
-journal = build_journal(
-    backend="sqlite",                     # or "cockroach"
-    sqlite_path="logs/tradebot.sqlite",
-)
+journal = build_journal(sqlite_path="logs/tradebot.sqlite")
 broker = PaperBroker(starting_equity=10_000, journal=journal)
 ```
 
-The broker logs **every** fill and **every** realized round-trip
-automatically. If the journal raises, the trade loop keeps running — we
-never let logging kill the bot.
+The broker logs every fill and every realized round-trip automatically.
+If the journal write fails, the trade loop keeps running — logging never
+kills the bot, but failures DO alert via `issue_reporter.report_issue`
+so silent data loss is impossible.
 
 ## Operational notes
 
-- SQLite writes with `PRAGMA journal_mode=WAL;` so reads don't block
-  writes. Safe for a single-process bot.
-- Don't point two bot instances at the same SQLite file; use CockroachDB
-  if you want to run multiple instances.
-- Back up `logs/tradebot.sqlite` daily if you're using SQLite. For
-  CockroachDB the cluster handles durability + backups.
-- Never put the DSN in `.env.example` or any file that ships to git.
-  Real values live only in `.env` which is `.gitignore`'d.
+- SQLite uses `PRAGMA journal_mode=WAL;` so reads don't block writes.
+  Safe for a single-process bot.
+- Don't point two bot instances at the same SQLite file.
+- Back up the SQLite file daily. On Jetson: `cp logs/tradebot.sqlite
+  logs/tradebot.$(date +%Y%m%d).sqlite.bak` in a nightly cron.
+- Never put any secret in `.env.example`. Real values live in `.env`,
+  which is gitignored.
+
+## Wiping the journal
+
+```bash
+bash scripts/tradebotctl.sh wipe-journal
+# requires typed DESTROY confirmation
+```
+
+Clears every table + slippage-calibration history + broker-state
+snapshot. Preserves `tradebot.out` / `tradebot.err` log files so you
+still have the process log.

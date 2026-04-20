@@ -143,9 +143,12 @@ Minimum things to set:
 
 - `ALPACA_API_KEY_ID` / `ALPACA_API_SECRET_KEY` (your paper-trading keys)
 - `ALPACA_BASE_URL=https://paper-api.alpaca.markets`
-- `COCKROACH_DSN=postgresql://...` (same DSN you used on the Mac — the cluster can be shared)
 - At least one Discord webhook (pick any of `DISCORD_WEBHOOK_URL`, `_TRADES`, `_ALERTS`, `_REASON`)
 - `LIVE_TRADING=false` (leave it false until you've run paper for at least 30 days)
+
+Storage is local SQLite; no database credential needed. The journal
+lives at `$TRADEBOT_DATA_ROOT/logs/tradebot.sqlite` (default:
+`logs/tradebot.sqlite` under the repo).
 
 The setup script already appended the LLM block (`LLM_MODEL_PATH=...`) for you.
 

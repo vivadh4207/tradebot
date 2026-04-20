@@ -143,15 +143,23 @@ def _build_news_sentiment(settings: Settings) -> Optional[CachedNewsSentiment]:
 
 
 def _build_journal_from_settings(settings: Settings) -> Optional[TradeJournal]:
-    """Build the local SQLite journal. Path redirectable via
-    TRADEBOT_SANDBOX_LOGS (used by tests)."""
+    """Build the local SQLite journal.
+
+    Path resolution priority:
+      1. TRADEBOT_SANDBOX_LOGS (used by tests — tmp dir)
+      2. TRADEBOT_DATA_ROOT + storage.sqlite_path (Jetson SD-card mode)
+      3. Repo-root + storage.sqlite_path (default laptop install)
+    """
+    from .core.data_paths import data_path
     sqlite_path = settings.get("storage.sqlite_path", "logs/tradebot.sqlite")
     _sandbox = os.getenv("TRADEBOT_SANDBOX_LOGS", "").strip()
     if _sandbox:
-        sqlite_path = os.path.join(_sandbox, "tradebot.sqlite")
+        resolved = os.path.join(_sandbox, "tradebot.sqlite")
+    else:
+        resolved = str(data_path(sqlite_path))
     try:
-        j = build_journal(sqlite_path=sqlite_path)
-        log.info("journal", backend="sqlite", path=sqlite_path)
+        j = build_journal(sqlite_path=resolved)
+        log.info("journal", backend="sqlite", path=resolved)
         return j
     except Exception as e:
         log.warning("journal_init_failed_fallback_to_none", err=str(e))
@@ -598,6 +606,26 @@ class TradeBot:
             log.info("credit_spreads_enabled",
                      weekly=bool(self.weekly_cs_runner),
                      zero_dte=bool(self.zero_dte_cs_runner))
+        # --- LLM brain (review layer, 8B on SD card) ---
+        # Gets a compact structured summary of what the rule-based
+        # signals concluded, returns {action, confidence_multiplier,
+        # reason}. Soft mode (default): can only scale confidence.
+        # Hard mode (opt-in): can veto. Off entirely when enabled=false.
+        try:
+            from .intelligence.llm_brain import build_llm_brain_from_settings
+            self.llm_brain = build_llm_brain_from_settings(settings)
+            if self.llm_brain is not None:
+                log.info("llm_brain_enabled hard_gate=%s",
+                          self.llm_brain.cfg.hard_gate)
+        except Exception as e:
+            log.warning("llm_brain_init_failed err=%s", e)
+            self.llm_brain = None
+
+        # --- Strategy auditor (70B on SD card, offline) ---
+        # Not constructed in __init__ — it's triggered on demand by a
+        # dashboard button + nightly cron so it doesn't compete for
+        # GPU with the review brain during market hours.
+
         if settings.get("ml.lstm_enabled", True):
             lstm = LSTMSignal(
                 checkpoint_path=settings.get("ml.lstm_checkpoint",
@@ -1401,6 +1429,88 @@ class TradeBot:
                 log.warning("news_sentiment_error", symbol=sig.symbol, err=str(e))
         econ_blackout = self.econ_calendar.in_blackout(bars[-1].ts, symbol=sig.symbol)
         vix_now = self.vix_probe.value()
+
+        # --- LLM brain review ---
+        # Runs BEFORE the filter chain so if the brain vetoes (hard mode)
+        # or scales confidence below threshold, we skip the rest of the
+        # work. Gets a compact structured summary, not raw bars. Always
+        # fail-open — an LLM outage or malformed JSON returns 1.0x so
+        # the rule-based decision passes through unchanged.
+        if self.llm_brain is not None:
+            try:
+                from .intelligence.llm_brain import (
+                    CandidateDecision, ReviewContext,
+                )
+                from .core.signal_audit import log_emit
+                breadth_snap = (self.breadth_probe.snapshot()
+                                 if self.breadth_probe is not None else None)
+                rsi_val = None
+                try:
+                    from .signals.credit_spread_runner import _rsi as _rsi_fn
+                    closes = [b.close for b in bars]
+                    rsi_val = _rsi_fn(closes, 14)
+                except Exception:
+                    pass
+                move5 = None
+                if len(bars) > 5 and bars[-6].close > 0:
+                    move5 = (bars[-1].close - bars[-6].close) / bars[-6].close
+                ctx_for_brain = ReviewContext(
+                    spot=float(spot), vwap=float(vwap),
+                    regime=(getattr(self, "_last_regime", None)),
+                    vix=float(vix_now) if vix_now is not None else None,
+                    breadth_score=(breadth_snap.score if breadth_snap else None),
+                    breadth_is_risk_off=bool(breadth_snap.is_risk_off if breadth_snap else False),
+                    rsi_14=rsi_val,
+                    five_bar_move_pct=move5,
+                    open_positions=len(self.broker.positions()),
+                    position_on_symbol=sum(p.qty for p in self.broker.positions()
+                                            if (p.underlying or "") == sig.symbol),
+                    catalyst_in_24h=econ_blackout,
+                    news_score=float(news_score),
+                    contributing_signals=[sig.source],
+                )
+                candidate = CandidateDecision(
+                    symbol=sig.symbol,
+                    action=("enter_long" if sig.option_right and sig.option_right.value == "call"
+                             else "enter_short"),
+                    direction=("bullish" if (isinstance(sig.meta, dict)
+                                and sig.meta.get("direction") == "bullish")
+                                else "bearish"),
+                    source=sig.source,
+                    confidence=float(sig.confidence or 0.5),
+                    rationale=sig.rationale[:120],
+                )
+                review = self.llm_brain.review(candidate, ctx_for_brain)
+                # Audit every review so the operator can evaluate the
+                # brain's impact over time (rules-only vs rules+brain).
+                try:
+                    log_emit(
+                        source="llm_brain", symbol=sig.symbol,
+                        emitted=(review.action != "veto"),
+                        confidence=review.confidence_multiplier,
+                        rationale=(review.reason or "")[:200],
+                        meta={"action": review.action,
+                              "latency_ms": review.latency_ms,
+                              "from_cache": review.from_cache,
+                              "model": review.model},
+                    )
+                except Exception:
+                    pass
+                if review.is_veto:
+                    log.info("llm_brain_veto sym=%s reason=%s",
+                              sig.symbol, review.reason[:80])
+                    return
+                # Soft mode: scale the signal's confidence
+                old_conf = float(sig.confidence or 0.5)
+                new_conf = max(0.0, min(1.0,
+                                          old_conf * review.confidence_multiplier))
+                if abs(new_conf - old_conf) > 0.001:
+                    log.info("llm_brain_adjust sym=%s mult=%.2f %.2f->%.2f reason=%s",
+                              sig.symbol, review.confidence_multiplier,
+                              old_conf, new_conf, review.reason[:80])
+                    sig.confidence = new_conf
+            except Exception as e:
+                log.warning("llm_brain_review_failed err=%s", e)
 
         # Pick the contract FIRST (before the filter chain) so filters
         # f11 (spread), f12 (open interest), f18 (scalp viability) can
