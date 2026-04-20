@@ -40,9 +40,13 @@ SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 SYSTEMD_WATCHDOG_UNIT="tradebot-watchdog.service"
 SYSTEMD_DASHBOARD_UNIT="tradebot-dashboard.service"
 SYSTEMD_DISCORD_UNIT="tradebot-discord-terminal.service"
+SYSTEMD_SUMMARY_UNIT="tradebot-summary.service"
+SYSTEMD_SUMMARY_TIMER="tradebot-summary.timer"
 SYSTEMD_WATCHDOG_SRC="$ROOT/deploy/systemd/${SYSTEMD_WATCHDOG_UNIT}"
 SYSTEMD_DASHBOARD_SRC="$ROOT/deploy/systemd/${SYSTEMD_DASHBOARD_UNIT}"
 SYSTEMD_DISCORD_SRC="$ROOT/deploy/systemd/${SYSTEMD_DISCORD_UNIT}"
+SYSTEMD_SUMMARY_SRC="$ROOT/deploy/systemd/${SYSTEMD_SUMMARY_UNIT}"
+SYSTEMD_SUMMARY_TIMER_SRC="$ROOT/deploy/systemd/${SYSTEMD_SUMMARY_TIMER}"
 
 # Host OS — drives which supervisor we wire up.
 HOST_OS="$(uname -s)"
@@ -476,6 +480,42 @@ cmd_discord_uninstall() {
   echo "discord terminal unloaded + removed"
 }
 
+cmd_summary_install() {
+  if [[ "$HOST_OS" != "Linux" ]]; then
+    echo "summary-install is Linux-only (uses systemd --user timer)."
+    return 2
+  fi
+  _require_systemctl || return 1
+  if [[ ! -f "$SYSTEMD_SUMMARY_SRC" || ! -f "$SYSTEMD_SUMMARY_TIMER_SRC" ]]; then
+    echo "source missing: $SYSTEMD_SUMMARY_SRC and/or $SYSTEMD_SUMMARY_TIMER_SRC"; return 1
+  fi
+  mkdir -p "$SYSTEMD_USER_DIR"
+  _write_systemd_unit "$SYSTEMD_SUMMARY_SRC"       "$SYSTEMD_USER_DIR/$SYSTEMD_SUMMARY_UNIT"
+  _write_systemd_unit "$SYSTEMD_SUMMARY_TIMER_SRC" "$SYSTEMD_USER_DIR/$SYSTEMD_SUMMARY_TIMER"
+  systemctl --user daemon-reload
+  if systemctl --user enable --now "$SYSTEMD_SUMMARY_TIMER"; then
+    echo "summary timer installed + enabled: $SYSTEMD_USER_DIR/$SYSTEMD_SUMMARY_TIMER"
+    echo "posts every hour at :05; fires once on boot if missed."
+    echo "run now:   systemctl --user start $SYSTEMD_SUMMARY_UNIT"
+    echo "logs:      journalctl --user -u $SYSTEMD_SUMMARY_UNIT -f"
+  else
+    echo "systemctl --user enable failed"; return 1
+  fi
+}
+
+cmd_summary_uninstall() {
+  if [[ "$HOST_OS" != "Linux" ]]; then
+    echo "summary-uninstall is Linux-only."; return 2
+  fi
+  _require_systemctl || return 1
+  systemctl --user disable --now "$SYSTEMD_SUMMARY_TIMER" 2>/dev/null || true
+  systemctl --user disable "$SYSTEMD_SUMMARY_UNIT" 2>/dev/null || true
+  rm -f "$SYSTEMD_USER_DIR/$SYSTEMD_SUMMARY_UNIT" \
+         "$SYSTEMD_USER_DIR/$SYSTEMD_SUMMARY_TIMER"
+  systemctl --user daemon-reload
+  echo "summary timer unloaded + removed"
+}
+
 cmd_discord_status() {
   if [[ "$HOST_OS" != "Linux" ]]; then
     echo "discord-status is Linux-only."; return 2
@@ -573,6 +613,9 @@ case "${1:-}" in
   discord-install)    cmd_discord_install ;;
   discord-uninstall)  cmd_discord_uninstall ;;
   discord-status)     cmd_discord_status ;;
+  summary-install)    cmd_summary_install ;;
+  summary-uninstall)  cmd_summary_uninstall ;;
+  log-summary)        shift; "$PY" "$ROOT/scripts/post_log_summary.py" "$@" ;;
   *)
     cat <<EOF
 usage: $(basename "$0") {start|stop|restart|status|logs|backtest|priors|walkforward|dashboard|testdb|

@@ -1,0 +1,17 @@
+# Fire the summary once an hour, any day. The service is a oneshot; a
+# single run takes ~1 second on Jetson.
+#
+# Tradebot.out timestamps use UTC; the digest window is relative (last
+# N minutes) so the user's TZ doesn't affect content.
+[Unit]
+Description=tradebot hourly log digest
+
+[Timer]
+# Trigger at :05 past every hour, persistent so a missed trigger
+# (sleeping Jetson) still fires once on next boot.
+OnCalendar=*-*-* *:05:00
+Persistent=true
+Unit=tradebot-summary.service
+
+[Install]
+WantedBy=timers.target

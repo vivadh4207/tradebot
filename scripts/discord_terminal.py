@@ -135,6 +135,7 @@ COMMAND_MAP: Dict[str, Tuple[str, bool]] = {
     "walkforward":   ("walkforward",     False),
     "risk-switch":   ("putcall-oi",      False),
     "audit":         ("strategy-audit",  False),
+    "summary":       ("log-summary",     False),     # handled in-process; see _handle_summary
     "reset-paper":   ("reset-paper",     True),       # requires DESTROY confirm
     "wipe":          ("wipe-journal",    True),       # requires DESTROY confirm
 }
@@ -155,6 +156,7 @@ HELP_TEXT = (
     f"  `{COMMAND_PREFIX}walkforward`   — nightly edge report on demand\n"
     f"  `{COMMAND_PREFIX}risk-switch`  — refresh CBOE put/call OI state\n"
     f"  `{COMMAND_PREFIX}audit`         — 70B strategy audit (~30-120s)\n"
+    f"  `{COMMAND_PREFIX}summary [N]`   — concise digest of last N min (default 60)\n"
     "\nDangerous (require DESTROY confirmation):\n"
     f"  `{COMMAND_PREFIX}reset-paper`  — flatten + wipe journal\n"
     f"  `{COMMAND_PREFIX}wipe`          — wipe journal only\n"
@@ -285,6 +287,13 @@ class CommandRunner:
             return await self._tail_logs(tail_n)
         if command == "positions":
             return await self._positions_print()
+        if command == "summary":
+            # Optional minute-window argument: "!summary 30"
+            window = 60
+            parts = (raw_text or "").split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                window = max(5, min(1440, int(parts[1])))
+            return await self._handle_summary(window)
         if destroyed and subcmd == "reset-paper":
             # reset_paper.py supports --yes to skip its own interactive prompt
             extra_args = ["--yes"]
@@ -315,6 +324,19 @@ class CommandRunner:
         if stderr and stderr.strip():
             body += f"\n**stderr:**```\n{_truncate(stderr, 400)}\n```"
         return head + body
+
+    async def _handle_summary(self, window_minutes: int) -> str:
+        """Build an in-session digest of the last N minutes of
+        tradebot.out. Runs the parser in-process — no subprocess — so
+        users in Discord get an answer in ~1s."""
+        try:
+            from src.reports.log_digest import build_digest
+            log_path = ROOT / "logs" / "tradebot.out"
+            d = build_digest(log_path, window_minutes=window_minutes)
+            body = d.to_markdown()
+            return body
+        except Exception as e:
+            return f"summary failed: {type(e).__name__}: {str(e)[:200]}"
 
     async def _tail_logs(self, n: int) -> str:
         """Read last N lines of logs/tradebot.out."""

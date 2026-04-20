@@ -1,0 +1,14 @@
+# Oneshot that posts a digest of the last hour of tradebot.out to
+# Discord. Triggered by tradebot-summary.timer.
+[Unit]
+Description=tradebot hourly log digest -> Discord
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=__TRADEBOT_ROOT__
+Environment=TZ=America/New_York
+ExecStart=__TRADEBOT_PY__ __TRADEBOT_ROOT__/scripts/post_log_summary.py --window 60
+StandardOutput=append:__TRADEBOT_ROOT__/logs/summary.out
+StandardError=append:__TRADEBOT_ROOT__/logs/summary.err
