@@ -1,0 +1,13 @@
+# Fire the macro sweep at 20:00 America/New_York on weekdays (bot's
+# session TZ). Weekends skipped — markets closed, no new read needed.
+# Persistent=true so a missed trigger still fires on next boot.
+[Unit]
+Description=tradebot nightly macro sweep schedule
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 20:00:00
+Persistent=true
+Unit=tradebot-macro-sweep.service
+
+[Install]
+WantedBy=timers.target

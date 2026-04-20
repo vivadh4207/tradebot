@@ -537,6 +537,41 @@ class TradeBot:
                     low_vol_damp=float(ta_cfg.get("low_vol_damp", 0.15)),
                 ))
                 log.info("technical_analysis_signal_enabled")
+            # Optional long-put-dip signal — explicit "profit from the
+            # fall" trigger. Fires on VWAP dip + RSI oversold + macro
+            # confirmation (VIX spike or breadth deterioration).
+            lpd_cfg = settings.raw.get("signals", {}).get("long_put_dip", {}) or {}
+            if lpd_cfg.get("enabled", False):
+                from .signals.long_put_dip import LongPutDipSignal, LongPutDipConfig
+                # Wire VIX + breadth callbacks if those providers exist.
+                _vix_fn = None
+                _brd_fn = None
+                try:
+                    if self.real_time_intel is not None:
+                        _vix_fn = lambda: self.real_time_intel.get_vix_snapshot()
+                except Exception:
+                    pass
+                try:
+                    if hasattr(self, "breadth_probe") and self.breadth_probe is not None:
+                        _brd_fn = lambda: self.breadth_probe.latest_snapshot()
+                except Exception:
+                    pass
+                self.strategies.append(LongPutDipSignal(
+                    cfg=LongPutDipConfig(
+                        vwap_dip_pct=float(lpd_cfg.get("vwap_dip_pct", 0.004)),
+                        rsi_ceiling=float(lpd_cfg.get("rsi_ceiling", 35.0)),
+                        rsi_period=int(lpd_cfg.get("rsi_period", 5)),
+                        vix_spike_pct=float(lpd_cfg.get("vix_spike_pct", 0.05)),
+                        breadth_decliners_mult=float(
+                            lpd_cfg.get("breadth_decliners_mult", 2.0)
+                        ),
+                        min_vol_ratio=float(lpd_cfg.get("min_vol_ratio", 1.1)),
+                        min_bars=int(lpd_cfg.get("min_bars", 40)),
+                    ),
+                    get_vix_fn=_vix_fn,
+                    get_breadth_fn=_brd_fn,
+                ))
+                log.info("long_put_dip_signal_enabled")
             # Optional TradingView webhook signal. The ingest side runs
             # in the dashboard process (POST /webhook/tradingview). This
             # source polls the file-backed queue each tick. The bot

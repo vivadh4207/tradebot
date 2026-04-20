@@ -42,11 +42,15 @@ SYSTEMD_DASHBOARD_UNIT="tradebot-dashboard.service"
 SYSTEMD_DISCORD_UNIT="tradebot-discord-terminal.service"
 SYSTEMD_SUMMARY_UNIT="tradebot-summary.service"
 SYSTEMD_SUMMARY_TIMER="tradebot-summary.timer"
+SYSTEMD_MACRO_UNIT="tradebot-macro-sweep.service"
+SYSTEMD_MACRO_TIMER="tradebot-macro-sweep.timer"
 SYSTEMD_WATCHDOG_SRC="$ROOT/deploy/systemd/${SYSTEMD_WATCHDOG_UNIT}"
 SYSTEMD_DASHBOARD_SRC="$ROOT/deploy/systemd/${SYSTEMD_DASHBOARD_UNIT}"
 SYSTEMD_DISCORD_SRC="$ROOT/deploy/systemd/${SYSTEMD_DISCORD_UNIT}"
 SYSTEMD_SUMMARY_SRC="$ROOT/deploy/systemd/${SYSTEMD_SUMMARY_UNIT}"
 SYSTEMD_SUMMARY_TIMER_SRC="$ROOT/deploy/systemd/${SYSTEMD_SUMMARY_TIMER}"
+SYSTEMD_MACRO_SRC="$ROOT/deploy/systemd/${SYSTEMD_MACRO_UNIT}"
+SYSTEMD_MACRO_TIMER_SRC="$ROOT/deploy/systemd/${SYSTEMD_MACRO_TIMER}"
 
 # Host OS — drives which supervisor we wire up.
 HOST_OS="$(uname -s)"
@@ -571,6 +575,42 @@ cmd_summary_install() {
   fi
 }
 
+cmd_macro_sweep_install() {
+  if [[ "$HOST_OS" != "Linux" ]]; then
+    echo "macro-sweep-install is Linux-only (uses systemd --user timer)."
+    return 2
+  fi
+  _require_systemctl || return 1
+  if [[ ! -f "$SYSTEMD_MACRO_SRC" || ! -f "$SYSTEMD_MACRO_TIMER_SRC" ]]; then
+    echo "source missing: $SYSTEMD_MACRO_SRC and/or $SYSTEMD_MACRO_TIMER_SRC"; return 1
+  fi
+  mkdir -p "$SYSTEMD_USER_DIR"
+  _write_systemd_unit "$SYSTEMD_MACRO_SRC"       "$SYSTEMD_USER_DIR/$SYSTEMD_MACRO_UNIT"
+  _write_systemd_unit "$SYSTEMD_MACRO_TIMER_SRC" "$SYSTEMD_USER_DIR/$SYSTEMD_MACRO_TIMER"
+  systemctl --user daemon-reload
+  if systemctl --user enable --now "$SYSTEMD_MACRO_TIMER"; then
+    echo "macro-sweep timer installed + enabled: $SYSTEMD_USER_DIR/$SYSTEMD_MACRO_TIMER"
+    echo "fires at 20:00 America/New_York on weekdays."
+    echo "run now:   systemctl --user start $SYSTEMD_MACRO_UNIT"
+    echo "logs:      journalctl --user -u $SYSTEMD_MACRO_UNIT -f"
+  else
+    echo "systemctl --user enable failed"; return 1
+  fi
+}
+
+cmd_macro_sweep_uninstall() {
+  if [[ "$HOST_OS" != "Linux" ]]; then
+    echo "macro-sweep-uninstall is Linux-only."; return 2
+  fi
+  _require_systemctl || return 1
+  systemctl --user disable --now "$SYSTEMD_MACRO_TIMER" 2>/dev/null || true
+  systemctl --user disable "$SYSTEMD_MACRO_UNIT" 2>/dev/null || true
+  rm -f "$SYSTEMD_USER_DIR/$SYSTEMD_MACRO_UNIT" \
+         "$SYSTEMD_USER_DIR/$SYSTEMD_MACRO_TIMER"
+  systemctl --user daemon-reload
+  echo "macro-sweep timer unloaded + removed"
+}
+
 cmd_summary_uninstall() {
   if [[ "$HOST_OS" != "Linux" ]]; then
     echo "summary-uninstall is Linux-only."; return 2
@@ -687,6 +727,9 @@ case "${1:-}" in
   ollama-restart)     cmd_ollama_restart ;;
   ollama-warmup)      cmd_ollama_warmup ;;
   ollama-status)      cmd_ollama_status ;;
+  macro-sweep-install)   cmd_macro_sweep_install ;;
+  macro-sweep-uninstall) cmd_macro_sweep_uninstall ;;
+  macro-sweep)        shift; "$PY" "$ROOT/scripts/nightly_macro_sweep.py" "$@" ;;
   *)
     cat <<EOF
 usage: $(basename "$0") {start|stop|restart|status|logs|backtest|priors|walkforward|dashboard|testdb|

@@ -347,6 +347,20 @@ signals:
     short_tf_group: 5              # ~5-min equivalent on 1-min bars
     long_tf_group: 15             # ~15-min equivalent
     low_vol_damp: 0.15
+  # Long-put-dip — explicit "profit from the fall" trigger. Fires when
+  # price drops >0.4% below VWAP with RSI(5) oversold AND a macro
+  # confirmation (VIX spike OR breadth deterioration). If no macro
+  # data is available, falls back to requiring a deeper price-only
+  # trigger (>= 2x the dip threshold + RSI below ceiling-5).
+  long_put_dip:
+    enabled: true
+    vwap_dip_pct: 0.004           # 0.4% below VWAP
+    rsi_ceiling: 35.0              # 5-bar RSI below this
+    rsi_period: 5
+    vix_spike_pct: 0.05            # VIX up 5%+ on day
+    breadth_decliners_mult: 2.0    # decliners > 2x advancers
+    min_vol_ratio: 1.1             # current bar >= avg volume
+    min_bars: 40
 
 # ===== Price-action liveness gate =====
 # Blocks entries when the underlying isn't moving. Options decay

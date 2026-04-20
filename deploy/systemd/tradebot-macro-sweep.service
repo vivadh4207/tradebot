@@ -1,0 +1,16 @@
+# Oneshot that runs the nightly macro sweep (70B reads today's snapshot
+# + political news + recent signals, emits a forward-looking report to
+# Discord). Triggered by tradebot-macro-sweep.timer.
+[Unit]
+Description=tradebot nightly macro sweep -> Discord
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=__TRADEBOT_ROOT__
+Environment=TZ=America/New_York
+TimeoutStartSec=15min
+ExecStart=__TRADEBOT_PY__ __TRADEBOT_ROOT__/scripts/nightly_macro_sweep.py
+StandardOutput=append:__TRADEBOT_ROOT__/logs/macro_sweep.out
+StandardError=append:__TRADEBOT_ROOT__/logs/macro_sweep.err
