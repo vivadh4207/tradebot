@@ -21,8 +21,10 @@ except ImportError:
 from src.core.config import load_settings
 from src.intelligence.econ_calendar import EconomicCalendar
 from src.intelligence.catalyst_calendar import build_default_catalyst_calendar
+from src.notify.issue_reporter import alert_on_crash
 
 
+@alert_on_crash("refresh_catalysts", rethrow=False)
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=14)

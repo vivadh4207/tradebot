@@ -26,6 +26,7 @@ from src.core.config import load_settings
 from src.core.clock import ET
 from src.data.historical_adapter import HistoricalMarketDataAdapter
 from src.storage.journal import build_journal
+from src.notify.issue_reporter import alert_on_crash
 
 
 def _classify(fwd_ret: float, up_thr: float, down_thr: float) -> int:
@@ -36,6 +37,7 @@ def _classify(fwd_ret: float, up_thr: float, down_thr: float) -> int:
     return 1      # neutral
 
 
+@alert_on_crash("resolve_ml_predictions", rethrow=False)
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--backend", default=None,

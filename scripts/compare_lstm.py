@@ -30,6 +30,7 @@ from src.data.market_data import SyntheticDataAdapter
 from src.data.historical_adapter import HistoricalMarketDataAdapter
 from src.backtest.simulator import BacktestSimulator, SimConfig
 from src.backtest.metrics import performance_report
+from src.notify.issue_reporter import alert_on_crash
 
 
 def run(settings, data, seed_label: str, disable=()) -> dict:
@@ -50,6 +51,7 @@ def run(settings, data, seed_label: str, disable=()) -> dict:
     }
 
 
+@alert_on_crash("compare_lstm", rethrow=False)
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", choices=["synthetic", "historical"], default="synthetic")

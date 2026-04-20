@@ -233,6 +233,20 @@ class AlpacaDataAdapter(MarketDataAdapter):
             _logging.getLogger(__name__).warning(
                 "alpaca_bars_error_falling_back symbol=%s err=%s", symbol, e,
             )
+            # Alert on fallback — but heavily throttled (1 hr) because
+            # a DNS/network outage would otherwise flood Discord with
+            # one alert per symbol per tick. One heads-up per hour per
+            # unique error is enough to notice the degradation.
+            try:
+                from ..notify.issue_reporter import report_issue
+                report_issue(
+                    scope="alpaca.get_bars",
+                    message=f"Alpaca bars fetch fell back to synthetic for {symbol}: {type(e).__name__}: {e}",
+                    exc=e,
+                    throttle_sec=3600.0,
+                )
+            except Exception:
+                pass
             return self._fallback.get_bars(symbol, limit=limit,
                                            timeframe_minutes=timeframe_minutes, end=end)
 
@@ -252,5 +266,17 @@ class AlpacaDataAdapter(MarketDataAdapter):
                 bid_size=float(getattr(q, "bid_size", 0) or 0),
                 ask_size=float(getattr(q, "ask_size", 0) or 0),
             )
-        except Exception:
+        except Exception as e:
+            # Same hourly throttle — quote fetch runs every tick, per
+            # symbol, so an outage must not fire per-tick alerts.
+            try:
+                from ..notify.issue_reporter import report_issue
+                report_issue(
+                    scope="alpaca.latest_quote",
+                    message=f"Alpaca quote fetch fell back to synthetic for {symbol}: {type(e).__name__}",
+                    exc=e,
+                    throttle_sec=3600.0,
+                )
+            except Exception:
+                pass
             return self._fallback.latest_quote(symbol)

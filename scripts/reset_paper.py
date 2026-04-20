@@ -17,6 +17,8 @@ Or via tradebotctl:
 """
 from __future__ import annotations
 
+from src.notify.issue_reporter import alert_on_crash
+
 import os
 import sys
 from pathlib import Path
@@ -48,8 +50,16 @@ def _confirm() -> bool:
     return ans == "DESTROY"
 
 
+@alert_on_crash("reset_paper", rethrow=False)
 def main() -> int:
-    if not _confirm():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--yes", action="store_true",
+                     help="Skip the interactive DESTROY prompt. ONLY for "
+                          "the dashboard reset-paper button which already "
+                          "requires an in-UI confirm.")
+    args, _ = ap.parse_known_args()
+    if not args.yes and not _confirm():
         print("aborted — nothing changed.")
         return 1
 

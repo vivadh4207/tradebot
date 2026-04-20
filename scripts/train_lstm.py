@@ -32,8 +32,10 @@ from src.core.clock import ET
 from src.data.historical_adapter import HistoricalMarketDataAdapter
 from src.ml.dataset import build_dataset, time_ordered_split
 from src.ml.checkpoint import CheckpointMeta
+from src.notify.issue_reporter import alert_on_crash
 
 
+@alert_on_crash("train_lstm", rethrow=False)
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--symbols", default=None,

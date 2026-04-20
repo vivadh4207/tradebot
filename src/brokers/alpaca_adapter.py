@@ -56,7 +56,13 @@ def _is_retriable(exc: BaseException) -> bool:
 
 def _with_retry(fn: Callable[[], Any], *, op: str,
                  max_attempts: int = _RETRY_MAX_ATTEMPTS) -> Any:
-    """Exponential-backoff wrapper with full jitter."""
+    """Exponential-backoff wrapper with full jitter.
+
+    A FINAL failure (all attempts exhausted OR non-retriable error) is
+    pushed to the Discord alerts channel once per unique (op, error)
+    pair via the issue_reporter throttle. Retriable attempts stay in
+    the log only to avoid spam.
+    """
     last_exc: Optional[BaseException] = None
     for attempt in range(1, max_attempts + 1):
         try:
@@ -66,6 +72,15 @@ def _with_retry(fn: Callable[[], Any], *, op: str,
             if not _is_retriable(e) or attempt == max_attempts:
                 _log.warning("alpaca_%s_failed_final attempt=%d err=%s",
                               op, attempt, e)
+                try:
+                    from ..notify.issue_reporter import report_issue
+                    report_issue(
+                        scope=f"alpaca.{op}",
+                        message=f"Alpaca {op} failed after {attempt} attempts: {type(e).__name__}: {e}",
+                        exc=e,
+                    )
+                except Exception:
+                    pass
                 raise
             delay = min(_RETRY_MAX_DELAY, _RETRY_BASE_DELAY * (2 ** (attempt - 1)))
             delay *= random.uniform(0.5, 1.5)           # full jitter
@@ -165,6 +180,65 @@ class AlpacaBroker(BrokerAdapter):
 
         _with_retry(_call, op="submit")
         return None  # rely on webhook/poll for fills
+
+    def submit_combo(self, combo) -> list:
+        """Submit a multi-leg option order via Alpaca's native mleg API.
+
+        Uses order_class="mleg" + OptionLegRequest[] if the installed
+        alpaca-py supports it (added 2024). Falls back to leg-by-leg
+        submission on older SDKs or when the mleg class raises.
+
+        Returns a list of Fills (empty — Alpaca fills resolve async).
+        """
+        from alpaca.trading.enums import OrderSide, TimeInForce
+
+        # Detect mleg support at call time — some environments pin an
+        # older alpaca-py that predates multi-leg support.
+        try:
+            from alpaca.trading.requests import (
+                LimitOrderRequest, OptionLegRequest,
+            )
+            try:
+                from alpaca.trading.enums import OrderClass, PositionIntent
+                has_mleg = True
+            except Exception:
+                has_mleg = False
+        except Exception:
+            has_mleg = False
+
+        if not has_mleg:
+            # Fall back to base-class leg-by-leg path.
+            from .base import BrokerAdapter
+            return BrokerAdapter.submit_combo(self, combo)
+
+        legs = []
+        for leg in combo.legs:
+            legs.append(OptionLegRequest(
+                symbol=leg.contract.symbol,
+                side=(OrderSide.BUY if leg.side == Side.BUY else OrderSide.SELL),
+                ratio_qty=leg.ratio,
+            ))
+        # Net limit price. Alpaca expects a positive number representing
+        # the per-combo debit; a credit spread is expressed as a negative.
+        req = LimitOrderRequest(
+            qty=combo.qty,
+            time_in_force=TimeInForce.DAY,
+            order_class=OrderClass.MLEG,
+            legs=legs,
+            limit_price=round(float(combo.net_limit), 2),
+        )
+
+        def _call():
+            self._client.submit_order(req)
+
+        try:
+            _with_retry(_call, op="submit_combo")
+        except Exception:
+            # On any failure, fall back to leg-by-leg; the base
+            # implementation will log + alert per leg.
+            from .base import BrokerAdapter
+            return BrokerAdapter.submit_combo(self, combo)
+        return []  # filled async via webhook/poll
 
     def cancel_all(self) -> None:
         _with_retry(lambda: self._client.cancel_orders(), op="cancel_all")

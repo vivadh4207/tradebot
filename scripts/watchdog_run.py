@@ -1,5 +1,10 @@
 """Watchdog launcher — supervises run_paper.py.
 
+Host-agnostic. Runs under macOS launchd
+(deploy/launchd/com.tradebot.paper.plist) AND under Linux/Jetson systemd
+--user (deploy/systemd/tradebot-watchdog.service). Both supervisors only
+need the watchdog itself; the internal logic is identical on either OS.
+
 Responsibilities (the bits launchd / systemd can't do on their own):
 
   1. Fire a notifier message when the child exits abnormally so the
@@ -10,19 +15,17 @@ Responsibilities (the bits launchd / systemd can't do on their own):
   3. Detect stale heartbeat — process alive but main loop frozen (a
      deadlock, a stuck network call, a runaway GC). If
      `logs/heartbeat.txt` hasn't been touched in HEARTBEAT_STALE_SEC,
-     SIGTERM the child; launchd's KeepAlive=true brings it back.
-  4. Exit with the child's return code. launchd restarts us per
-     KeepAlive; we only exit 0 if we were asked to stop cleanly
-     (SIGTERM from `launchctl stop` / the user).
+     SIGTERM the child; the outer supervisor's Restart=on-failure /
+     KeepAlive=true brings it back.
+  4. Exit with the child's return code. We only exit 0 if asked to stop
+     cleanly (SIGTERM from `launchctl stop` / `systemctl --user stop`
+     / the user).
 
 Why a Python wrapper instead of a shell script:
   - We already have `src.notify.build_notifier()` — reusing it means
     alerts go to the same Discord/Slack channel as calibration alerts.
   - Heartbeat-timeout math is fiddly; easier to get right in Python
-    than bash.
-
-Invocation: same env as run_paper.py (the plist's EnvironmentVariables
-block covers both). See deploy/launchd/com.tradebot.paper.plist.
+     than bash.
 """
 from __future__ import annotations
 
@@ -154,6 +157,15 @@ def _terminate(child: subprocess.Popen) -> None:
 
 
 def main() -> int:
+    # Global error hooks — any stray exception inside the watchdog
+    # (file I/O, signal handling, child spawn) posts to Discord alerts
+    # before the process dies.
+    try:
+        from src.notify.issue_reporter import install_excepthooks
+        install_excepthooks(scope_prefix="watchdog")
+    except Exception:
+        pass  # notifier failed to import; continue — watchdog itself still logs events.
+
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     _reset_heartbeat()
 

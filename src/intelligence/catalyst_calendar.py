@@ -146,8 +146,21 @@ class FinnhubCalendarProvider(CatalystProvider):
                         when=d, timing=timing,
                         details=f"EPS est {row.get('epsEstimate')}",
                     ))
-        except Exception:
-            pass
+        except Exception as e:                          # noqa: BLE001
+            # Surface API-level Finnhub failures so a revoked/throttled
+            # key doesn't silently zero out earnings data. Throttled to
+            # once per 6h — catalyst refresh runs daily, so this fires
+            # at most once per bad day.
+            try:
+                from ..notify.issue_reporter import report_issue
+                report_issue(
+                    scope="catalysts.finnhub",
+                    message=f"Finnhub earnings calendar fetch failed: {type(e).__name__}: {e}",
+                    exc=e,
+                    throttle_sec=6 * 3600.0,
+                )
+            except Exception:
+                pass
         return out
 
 
@@ -221,8 +234,21 @@ class CatalystCalendar:
         for p in self.providers:
             try:
                 got = p.fetch(symbols, days=self.lookahead_days) or []
-            except Exception:
+            except Exception as err:                    # noqa: BLE001
                 got = []
+                # A whole provider failing means its data is missing
+                # from today's catalyst set — could lead to entering
+                # trades into unseen earnings. Alert.
+                try:
+                    from ..notify.issue_reporter import report_issue
+                    report_issue(
+                        scope=f"catalysts.provider.{type(p).__name__}",
+                        message=f"catalyst provider {type(p).__name__} failed: {type(err).__name__}: {err}",
+                        exc=err,
+                        throttle_sec=6 * 3600.0,
+                    )
+                except Exception:
+                    pass
             for e in got:
                 key = (e.symbol, e.when, e.event_type)
                 if key in seen:

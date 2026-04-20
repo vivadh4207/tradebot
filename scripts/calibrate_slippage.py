@@ -33,8 +33,10 @@ from src.analytics.slippage_calibration import (
     load_recent, analyze, propose_tuning,
 )
 from src.core.config import load_settings
+from src.notify.issue_reporter import alert_on_crash
 
 
+@alert_on_crash("calibrate_slippage", rethrow=False)
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=7)

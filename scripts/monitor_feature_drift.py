@@ -32,8 +32,10 @@ from src.data.historical_adapter import HistoricalMarketDataAdapter
 from src.ml.features import build_feature_matrix, FeatureStats, FEATURE_COLS
 from src.ml.feature_drift import check_drift
 from src.notify.base import build_notifier
+from src.notify.issue_reporter import alert_on_crash
 
 
+@alert_on_crash("monitor_feature_drift", rethrow=False)
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=7, help="live-window days")

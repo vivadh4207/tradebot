@@ -199,8 +199,19 @@ class PaperBroker(BrokerAdapter):
             return
         try:
             self._journal.record_fill(fill)
-        except Exception:
-            pass   # never let journaling kill the trade loop
+        except Exception as e:                         # noqa: BLE001
+            # Never let journaling kill the trade loop — but DO alert.
+            # A silent journal failure means every subsequent trade
+            # runs without an audit trail. The user must know.
+            try:
+                from ..notify.issue_reporter import report_issue
+                report_issue(
+                    scope="journal.record_fill",
+                    message=f"journal write failed for fill {fill.order.symbol}: {type(e).__name__}: {e}",
+                    exc=e,
+                )
+            except Exception:
+                pass
 
     def _log_slippage_calibration(self, fill: Fill, cost, ctx) -> None:
         """Append a calibration row for this fill so the auto-tuner / weekly
@@ -227,8 +238,20 @@ class PaperBroker(BrokerAdapter):
                 vix=float(ctx.vix),
                 tag=str(fill.order.tag or ""),
             )
-        except Exception:
-            pass   # calibration is advisory, never let it kill a fill
+        except Exception as e:                         # noqa: BLE001
+            # Calibration is advisory; degraded slippage tuning won't
+            # stop trading. Throttle aggressively (1 hr) — if the path
+            # is bad we don't want one alert per fill.
+            try:
+                from ..notify.issue_reporter import report_issue
+                report_issue(
+                    scope="slippage_calibration",
+                    message=f"slippage logger failed: {type(e).__name__}: {e}",
+                    exc=e,
+                    throttle_sec=3600.0,
+                )
+            except Exception:
+                pass
 
     def _log_trade(self, pos: Position, exit_fill: Fill, closed_qty: int, realized: float) -> None:
         if self._journal is None:

@@ -30,8 +30,10 @@ except ImportError:
 from src.core.config import load_settings
 from src.storage.journal import build_journal
 from src.analytics.slippage_calibration import load_recent, analyze
+from src.notify.issue_reporter import alert_on_crash
 
 
+@alert_on_crash("daily_report", rethrow=False)
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=1,

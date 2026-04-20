@@ -242,3 +242,17 @@ class MirrorAlpacaBroker(PaperBroker):
                     "alpaca_mirror_failed symbol=%s err=%s",
                     order.symbol, e,
                 )
+                # Push to Discord alerts — throttled per-error so a
+                # persistent failure (e.g. wrong OCC format) sends one
+                # alert every 5 minutes, not one per submission.
+                try:
+                    from ..notify.issue_reporter import report_issue
+                    report_issue(
+                        scope="alpaca.mirror_submit",
+                        message=f"mirror to Alpaca failed for {order.symbol}: {type(e).__name__}: {e}",
+                        exc=e,
+                        extra={"qty": order.qty, "side": str(order.side),
+                               "is_option": order.is_option},
+                    )
+                except Exception:
+                    pass

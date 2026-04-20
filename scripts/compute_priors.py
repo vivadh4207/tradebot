@@ -25,8 +25,10 @@ except ImportError:
     pass
 
 from src.storage.journal import build_journal
+from src.notify.issue_reporter import alert_on_crash
 
 
+@alert_on_crash("compute_priors", rethrow=False)
 def main() -> int:
     ap = argparse.ArgumentParser(description="Compute priors from the trade journal.")
     ap.add_argument("--backend", default="sqlite",

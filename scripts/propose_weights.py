@@ -44,6 +44,7 @@ except ImportError:
 from src.core.config import load_settings
 from src.storage.journal import build_journal
 from src.signals.ensemble import DEFAULT_WEIGHTS
+from src.notify.issue_reporter import alert_on_crash
 
 
 WEIGHT_FLOOR = 0.30
@@ -61,6 +62,7 @@ def _current_weights(s) -> Dict[str, Dict[str, float]]:
     return {r.value: dict(w) for r, w in DEFAULT_WEIGHTS.items()}
 
 
+@alert_on_crash("propose_weights", rethrow=False)
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--backend", default=None)

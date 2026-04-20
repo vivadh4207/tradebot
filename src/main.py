@@ -474,9 +474,136 @@ class TradeBot:
         else:
             self.wheel_runner = None
             self.wheel_exits = None
-            self.strategies = [
-                MomentumSignal(), VwapReversionSignal(), OpeningRangeBreakout(),
-            ]
+            # Build the ORB signal with the retest toggle from config
+            orb_cfg = settings.raw.get("signals", {}).get("orb", {}) or {}
+            orb = OpeningRangeBreakout(
+                retest_required=bool(orb_cfg.get("retest_required", False)),
+                retest_band_pct=float(orb_cfg.get("retest_band_pct", 0.0015)),
+            )
+            self.strategies = [MomentumSignal(), VwapReversionSignal(), orb]
+            # Optional extreme-momentum (shock) signal — off by default.
+            em_cfg = settings.raw.get("signals", {}).get("extreme_momentum", {}) or {}
+            if em_cfg.get("enabled", False):
+                from .signals.extreme_momentum import (
+                    ExtremeMomentumSignal, ExtremeMomentumConfig,
+                )
+                self.strategies.append(ExtremeMomentumSignal(
+                    ExtremeMomentumConfig(
+                        lookback_bars=int(em_cfg.get("lookback_bars", 5)),
+                        baseline_bars=int(em_cfg.get("baseline_bars", 20)),
+                        min_move_pct=float(em_cfg.get("min_move_pct", 0.03)),
+                        min_volume_multiple=float(em_cfg.get("min_volume_multiple", 3.0)),
+                        confidence=float(em_cfg.get("confidence", 0.85)),
+                    )
+                ))
+                log.info("extreme_momentum_signal_enabled")
+            # Optional TradingView webhook signal. The ingest side runs
+            # in the dashboard process (POST /webhook/tradingview). This
+            # source polls the file-backed queue each tick. The bot
+            # doesn't need to know the dashboard is up — if the queue
+            # file exists and has unconsumed alerts, they're emitted.
+            if os.getenv("TRADINGVIEW_WEBHOOK_SECRET", "").strip():
+                try:
+                    from .signals.tradingview_webhook import TradingViewWebhookSignal
+                    self.strategies.append(TradingViewWebhookSignal())
+                    log.info("tradingview_webhook_signal_enabled")
+                except Exception as e:
+                    log.warning("tradingview_webhook_load_failed err=%s", e)
+            # Optional per-signal audit wrapping — enabled only when
+            # TRADEBOT_SIGNAL_AUDIT=1 in env. Zero overhead otherwise.
+            try:
+                from .core.signal_audit import audit_source
+                self.strategies = [audit_source(s) for s in self.strategies]
+            except Exception:
+                pass
+
+        # --- Breadth probe (risk-on/off composite) ---
+        # Used by the credit-spread runners + sizer to stand down
+        # during risk-off regimes. Off by default; enable with
+        # breadth.enabled: true in settings.yaml.
+        breadth_cfg = settings.raw.get("breadth", {}) or {}
+        self.breadth_probe = None
+        if breadth_cfg.get("enabled", False):
+            try:
+                from .intelligence.breadth_probe import (
+                    BreadthProbe, BreadthProbeConfig,
+                )
+                bp_cfg = BreadthProbeConfig(
+                    cache_seconds=float(breadth_cfg.get("cache_seconds", 60.0)),
+                    risk_off_threshold=float(breadth_cfg.get("risk_off_threshold", -0.3)),
+                )
+                self.breadth_probe = BreadthProbe(
+                    cfg=bp_cfg,
+                    spot_fetcher=self.data.latest_price,
+                    open_fetcher=lambda s: (self.data.get_bars(s, limit=1)[0].open
+                                             if self.data.get_bars(s, limit=1) else None),
+                    vix_probe=getattr(self, "vix_probe", None),
+                )
+                log.info("breadth_probe_enabled")
+            except Exception as e:
+                log.warning("breadth_probe_init_failed err=%s", e)
+
+        # --- Credit-spread runners (additive to any strategy_mode) ---
+        # These are short-premium strategies that work ALONGSIDE the
+        # directional or wheel paths. They don't compete with the
+        # ensemble — each has its own tick cadence and risk math.
+        # Toggled independently in settings.yaml under credit_spreads.*
+        cs_cfg = settings.raw.get("credit_spreads", {}) or {}
+        self.weekly_cs_runner = None
+        self.zero_dte_cs_runner = None
+        self.credit_spread_exits = None
+        if cs_cfg.get("enabled", False):
+            from .signals.credit_spread_runner import (
+                WeeklyCreditSpreadRunner, WeeklyCreditSpreadConfig,
+                ZeroDTECreditSpreadRunner, ZeroDTECreditSpreadConfig,
+            )
+            from .exits.credit_spread_exits import CreditSpreadExitConfig
+            weekly_on = cs_cfg.get("weekly_enabled", True)
+            zero_on   = cs_cfg.get("zero_dte_enabled", False)
+            uni = list(cs_cfg.get("universe", ["SPY", "QQQ"]))
+            if weekly_on:
+                wk = cs_cfg.get("weekly", {}) or {}
+                self.weekly_cs_runner = WeeklyCreditSpreadRunner(
+                    WeeklyCreditSpreadConfig(
+                        universe=uni,
+                        dte_min=int(wk.get("dte_min", 30)),
+                        dte_max=int(wk.get("dte_max", 45)),
+                        short_delta=float(wk.get("short_delta", 0.20)),
+                        long_delta=float(wk.get("long_delta", 0.08)),
+                        max_wing_width=float(wk.get("max_wing_width", 10.0)),
+                        min_credit_pct_of_wing=float(wk.get("min_credit_pct_of_wing", 0.15)),
+                        max_open_positions=int(wk.get("max_open_positions", 2)),
+                        profit_target_pct=float(wk.get("profit_target_pct", 0.50)),
+                        dte_close_threshold=int(wk.get("dte_close_threshold", 21)),
+                    ),
+                    bot=self,
+                )
+            if zero_on:
+                zd = cs_cfg.get("zero_dte", {}) or {}
+                self.zero_dte_cs_runner = ZeroDTECreditSpreadRunner(
+                    ZeroDTECreditSpreadConfig(
+                        universe=uni,
+                        short_delta=float(zd.get("short_delta", 0.12)),
+                        wing_width=float(zd.get("wing_width", 5.0)),
+                        max_open_positions=int(zd.get("max_open_positions", 3)),
+                        rsi_oversold=float(zd.get("rsi_oversold", 35.0)),
+                        support_band_pct=float(zd.get("support_band_pct", 0.005)),
+                        support_lookback_bars=int(zd.get("support_lookback_bars", 20)),
+                        profit_target_pct=float(zd.get("profit_target_pct", 0.50)),
+                        stop_loss_pct=float(zd.get("stop_loss_pct", 1.50)),
+                    ),
+                    bot=self,
+                )
+            # Shared exit engine for both credit-spread variants
+            ex = cs_cfg.get("exits", {}) or {}
+            self.credit_spread_exits = CreditSpreadExitConfig(
+                profit_target_pct=float(ex.get("profit_target_pct", 0.50)),
+                stop_loss_pct=float(ex.get("stop_loss_pct", 1.50)),
+                dte_close_threshold=int(ex.get("dte_close_threshold", 21)),
+            )
+            log.info("credit_spreads_enabled",
+                     weekly=bool(self.weekly_cs_runner),
+                     zero_dte=bool(self.zero_dte_cs_runner))
         if settings.get("ml.lstm_enabled", True):
             lstm = LSTMSignal(
                 checkpoint_path=settings.get("ml.lstm_checkpoint",
@@ -631,6 +758,75 @@ class TradeBot:
                     marks[p.symbol] = float(mark)
         return marks
 
+    def _evaluate_credit_spreads(self, open_pos, marks) -> None:
+        """Group credit-spread legs by tag, evaluate each as a unit,
+        submit a single close-combo if the exit criteria fire.
+
+        Keeps exit decisions symmetric: a credit spread's two legs
+        either both stay open or both close. No half-closes via per-leg
+        logic.
+        """
+        from .exits.credit_spread_exits import (
+            group_spread_positions, evaluate_spread, build_close_combo,
+        )
+        from datetime import datetime as _dt
+        try:
+            from zoneinfo import ZoneInfo
+            now_et = _dt.now(tz=ZoneInfo("America/New_York"))
+        except Exception:
+            now_et = _dt.utcnow()
+
+        groups = group_spread_positions(open_pos)
+        if not groups:
+            return
+
+        # Build a {symbol → OptionContract} map from current chains so
+        # the close combo can use live bid/ask for its limit price.
+        contracts_by_symbol: Dict[str, Any] = {}
+        underlyings = {p.underlying for legs in groups.values() for p in legs
+                       if p.underlying}
+        for under in underlyings:
+            spot = self.data.latest_price(under)
+            if not spot:
+                continue
+            try:
+                # Pull a wide window so both the short and long legs land in it
+                chain = self.chain_provider.chain(under, float(spot),
+                                                   target_dte=5)
+            except Exception:
+                chain = []
+            for c in chain or []:
+                contracts_by_symbol[c.symbol] = c
+
+        for tag, legs in groups.items():
+            try:
+                decision = evaluate_spread(
+                    legs, marks, self.credit_spread_exits, now_et=now_et,
+                )
+                if decision is None or not decision.should_close:
+                    continue
+                combo = build_close_combo(decision, contracts_by_symbol)
+                if combo is None:
+                    log.warning("cs_close_build_failed tag=%s", tag)
+                    continue
+                log.info("cs_close_submit tag=%s reason=%s pnl=%.2f%%",
+                          tag, decision.reason,
+                          decision.net_pnl_pct_of_credit * 100)
+                self.broker.submit_combo(combo)
+                self.notifier.notify(
+                    f"CLOSE credit spread ({tag}) — {decision.reason}",
+                    title="exit", level=("success"
+                         if decision.net_pnl_pct_of_credit > 0 else "warn"),
+                    meta={
+                        "strategy": "credit_spread_exit",
+                        "tag": tag,
+                        "reason": decision.reason,
+                        "net_pnl_vs_credit": f"{decision.net_pnl_pct_of_credit:+.1%}",
+                    },
+                )
+            except Exception as e:                         # noqa: BLE001
+                log.warning("cs_eval_failed tag=%s err=%s", tag, e)
+
     def _refresh_catalysts(self) -> None:
         """Pull earnings/FDA events and hydrate the EconomicCalendar with
         per-symbol blackouts. Swallows errors (network, missing deps).
@@ -699,6 +895,31 @@ class TradeBot:
                 # an exit evaluator that's comparing to a $1.20 option entry,
                 # triggering the hard-profit-cap instantly every tick.
                 marks = self._build_mark_prices(open_pos)
+
+                # -------- credit-spread exits (evaluated FIRST) --------
+                # A credit spread has two legs that must unwind together.
+                # Evaluate by spread tag BEFORE the per-position loop so
+                # we don't half-close a spread via the per-leg logic.
+                if self.credit_spread_exits is not None:
+                    try:
+                        self._evaluate_credit_spreads(open_pos, marks)
+                    except Exception as e:                    # noqa: BLE001
+                        log.warning("credit_spread_exit_failed", err=str(e))
+                        try:
+                            from .notify.issue_reporter import report_issue
+                            report_issue(
+                                scope="credit_spread_exits",
+                                message=f"exit eval failed: {type(e).__name__}: {e}",
+                                exc=e,
+                            )
+                        except Exception:
+                            pass
+                    # Refresh position list — some legs may have just
+                    # been submitted for close. Stale positions would
+                    # cause the per-leg loop below to issue a second
+                    # close order.
+                    open_pos = list(self.broker.positions())
+
                 for pos in open_pos:
                     price = marks.get(
                         pos.symbol,
@@ -795,6 +1016,18 @@ class TradeBot:
                         )
             except Exception as e:  # noqa: BLE001
                 log.warning("fast_loop_error", err=str(e))
+                # Push to Discord alerts. Throttled by (scope, message)
+                # fingerprint inside report_issue, so a repeating error
+                # in a tight loop sends one alert every 5 minutes.
+                try:
+                    from .notify.issue_reporter import report_issue
+                    report_issue(
+                        scope="fast_loop",
+                        message=f"fast-exit thread: {type(e).__name__}: {e}",
+                        exc=e,
+                    )
+                except Exception:
+                    pass
             self._stop.wait(interval)
 
     def main_loop(self) -> None:
@@ -838,9 +1071,40 @@ class TradeBot:
                             self.wheel_runner.tick()
                         except Exception as e:              # noqa: BLE001
                             log.warning("wheel_runner_tick_failed", err=str(e))
+                            try:
+                                from .notify.issue_reporter import report_issue
+                                report_issue(
+                                    scope="wheel_runner.tick",
+                                    message=f"wheel tick failed: {type(e).__name__}: {e}",
+                                    exc=e,
+                                )
+                            except Exception:
+                                pass
                     else:
                         for symbol in self.s.universe:
                             self._tick_symbol(symbol)
+                    # Credit-spread runners tick AFTER directional/wheel.
+                    # They have their own time-of-day gates + idempotency
+                    # so running every main loop tick is safe.
+                    for runner_name, runner in (
+                        ("weekly_credit_spread", self.weekly_cs_runner),
+                        ("zero_dte_credit_spread", self.zero_dte_cs_runner),
+                    ):
+                        if runner is None:
+                            continue
+                        try:
+                            runner.tick()
+                        except Exception as e:              # noqa: BLE001
+                            log.warning("%s_tick_failed", runner_name, err=str(e))
+                            try:
+                                from .notify.issue_reporter import report_issue
+                                report_issue(
+                                    scope=f"{runner_name}.tick",
+                                    message=f"{runner_name} tick failed: {type(e).__name__}: {e}",
+                                    exc=e,
+                                )
+                            except Exception:
+                                pass
                 # Mark every open position at current market so equity reflects
                 # live P&L (otherwise it's frozen at avg_price until a close).
                 # Fail-soft — a bad chain fetch shouldn't stop the loop.
@@ -852,10 +1116,34 @@ class TradeBot:
                         )
                 except Exception as e:                        # noqa: BLE001
                     log.warning("mtm_tick_failed", err=str(e))
+                    try:
+                        from .notify.issue_reporter import report_issue
+                        report_issue(
+                            scope="mark_to_market",
+                            message=f"MTM tick failed: {type(e).__name__}: {e}",
+                            exc=e,
+                        )
+                    except Exception:
+                        pass
             except Exception as e:  # noqa: BLE001
                 log.error("main_loop_error", err=str(e))
-                self.notifier.notify(f"main_loop_error: {e}", level="error",
-                                     title="tradebot")
+                # title="error" routes to #tradebot-alerts per the
+                # MultiChannelNotifier map. "tradebot" used to fall back
+                # to default — this is the fix.
+                try:
+                    from .notify.issue_reporter import report_issue
+                    report_issue(
+                        scope="main_loop",
+                        message=f"main_loop_error: {type(e).__name__}: {e}",
+                        exc=e,
+                    )
+                except Exception:
+                    # Belt-and-suspenders: if report_issue itself is
+                    # unavailable, fall back to the old direct notifier.
+                    self.notifier.notify(
+                        f"main_loop_error: {e}",
+                        level="error", title="error",
+                    )
             self._stop.wait(interval)
 
     def _check_halt_conditions(self) -> None:
@@ -865,6 +1153,54 @@ class TradeBot:
         # Track peak equity for peak-to-trough DD
         if acct.equity > self._peak_equity:
             self._peak_equity = acct.equity
+
+        # VIX regime gate (quant-advisor recommendation).
+        # Three regimes:
+        #   VIX < 15                     → low vol, trend strategies work → OK to trade
+        #   VIX 15-25                    → normal, trade with care → OK
+        #   VIX > regime_halt_vix        → crisis/fear, directional alpha compresses,
+        #                                   correlations converge, bid-ask widens → STAND DOWN
+        # When VIX/VIX3M > 1.0 (backwardation) it signals acute stress
+        # ahead of the spot index — also a stand-down signal.
+        try:
+            regime_halt_vix = float(self.s.get("vix.regime_halt_vix", 25.0))
+            backwardation_halt_enabled = bool(self.s.get(
+                "vix.backwardation_halt_enabled", False))   # off by default
+            vix_now = self.vix_probe.value()
+            if vix_now > regime_halt_vix:
+                self._halted_today = True
+                log.warning("vix_regime_halt", vix=vix_now, threshold=regime_halt_vix)
+                self.notifier.notify(
+                    f"VIX regime halt — standing down for the day.",
+                    level="error", title="HALT",
+                    meta={
+                        "vix_now": f"{vix_now:.2f}",
+                        "threshold": f"{regime_halt_vix:.2f}",
+                        "reason": "VIX above regime-halt threshold; directional alpha compresses and spreads widen in high-vol regimes",
+                    },
+                )
+                return
+            # Optional backwardation check (needs VIX3M feed)
+            if backwardation_halt_enabled:
+                vix3m = float(self.s.get("vix.vix3m_override", 0) or 0)
+                if vix3m > 0 and vix_now / vix3m > 1.0:
+                    self._halted_today = True
+                    log.warning("vix_backwardation_halt",
+                                 vix=vix_now, vix3m=vix3m,
+                                 ratio=vix_now/vix3m)
+                    self.notifier.notify(
+                        f"VIX term structure in backwardation — crisis signal.",
+                        level="error", title="HALT",
+                        meta={
+                            "vix": f"{vix_now:.2f}",
+                            "vix3m": f"{vix3m:.2f}",
+                            "ratio": f"{vix_now/vix3m:.3f}",
+                            "reason": "VIX > VIX3M (backwardation) historically precedes sharp moves; stand down",
+                        },
+                    )
+                    return
+        except Exception as e:                               # noqa: BLE001
+            log.warning("vix_regime_check_failed", err=str(e))
         cap = self.s.max_daily_loss_pct * acct.equity
         if acct.day_pnl <= -cap:
             self._halted_today = True

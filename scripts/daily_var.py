@@ -31,8 +31,10 @@ from src.risk.vol_scaling import realized_vol_annualized
 from src.storage.position_snapshot import load_snapshot
 from src.intelligence.dividend_yield import DividendYieldProvider
 from src.notify.base import build_notifier
+from src.notify.issue_reporter import alert_on_crash
 
 
+@alert_on_crash("daily_var", rethrow=False)
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--horizon-days", type=float, default=1.0)

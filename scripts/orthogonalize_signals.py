@@ -35,8 +35,10 @@ import numpy as np
 
 from src.core.config import load_settings
 from src.storage.journal import build_journal
+from src.notify.issue_reporter import alert_on_crash
 
 
+@alert_on_crash("orthogonalize_signals", rethrow=False)
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=30)
