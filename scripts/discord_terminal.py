@@ -87,10 +87,29 @@ CHANNEL_IDS: Set[int] = (
     | _parse_id_set(os.getenv("DISCORD_TERMINAL_CHANNEL_ID") or "")
 )
 
+# Channels whose free-form chat should use the 70B model for detailed
+# answers instead of the 8B default. These must ALSO be in CHANNEL_IDS.
+CHAT_70B_CHANNEL_IDS: Set[int] = _parse_id_set(
+    os.getenv("DISCORD_CHAT_70B_CHANNELS")
+    or os.getenv("DISCORD_CHAT_70B_CHANNEL_IDS") or ""
+)
+
+# Tag to use when a channel is in the 70B set. Falls back to LLM_AUDITOR_MODEL
+# (same 70B that does the nightly audit) to avoid duplicating the model spec.
+CHAT_70B_MODEL = (
+    os.getenv("LLM_CHAT_70B_MODEL", "").strip()
+    or os.getenv("LLM_AUDITOR_MODEL", "").strip()
+    or "llama3.1:70b"
+)
+
 AUTH_USERS = _parse_id_set(os.getenv("DISCORD_TERMINAL_AUTHORIZED_USERS") or "")
 COMMAND_PREFIX    = os.getenv("DISCORD_TERMINAL_PREFIX", "!").strip() or "!"
 MAX_OUT_CHARS     = 1850      # keep us under Discord's 2000-char message cap
 CMD_TIMEOUT_SEC   = 180.0     # longest single command (70B audit can take 2 min)
+# 70B chat can be slow (3-6 tok/sec on Jetson); give it room without
+# blocking the Discord heartbeat forever.
+CHAT_70B_TIMEOUT_SEC = float(os.getenv("LLM_CHAT_70B_TIMEOUT_SEC", "180"))
+CHAT_70B_MAX_TOKENS  = int(os.getenv("LLM_CHAT_70B_MAX_TOKENS", "700"))
 RATE_LIMIT_MAX    = 12
 RATE_LIMIT_WINDOW = 60.0      # seconds
 AUDIT_LOG_PATH    = Path(
@@ -128,6 +147,8 @@ HELP_TEXT = (
     f"  `{COMMAND_PREFIX}logs [N]`     — last N log lines (default 100)\n"
     f"  `{COMMAND_PREFIX}doctor`        — run readiness check\n"
     f"  `{COMMAND_PREFIX}panel`         — post the button-panel in this channel\n"
+    f"  `{COMMAND_PREFIX}ask <question>` — ask the LLM (8B default, 70B in "
+    "designated channels)\n"
     "\nLifecycle:\n"
     f"  `{COMMAND_PREFIX}start`  `{COMMAND_PREFIX}stop`  `{COMMAND_PREFIX}restart`\n"
     "\nReports:\n"
@@ -137,6 +158,8 @@ HELP_TEXT = (
     "\nDangerous (require DESTROY confirmation):\n"
     f"  `{COMMAND_PREFIX}reset-paper`  — flatten + wipe journal\n"
     f"  `{COMMAND_PREFIX}wipe`          — wipe journal only\n"
+    "\nFree-form chat: in chat-enabled channels, any non-command message "
+    "routes to the LLM automatically.\n"
 )
 
 
@@ -363,6 +386,57 @@ class CommandRunner:
 # --------------------------------------------------------------- discord
 
 
+def _build_chat_context():
+    """Pull a compact bot-state snapshot from the journal + broker snap.
+    Used by both the startup hello and the free-form chat. Fail-open —
+    if anything is missing, return a ChatContext with whatever we have.
+    """
+    from datetime import datetime, timezone
+    try:
+        from src.intelligence.llm_chat import ChatContext
+    except Exception:
+        return None
+    ctx = ChatContext(now_iso=datetime.now(tz=timezone.utc).isoformat())
+    # broker_state.json → positions + day_pnl
+    snap_path = ROOT / "logs" / "broker_state.json"
+    if snap_path.exists():
+        try:
+            data = json.loads(snap_path.read_text())
+            ctx.open_positions = len(data.get("positions", []) or [])
+            ctx.positions_summary = [
+                f"{p.get('symbol','?')} qty={p.get('qty','?')}"
+                f" avg=${p.get('avg_price',0):.2f}"
+                for p in (data.get("positions") or [])[:6]
+            ]
+            ctx.day_pnl_usd = float(data.get("day_pnl", 0.0))
+        except Exception:
+            pass
+    # settings.yaml → universe + live_trading flag
+    try:
+        from src.core.config import load_settings
+        s = load_settings(ROOT / "config" / "settings.yaml")
+        uni = s.raw.get("universe") if hasattr(s, "raw") else None
+        if isinstance(uni, list):
+            ctx.universe = [str(x) for x in uni][:6]
+        elif isinstance(uni, dict):
+            ctx.universe = [str(x) for x in (uni.get("symbols") or [])[:6]]
+        ctx.live_trading = bool(
+            (s.raw.get("execution", {}) or {}).get("live_trading", False)
+        )
+    except Exception:
+        pass
+    # latest strategy-audit summary
+    try:
+        from src.intelligence.strategy_auditor import read_recent_audits
+        recent = read_recent_audits(1)
+        if recent:
+            ctx.last_audit_health = recent[0].get("overall_health")
+            ctx.last_audit_summary = recent[0].get("summary")
+    except Exception:
+        pass
+    return ctx
+
+
 def _build_app():
     """Construct the discord client + command router. Lazy-imports
     discord so `import discord_terminal` doesn't require the lib to be
@@ -370,10 +444,53 @@ def _build_app():
     import discord
     from discord import app_commands   # noqa: F401
 
+    # LLM chat — built once, reused across messages. Off unless
+    # LLM_CHAT_ENABLED=1 in .env.
+    try:
+        from src.intelligence.llm_chat import build_llm_chat_from_env
+        chat = build_llm_chat_from_env()
+    except Exception as e:
+        _log.warning("llm_chat_init_failed err=%s", e)
+        chat = None
+
     intents = discord.Intents.default()
     intents.message_content = True
     client = discord.Client(intents=intents)
     runner = CommandRunner()
+
+    def _pick_chat_model_for_channel(channel_id: int) -> Optional[str]:
+        """70B for designated channels, None (= default 8B) otherwise."""
+        if channel_id in CHAT_70B_CHANNEL_IDS:
+            return CHAT_70B_MODEL
+        return None
+
+    async def _handle_chat_question(message, question: str) -> None:
+        """Route a free-form question through LLMChat and post the
+        answer. Uses the 70B model if this channel is in the 70B set."""
+        if chat is None or not chat.cfg.enabled:
+            return
+        model_override = _pick_chat_model_for_channel(message.channel.id)
+        is_70b = model_override is not None
+        # Long-running 70B calls: show typing so the user sees progress.
+        try:
+            async with message.channel.typing():
+                ctx = _build_chat_context()
+                answer = await asyncio.to_thread(
+                    chat.answer, question, ctx,
+                    user_id=message.author.id,
+                    model_override=model_override,
+                    max_tokens_override=(CHAT_70B_MAX_TOKENS if is_70b else None),
+                )
+        except Exception as e:
+            _log.warning("llm_chat_handler_failed err=%s", e)
+            answer = "_chat failed — check logs._"
+        tag = f" · model={model_override}" if model_override else ""
+        await message.channel.send(_truncate(answer) + tag)
+        _audit({"kind": "chat",
+                "user": message.author.id,
+                "channel": message.channel.id,
+                "model": model_override or chat.cfg.model_name,
+                "q_len": len(question), "a_len": len(answer)})
 
     # ------------------------- button panel -------------------------
 
@@ -457,11 +574,41 @@ def _build_app():
     async def on_ready():
         _log.info("discord_terminal_ready user=%s id=%s",
                    client.user, getattr(client.user, "id", "?"))
-        _log.info("listening in channels=%s authorized_users=%s",
-                   sorted(CHANNEL_IDS), sorted(AUTH_USERS))
+        _log.info("listening in channels=%s authorized_users=%s chat_70b=%s",
+                   sorted(CHANNEL_IDS), sorted(AUTH_USERS),
+                   sorted(CHAT_70B_CHANNEL_IDS))
         # Re-register the persistent view so old panel buttons keep working
         # across every channel the user has !panel-ed in.
         client.add_view(ControlPanel())
+
+        # Startup hello — posts one line per configured channel so the
+        # operator can visually confirm every channel is wired up and
+        # which model is answering there.
+        ctx = _build_chat_context()
+        if chat is not None and ctx is not None:
+            base_hello = chat.hello(ctx)
+        else:
+            base_hello = "**tradebot online** · chat disabled"
+        for cid in sorted(CHANNEL_IDS):
+            try:
+                ch = client.get_channel(cid) or await client.fetch_channel(cid)
+                if ch is None:
+                    _log.warning("discord_terminal_channel_missing id=%s", cid)
+                    continue
+                chat_suffix = ""
+                if chat is not None and chat.cfg.enabled:
+                    if cid in CHAT_70B_CHANNEL_IDS:
+                        chat_suffix = (f" · chat=ON ({CHAT_70B_MODEL}, 70B "
+                                        "for detailed answers)")
+                    else:
+                        chat_suffix = f" · chat=ON ({chat.cfg.model_name})"
+                else:
+                    chat_suffix = " · chat=OFF"
+                await ch.send(base_hello + chat_suffix
+                               + " — ask me anything")
+            except Exception as e:
+                _log.warning("discord_terminal_hello_failed cid=%s err=%s",
+                              cid, e)
 
     @client.event
     async def on_message(message):
@@ -474,7 +621,13 @@ def _build_app():
         if message.channel.id not in CHANNEL_IDS:
             return
         text = (message.content or "").strip()
+        if not text:
+            return
+
+        # Non-command: route to LLM chat if enabled, else silently ignore
         if not text.startswith(COMMAND_PREFIX):
+            if chat is not None and chat.cfg.enabled:
+                await _handle_chat_question(message, text)
             return
 
         # Extract the command word
@@ -495,6 +648,16 @@ def _build_app():
                 "**tradebot control panel**",
                 view=ControlPanel(),
             )
+            return
+        if command == "ask":
+            # Explicit LLM chat: !ask <question>
+            question = bare[len("ask"):].strip()
+            if not question:
+                await message.channel.send(
+                    f"Usage: `{COMMAND_PREFIX}ask <question>`"
+                )
+                return
+            await _handle_chat_question(message, question)
             return
         if command == "destroy":
             # confirm a pending destructive action

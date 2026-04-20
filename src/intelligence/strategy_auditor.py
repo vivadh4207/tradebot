@@ -379,14 +379,35 @@ def build_auditor_from_settings(settings) -> Optional[StrategyAuditor]:
         except Exception:
             pass
     # Shared backend flag — same LLM_BACKEND env the brain reads.
-    backend = (os.getenv("LLM_BACKEND", "").strip().lower()
-                or str(cfg_d.get("backend", "llama_cpp")).lower())
+    # Strip surrounding quotes/whitespace so values like "ollama" or
+    # ' ollama ' in .env still parse correctly.
+    raw_backend = os.getenv("LLM_BACKEND", "")
+    raw_backend = raw_backend.strip().strip('"').strip("'").lower()
+    backend = (raw_backend
+                or str(cfg_d.get("backend", "llama_cpp")).strip().lower())
     if backend not in ("ollama", "llama_cpp"):
         backend = "llama_cpp"
+
+    # Auto-promote to ollama if the daemon is up and an auditor tag is
+    # configured. Avoids the common footgun where the user sets
+    # LLM_AUDITOR_MODEL=llama3.1:70b but forgets LLM_BACKEND=ollama
+    # and the audit silently falls through to the llama_cpp GGUF path.
+    if backend == "llama_cpp" and os.getenv("LLM_AUDITOR_MODEL", "").strip():
+        try:
+            from .ollama_client import build_ollama_client
+            if build_ollama_client().ping():
+                _log.info("strategy_auditor_backend_autopromoted "
+                          "to=ollama reason=auditor_tag_set_and_daemon_up")
+                backend = "ollama"
+        except Exception:
+            pass
 
     # Model name — ollama tag (e.g. "llama3.1:70b") or informational name.
     model_name = (os.getenv("LLM_AUDITOR_MODEL", "").strip()
                   or str(cfg_d.get("model_name", "llama-3.1-70b-q4")))
+
+    _log.info("strategy_auditor_config backend=%s model=%s path=%s",
+              backend, model_name, model_path)
 
     cfg = StrategyAuditorConfig(
         backend=backend,

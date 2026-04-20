@@ -446,8 +446,10 @@ def build_llm_brain_from_settings(settings) -> Optional[LLMBrain]:
             pass
 
     # Backend: "ollama" (HTTP) or "llama_cpp" (GGUF load). Env wins.
-    backend = (os.getenv("LLM_BACKEND", "").strip().lower()
-                or str(cfg_dict.get("backend", "llama_cpp")).lower())
+    raw_backend = os.getenv("LLM_BACKEND", "")
+    raw_backend = raw_backend.strip().strip('"').strip("'").lower()
+    backend = (raw_backend
+                or str(cfg_dict.get("backend", "llama_cpp")).strip().lower())
     if backend not in ("ollama", "llama_cpp"):
         backend = "llama_cpp"
 
@@ -455,6 +457,18 @@ def build_llm_brain_from_settings(settings) -> Optional[LLMBrain]:
     # LLM_BRAIN_MODEL env overrides settings.yaml's model_name.
     model_name = (os.getenv("LLM_BRAIN_MODEL", "").strip()
                   or str(cfg_dict.get("model_name", "llama-3.1-8b-q4")))
+
+    # Auto-promote: if a ':'-style ollama tag was given but backend is
+    # still llama_cpp, and the daemon is up, switch to ollama.
+    if (backend == "llama_cpp" and ":" in model_name):
+        try:
+            from .ollama_client import build_ollama_client
+            if build_ollama_client().ping():
+                _log.info("llm_brain_backend_autopromoted to=ollama "
+                          "reason=colon_tag_and_daemon_up")
+                backend = "ollama"
+        except Exception:
+            pass
 
     cfg = LLMBrainConfig(
         backend=backend,
