@@ -136,6 +136,9 @@ COMMAND_MAP: Dict[str, Tuple[str, bool]] = {
     "risk-switch":   ("putcall-oi",      False),
     "audit":         ("strategy-audit",  False),
     "summary":       ("log-summary",     False),     # handled in-process; see _handle_summary
+    "ollama-status":  ("ollama-status",  False),
+    "ollama-restart": ("ollama-restart", False),
+    "ollama-warmup":  ("ollama-warmup",  False),
     "reset-paper":   ("reset-paper",     True),       # requires DESTROY confirm
     "wipe":          ("wipe-journal",    True),       # requires DESTROY confirm
 }
@@ -157,6 +160,9 @@ HELP_TEXT = (
     f"  `{COMMAND_PREFIX}risk-switch`  — refresh CBOE put/call OI state\n"
     f"  `{COMMAND_PREFIX}audit`         — 70B strategy audit (~30-120s)\n"
     f"  `{COMMAND_PREFIX}summary [N]`   — concise digest of last N min (default 60)\n"
+    f"  `{COMMAND_PREFIX}ollama-status` — Ollama daemon + loaded models\n"
+    f"  `{COMMAND_PREFIX}ollama-warmup` — Pre-load 8B + 70B into GPU memory\n"
+    f"  `{COMMAND_PREFIX}ollama-restart` — Restart Ollama daemon\n"
     "\nDangerous (require DESTROY confirmation):\n"
     f"  `{COMMAND_PREFIX}reset-paper`  — flatten + wipe journal\n"
     f"  `{COMMAND_PREFIX}wipe`          — wipe journal only\n"
@@ -655,7 +661,33 @@ def _build_app():
         async def btn_audit(self, interaction, _):
             await self._button(interaction, "audit")
 
+        @discord.ui.button(label="Ollama Status", style=discord.ButtonStyle.secondary,
+                            custom_id="tb:ollama-status", row=3)
+        async def btn_ollama_status(self, interaction, _):
+            await self._button(interaction, "ollama-status")
+
+        @discord.ui.button(label="Warm LLMs", style=discord.ButtonStyle.secondary,
+                            custom_id="tb:ollama-warmup", row=3)
+        async def btn_ollama_warmup(self, interaction, _):
+            await self._button(interaction, "ollama-warmup")
+
+        @discord.ui.button(label="Restart Ollama", style=discord.ButtonStyle.danger,
+                            custom_id="tb:ollama-restart", row=3)
+        async def btn_ollama_restart(self, interaction, _):
+            await self._button(interaction, "ollama-restart")
+
+        @discord.ui.button(label="Summary 60m", style=discord.ButtonStyle.primary,
+                            custom_id="tb:summary", row=3)
+        async def btn_summary(self, interaction, _):
+            await self._button(interaction, "summary")
+
     # ------------------------- events -------------------------
+
+    # on_ready fires on EVERY gateway connection, including reconnects.
+    # On flaky networks that means the startup hello gets posted every
+    # time Discord's gateway drops and reconnects — very spammy.
+    # Gate the hello behind a once-per-process flag.
+    _hello_state = {"sent": False}
 
     @client.event
     async def on_ready():
@@ -665,17 +697,24 @@ def _build_app():
                    sorted(CHANNEL_IDS), sorted(AUTH_USERS),
                    sorted(CHAT_70B_CHANNEL_IDS))
         # Re-register the persistent view so old panel buttons keep working
-        # across every channel the user has !panel-ed in.
+        # across every channel the user has !panel-ed in. Safe to call
+        # on every reconnect.
         client.add_view(ControlPanel())
+
+        if _hello_state["sent"]:
+            _log.info("discord_terminal_hello_skipped reason=already_sent_this_process")
+            return
 
         # Startup hello — posts one line per configured channel so the
         # operator can visually confirm every channel is wired up and
-        # which model is answering there.
+        # which model is answering there. Only runs on the FIRST
+        # on_ready within this process; reconnects don't re-spam it.
         ctx = _build_chat_context()
         if chat is not None and ctx is not None:
             base_hello = chat.hello(ctx)
         else:
             base_hello = "**tradebot online** · chat disabled"
+        sent_any = False
         for cid in sorted(CHANNEL_IDS):
             try:
                 ch = client.get_channel(cid) or await client.fetch_channel(cid)
@@ -693,9 +732,12 @@ def _build_app():
                     chat_suffix = " · chat=OFF"
                 await ch.send(base_hello + chat_suffix
                                + " — ask me anything")
+                sent_any = True
             except Exception as e:
                 _log.warning("discord_terminal_hello_failed cid=%s err=%s",
                               cid, e)
+        if sent_any:
+            _hello_state["sent"] = True
 
     @client.event
     async def on_message(message):

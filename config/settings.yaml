@@ -298,12 +298,14 @@ ensemble:
   # Regime × signal-source weight overrides. Comment out to use DEFAULT_WEIGHTS
   # in src/signals/ensemble.py. Any regime/source not listed uses 1.0 (neutral).
   weights:
-    trend_lowvol: {momentum: 1.30, orb: 0.80, vwap_reversion: 0.60, vrp: 0.70, wheel: 0.70, lstm: 1.20, claude_ai: 1.10}
-    trend_highvol: {momentum: 1.10, orb: 0.70, vwap_reversion: 0.50, vrp: 0.80, wheel: 0.60, lstm: 0.90, claude_ai: 0.90}
-    range_lowvol: {momentum: 0.60, orb: 1.00, vwap_reversion: 1.30, vrp: 1.00, wheel: 1.00, lstm: 0.80, claude_ai: 0.90}
-    range_highvol: {momentum: 0.50, orb: 0.90, vwap_reversion: 1.10, vrp: 1.40, wheel: 1.30, lstm: 0.70, claude_ai: 0.80}
-    opening: {momentum: 0.80, orb: 1.50, vwap_reversion: 0.80, vrp: 0.60, wheel: 0.60, lstm: 0.80, claude_ai: 0.90}
-    closing: {momentum: 0.30, orb: 0.30, vwap_reversion: 0.30, vrp: 0.20, wheel: 0.20, lstm: 0.30, claude_ai: 0.30}
+    # lstm=0: no trained checkpoint on disk, zero-signal poisons the average.
+    # candle_patterns: new — chart-reading layer, helps quick entries.
+    trend_lowvol: {momentum: 1.30, orb: 0.80, vwap_reversion: 0.60, vrp: 0.70, wheel: 0.70, lstm: 0.00, claude_ai: 1.10, candle_patterns: 1.00}
+    trend_highvol: {momentum: 1.10, orb: 0.70, vwap_reversion: 0.50, vrp: 0.80, wheel: 0.60, lstm: 0.00, claude_ai: 0.90, candle_patterns: 1.10}
+    range_lowvol: {momentum: 0.60, orb: 1.00, vwap_reversion: 1.30, vrp: 1.00, wheel: 1.00, lstm: 0.00, claude_ai: 0.90, candle_patterns: 1.30}
+    range_highvol: {momentum: 0.50, orb: 0.90, vwap_reversion: 1.10, vrp: 1.40, wheel: 1.30, lstm: 0.00, claude_ai: 0.80, candle_patterns: 1.20}
+    opening: {momentum: 0.80, orb: 1.50, vwap_reversion: 0.80, vrp: 0.60, wheel: 0.60, lstm: 0.00, claude_ai: 0.90, candle_patterns: 0.90}
+    closing: {momentum: 0.30, orb: 0.30, vwap_reversion: 0.30, vrp: 0.20, wheel: 0.20, lstm: 0.00, claude_ai: 0.30, candle_patterns: 0.30}
 
 # ===== Extra signal sources + ORB retest + breadth =====
 # All off by default — operator flips each to true when ready to test.
@@ -313,15 +315,28 @@ signals:
     retest_required: false       # wait for breakout + pullback + reclaim
     retest_band_pct: 0.0015       # 0.15% band around OR boundary for retest
   extreme_momentum:
-    enabled: false                # shock-pattern detector, complementary to momentum
+    enabled: true                 # shock-pattern detector, complementary to momentum
     lookback_bars: 5
     baseline_bars: 20
     min_move_pct: 0.03             # 3% move in lookback window
     min_volume_multiple: 3.0       # 3× baseline volume
     confidence: 0.85
+  # Chart-reading layer: engulfing, hammer, shooting star, inside-bar
+  # breakout, 20-bar range breakout. Volume-gated so low-volume
+  # breakouts don't fire as false signals.
+  candle_patterns:
+    enabled: true
+    min_bars: 20
+    volume_hi_ratio: 1.5           # bar vol >= 1.5x 20-bar avg = confirmed
+    volume_lo_ratio: 0.6           # bar vol <= 0.6x 20-bar avg = weak
+    low_vol_damp: 0.20             # subtract from confidence on low vol
+    high_vol_boost: 0.10           # add to confidence on high vol
+    near_vwap_bps: 50.0            # within 0.50% of VWAP = "near"
+    near_vwap_boost: 0.05
+    continuation_require_volume: true   # drop low-vol breakouts
 
 breadth:
-  enabled: false                   # composite risk-on/off probe
+  enabled: true                    # composite risk-on/off probe
   cache_seconds: 60
   risk_off_threshold: -0.3         # credit-spread runners stand down below this
 
@@ -429,10 +444,10 @@ strategy_auditor:
 # Feeds into StrategyAuditor so the 70B sees political risk alongside
 # config and trade history.
 political_news:
-  enabled: false                      # flip true after setting sources below
+  enabled: true
   alpaca_enabled: true                # reuse existing Alpaca News auth
-  x_enabled: false                    # flip true + curate x_handles
-  rss_enabled: false                  # flip true + add rss_feeds
+  x_enabled: true                     # Twitter via Nitter
+  rss_enabled: true                   # CNBC, Reuters, Bloomberg, Reddit, Truth, Fed, WH
   nitter_instance: https://nitter.privacydev.net
   x_handles:
     - WhiteHouse
@@ -443,14 +458,35 @@ political_news:
     - SpeakerJohnson
     - SenSchumer
     - realDonaldTrump
+    - elonmusk
+    - jimcramer
+    - zerohedge
+    - unusual_whales
+  # Broad source mix: mainstream financial press, government primary
+  # sources, political/social sentiment. Add/remove freely.
   rss_feeds:
-    # Example: put any RSS URL here. Truth Social archives, Fed
-    # speeches, White House press briefings, etc. Left empty by
-    # default — operator curates.
-    # - https://www.federalreserve.gov/feeds/speeches.xml
-    # - https://www.whitehouse.gov/feed/
+    # Financial mainstream
+    - https://feeds.content.dowjones.io/public/rss/mw_topstories
+    - https://www.cnbc.com/id/100003114/device/rss/rss.html      # CNBC Top News
+    - https://www.cnbc.com/id/10001147/device/rss/rss.html       # CNBC Markets
+    - https://feeds.reuters.com/reuters/businessNews
+    - https://feeds.reuters.com/reuters/topNews
+    - https://feeds.bloomberg.com/markets/news.rss
+    # Reddit pulse (heavier noise, but useful retail sentiment)
+    - https://www.reddit.com/r/wallstreetbets/.rss
+    - https://www.reddit.com/r/stocks/hot/.rss
+    - https://www.reddit.com/r/options/.rss
+    # Macro primary sources
+    - https://www.federalreserve.gov/feeds/speeches.xml
+    - https://www.federalreserve.gov/feeds/press_all.xml
+    - https://www.whitehouse.gov/feed/
+    - https://home.treasury.gov/rss/press-releases
+    # Truth Social — public user RSS via community archives. If the
+    # archive changes URL, comment out this line until the new one is
+    # curated. Fails gracefully if 404.
+    - https://trumpstruth.org/feed
   lookback_hours: 24
-  max_headlines: 40
+  max_headlines: 60                    # more sources -> more headlines
   cache_seconds: 900                  # 15 min
   http_timeout_sec: 8.0
 

@@ -480,6 +480,74 @@ cmd_discord_uninstall() {
   echo "discord terminal unloaded + removed"
 }
 
+# ----- Ollama quick ops (Linux only, uses sudo systemctl / HTTP API) -----
+# Button-triggered from Discord panel. Keeps common "fix hung LLM"
+# actions one click away instead of requiring SSH.
+
+cmd_ollama_restart() {
+  if [[ "$HOST_OS" != "Linux" ]]; then
+    echo "ollama-restart is Linux-only."; return 2
+  fi
+  echo "restarting ollama daemon..."
+  if sudo -n systemctl restart ollama 2>/dev/null; then
+    sleep 3
+    if curl -sS -m 5 http://127.0.0.1:11434/api/tags >/dev/null; then
+      echo "ollama restarted + reachable"
+      return 0
+    fi
+    echo "ollama restarted but /api/tags unreachable"
+    return 1
+  fi
+  echo "sudo systemctl restart ollama FAILED (no passwordless sudo?)"
+  echo "fallback: pkill -9 ollama then let systemd restart"
+  pkill -9 ollama 2>/dev/null || true
+  sleep 3
+  if curl -sS -m 5 http://127.0.0.1:11434/api/tags >/dev/null; then
+    echo "ollama came back via systemd auto-restart"
+    return 0
+  fi
+  echo "ollama not reachable after fallback"
+  return 1
+}
+
+cmd_ollama_warmup() {
+  # Fire a tiny request to each model so Ollama keeps them in memory.
+  # keep_alive=30m prevents eviction for the next half hour.
+  local base="${OLLAMA_BASE_URL:-http://127.0.0.1:11434}"
+  local brain="${LLM_BRAIN_MODEL:-llama3.1:8b}"
+  local audit="${LLM_AUDITOR_MODEL:-llama3.1:70b}"
+  echo "warming up ${brain}..."
+  curl -sS -m 90 "${base}/api/generate" \
+       -H "Content-Type: application/json" \
+       -d "{\"model\":\"${brain}\",\"prompt\":\"ok\",\"stream\":false,\"keep_alive\":\"30m\"}" \
+       >/dev/null && echo "  ${brain} warm"
+  echo "warming up ${audit} (may take 1-3 min first call)..."
+  curl -sS -m 400 "${base}/api/generate" \
+       -H "Content-Type: application/json" \
+       -d "{\"model\":\"${audit}\",\"prompt\":\"ok\",\"stream\":false,\"keep_alive\":\"30m\"}" \
+       >/dev/null && echo "  ${audit} warm"
+  echo "done"
+}
+
+cmd_ollama_status() {
+  local base="${OLLAMA_BASE_URL:-http://127.0.0.1:11434}"
+  echo "== ollama =="
+  if curl -sS -m 3 "${base}/api/tags" >/dev/null; then
+    echo "daemon: reachable @ ${base}"
+  else
+    echo "daemon: UNREACHABLE @ ${base}"
+    return 1
+  fi
+  echo ""
+  echo "== pulled models =="
+  curl -sS -m 5 "${base}/api/tags" \
+    | python3 -c "import sys,json;d=json.load(sys.stdin);[print(f'  {m[\"name\"]:30s}  size={m.get(\"size\",0)/1e9:5.1f} GB') for m in d.get('models',[])]"
+  echo ""
+  echo "== currently loaded in memory =="
+  curl -sS -m 5 "${base}/api/ps" \
+    | python3 -c "import sys,json;d=json.load(sys.stdin);[print(f'  {m[\"name\"]:30s}  vram={m.get(\"size_vram\",0)/1e9:5.1f} GB') for m in d.get('models',[])] or print('  (none)')"
+}
+
 cmd_summary_install() {
   if [[ "$HOST_OS" != "Linux" ]]; then
     echo "summary-install is Linux-only (uses systemd --user timer)."
@@ -616,6 +684,9 @@ case "${1:-}" in
   summary-install)    cmd_summary_install ;;
   summary-uninstall)  cmd_summary_uninstall ;;
   log-summary)        shift; "$PY" "$ROOT/scripts/post_log_summary.py" "$@" ;;
+  ollama-restart)     cmd_ollama_restart ;;
+  ollama-warmup)      cmd_ollama_warmup ;;
+  ollama-status)      cmd_ollama_status ;;
   *)
     cat <<EOF
 usage: $(basename "$0") {start|stop|restart|status|logs|backtest|priors|walkforward|dashboard|testdb|

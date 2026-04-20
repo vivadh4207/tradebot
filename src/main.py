@@ -499,6 +499,26 @@ class TradeBot:
                     )
                 ))
                 log.info("extreme_momentum_signal_enabled")
+            # Optional candle-pattern signal — chart-reading layer.
+            # Detects bullish/bearish reversals + breakouts with volume
+            # confirmation. Helps catch entries before slope-based
+            # momentum triggers.
+            cp_cfg = settings.raw.get("signals", {}).get("candle_patterns", {}) or {}
+            if cp_cfg.get("enabled", False):
+                from .signals.candle_patterns import CandlePatternSignal
+                self.strategies.append(CandlePatternSignal(
+                    min_bars=int(cp_cfg.get("min_bars", 20)),
+                    volume_hi_ratio=float(cp_cfg.get("volume_hi_ratio", 1.5)),
+                    volume_lo_ratio=float(cp_cfg.get("volume_lo_ratio", 0.6)),
+                    low_vol_damp=float(cp_cfg.get("low_vol_damp", 0.20)),
+                    high_vol_boost=float(cp_cfg.get("high_vol_boost", 0.10)),
+                    near_vwap_bps=float(cp_cfg.get("near_vwap_bps", 50.0)),
+                    near_vwap_boost=float(cp_cfg.get("near_vwap_boost", 0.05)),
+                    continuation_require_volume=bool(
+                        cp_cfg.get("continuation_require_volume", True)
+                    ),
+                ))
+                log.info("candle_patterns_signal_enabled")
             # Optional TradingView webhook signal. The ingest side runs
             # in the dashboard process (POST /webhook/tradingview). This
             # source polls the file-backed queue each tick. The bot
