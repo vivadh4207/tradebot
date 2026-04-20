@@ -116,7 +116,6 @@ COMMAND_MAP: Dict[str, Tuple[str, bool]] = {
     "walkforward":   ("walkforward",     False),
     "risk-switch":   ("putcall-oi",      False),
     "audit":         ("strategy-audit",  False),
-    "ask":           ("_chat_intercept", False),     # routed to LLM, not tradebotctl
     "reset-paper":   ("reset-paper",     True),       # requires DESTROY confirm
     "wipe":          ("wipe-journal",    True),       # requires DESTROY confirm
 }
@@ -135,9 +134,6 @@ HELP_TEXT = (
     f"  `{COMMAND_PREFIX}walkforward`   — nightly edge report on demand\n"
     f"  `{COMMAND_PREFIX}risk-switch`  — refresh CBOE put/call OI state\n"
     f"  `{COMMAND_PREFIX}audit`         — 70B strategy audit (~30-120s)\n"
-    "\nAsk the 8B LLM (requires LLM_CHAT_ENABLED=1):\n"
-    f"  `{COMMAND_PREFIX}ask <question>` — explicit ask\n"
-    "  or just type a question without the prefix — bot answers.\n"
     "\nDangerous (require DESTROY confirmation):\n"
     f"  `{COMMAND_PREFIX}reset-paper`  — flatten + wipe journal\n"
     f"  `{COMMAND_PREFIX}wipe`          — wipe journal only\n"
@@ -457,81 +453,6 @@ def _build_app():
 
     # ------------------------- events -------------------------
 
-    # LLM chat wrapper — lazily constructed so the module works even
-    # when LLM_CHAT_ENABLED=0.
-    _chat_holder = {"chat": None}
-
-    def _get_chat():
-        if _chat_holder["chat"] is None:
-            try:
-                from src.intelligence.llm_chat import build_llm_chat_from_env
-                _chat_holder["chat"] = build_llm_chat_from_env()
-            except Exception as e:
-                _log.warning("llm_chat_init_failed err=%s", e)
-                _chat_holder["chat"] = False   # sentinel: init tried + failed
-        return _chat_holder["chat"] or None
-
-    async def _build_chat_context():
-        """Assemble a ChatContext from the local broker snapshot +
-        recent audit log. Runs in the bot process, separate from the
-        trade loop, so it just reads on-disk state."""
-        from src.intelligence.llm_chat import ChatContext
-        import json as _j
-        from datetime import datetime as _dt, timezone as _tz
-        ctx = ChatContext(now_iso=_dt.now(tz=_tz.utc).isoformat())
-        # broker_state.json (positions + cash + day pnl)
-        bs = ROOT / "logs" / "broker_state.json"
-        if bs.exists():
-            try:
-                d = _j.loads(bs.read_text())
-                ctx.open_positions = len(d.get("positions", []))
-                ctx.day_pnl_usd = d.get("day_pnl")
-                for p in d.get("positions", []):
-                    ctx.positions_summary.append(
-                        f"{p.get('symbol','?')} qty={p.get('qty',0)} "
-                        f"avg=${p.get('avg_price',0):.2f} "
-                        f"right={p.get('right','')} "
-                        f"strike={p.get('strike','')} exp={p.get('expiry','')}")
-            except Exception:
-                pass
-        # Recent strategy audit (if any)
-        sa = ROOT / "logs" / "strategy_audit.jsonl"
-        if sa.exists():
-            try:
-                last = sa.read_text().strip().splitlines()[-1]
-                rec = _j.loads(last)
-                ctx.last_audit_summary = rec.get("summary")
-                ctx.last_audit_health = rec.get("overall_health")
-            except Exception:
-                pass
-        # Universe from settings.yaml
-        try:
-            import yaml
-            with (ROOT / "config" / "settings.yaml").open() as f:
-                s = yaml.safe_load(f) or {}
-            ctx.universe = list(s.get("universe", []))
-            ctx.live_trading = bool(s.get("live_trading", False))
-        except Exception:
-            pass
-        # Recent signals from audit log if enabled
-        sig_log = ROOT / "logs" / "signal_audit.jsonl"
-        if sig_log.exists():
-            try:
-                lines = sig_log.read_text().splitlines()[-20:]
-                for ln in lines:
-                    try:
-                        r = _j.loads(ln)
-                        ctx.recent_signals.append(
-                            f"{r.get('ts','')[:19]} {r.get('source','?')} "
-                            f"{r.get('symbol','?')} {'emit' if r.get('emitted') else 'skip'} "
-                            f"conf={r.get('confidence','')}"
-                        )
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-        return ctx
-
     @client.event
     async def on_ready():
         _log.info("discord_terminal_ready user=%s id=%s",
@@ -541,30 +462,6 @@ def _build_app():
         # Re-register the persistent view so old panel buttons keep working
         # across every channel the user has !panel-ed in.
         client.add_view(ControlPanel())
-
-        # --- startup hello to each configured channel ---
-        try:
-            import discord as _d
-            chat = _get_chat()
-            ctx = await _build_chat_context()
-            hello_text = (chat.hello(ctx) if chat
-                           else (f"**tradebot-control online** · "
-                                  f"universe={','.join(ctx.universe) or '—'} · "
-                                  f"{ctx.open_positions} open positions"))
-            note = (" · LLM chat ON — ask me anything"
-                     if chat and chat.cfg.enabled
-                     else " · LLM chat off (set `LLM_CHAT_ENABLED=1` to enable)")
-            for ch_id in CHANNEL_IDS:
-                try:
-                    ch = client.get_channel(ch_id)
-                    if ch is None:
-                        ch = await client.fetch_channel(ch_id)
-                    await ch.send(hello_text + note)
-                except Exception as e:
-                    _log.warning("startup_hello_failed channel=%s err=%s",
-                                  ch_id, e)
-        except Exception as e:
-            _log.warning("on_ready_hello_failed err=%s", e)
 
     @client.event
     async def on_message(message):
@@ -577,33 +474,6 @@ def _build_app():
         if message.channel.id not in CHANNEL_IDS:
             return
         text = (message.content or "").strip()
-
-        # --- free-form chat path (no prefix) ---
-        # Authorized user + enabled chat + non-empty message + not a
-        # command. Strip @mentions first so "@tradebot how are we?"
-        # works too.
-        if text and not text.startswith(COMMAND_PREFIX):
-            if not runner.is_authorized(message.author.id):
-                return    # silent ignore — not authorized for chat
-            chat = _get_chat()
-            if chat is None or not chat.cfg.enabled:
-                return    # silent when chat is disabled
-            # Clean out bot mentions — `<@bot_id>` at the start
-            cleaned = text
-            bot_id = getattr(client.user, "id", None)
-            if bot_id is not None:
-                for tok in (f"<@{bot_id}>", f"<@!{bot_id}>"):
-                    if cleaned.startswith(tok):
-                        cleaned = cleaned[len(tok):].strip()
-                        break
-            if not cleaned:
-                return
-            # Require at least 5 chars to reduce accidental misfires
-            if len(cleaned) < 5:
-                return
-            await _handle_chat_question(message, cleaned)
-            return
-
         if not text.startswith(COMMAND_PREFIX):
             return
 
@@ -633,46 +503,11 @@ def _build_app():
                                      "DESTROY", raw_text=text)
             await message.channel.send(_truncate(msg))
             return
-        if command == "ask":
-            # Explicit !ask <question> → LLM chat
-            if not runner.is_authorized(message.author.id):
-                await message.channel.send("Not authorized.")
-                return
-            question = bare.split(maxsplit=1)[1] if len(parts) > 1 else ""
-            if not question:
-                await message.channel.send(
-                    f"Usage: `{COMMAND_PREFIX}ask <question>`")
-                return
-            await _handle_chat_question(message, question)
-            return
 
         msg = await runner.run(message.author.id,
                                  str(message.author),
                                  command, raw_text=text)
         await message.channel.send(_truncate(msg))
-
-    async def _handle_chat_question(message, question: str):
-        """Send a question to the LLM chat backend and post the answer."""
-        chat = _get_chat()
-        if chat is None or not chat.cfg.enabled:
-            await message.channel.send(
-                "_LLM chat is off._ Enable with `LLM_CHAT_ENABLED=1` "
-                "(and `LLM_BACKEND=ollama` + `LLM_CHAT_MODEL=llama3.1:8b`) "
-                "in `.env`, then restart the bot.")
-            return
-        async with message.channel.typing():
-            ctx = await _build_chat_context()
-            # LLM inference is sync; punt to a thread so we don't block
-            # Discord's heartbeat loop.
-            import asyncio as _asyncio
-            try:
-                answer = await _asyncio.to_thread(
-                    chat.answer, question, ctx, message.author.id,
-                )
-            except Exception as e:
-                _log.warning("llm_chat_call_failed err=%s", e)
-                answer = f"_LLM call crashed: {type(e).__name__}_"
-        await message.channel.send(_truncate(answer))
 
     return client
 
