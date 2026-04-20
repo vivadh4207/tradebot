@@ -471,19 +471,27 @@ def _build_app():
             return
         model_override = _pick_chat_model_for_channel(message.channel.id)
         is_70b = model_override is not None
+        answer = ""
         # Long-running 70B calls: show typing so the user sees progress.
+        # asyncio.to_thread() is 3.9+; fall back to run_in_executor on 3.8
+        # (Jetson's default). Both dispatch the blocking LLM call to a
+        # thread pool so the Discord heartbeat keeps ticking.
         try:
             async with message.channel.typing():
                 ctx = _build_chat_context()
-                answer = await asyncio.to_thread(
-                    chat.answer, question, ctx,
-                    user_id=message.author.id,
-                    model_override=model_override,
-                    max_tokens_override=(CHAT_70B_MAX_TOKENS if is_70b else None),
+                loop = asyncio.get_event_loop()
+                answer = await loop.run_in_executor(
+                    None,
+                    lambda: chat.answer(
+                        question, ctx,
+                        user_id=message.author.id,
+                        model_override=model_override,
+                        max_tokens_override=(CHAT_70B_MAX_TOKENS if is_70b else None),
+                    ),
                 )
         except Exception as e:
-            _log.warning("llm_chat_handler_failed err=%s", e)
-            answer = "_chat failed — check logs._"
+            _log.warning("llm_chat_handler_failed err=%s", e, exc_info=True)
+            answer = f"_chat failed — {type(e).__name__}: {str(e)[:200]}_"
         tag = f" · model={model_override}" if model_override else ""
         await message.channel.send(_truncate(answer) + tag)
         _audit({"kind": "chat",
