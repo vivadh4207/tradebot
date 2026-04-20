@@ -125,10 +125,25 @@ class MirrorAlpacaBroker(PaperBroker):
             return result
         with self._lock:
             local_symbols = set(self._positions.keys())
+        # Operator override: specific symbols (zombie positions kept
+        # intentionally, e.g. a cheap long put left to expire) can be
+        # excluded from reconcile. Keeps the noise down without hiding
+        # the mirror from other positions. Comma-separated, env-only so
+        # it's trivially togglable without a deploy.
+        import os as _os
+        skip_syms = {
+            s.strip() for s in
+            (_os.getenv("ALPACA_RECONCILE_SKIP_SYMBOLS", "") or "").split(",")
+            if s.strip()
+        }
         for ap in alpaca_positions:
             sym = ap.symbol
             if sym in local_symbols:
                 continue            # both books have it; no action
+            if sym in skip_syms:
+                _log.info("alpaca_reconcile_skip_operator_override symbol=%s",
+                          sym)
+                continue
             result["alpaca_only_symbols"].append(sym)
             qty = abs(int(ap.qty))
             if qty <= 0:

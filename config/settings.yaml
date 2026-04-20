@@ -1,8 +1,9 @@
 # ===== Strategy mode =====
 # "directional" = buy long options on momentum/ORB signals. Per operator:
-#                 only buying, never selling. Relies on all the exit
+#                 only buying, never selling — long calls and long puts
+#                 only, defined max-loss per trade. Relies on the exit
 #                 improvements (tight 10% stops + scale-out + trailing
-#                 stop + VWAP/momentum filters + ensemble threshold 0.85)
+#                 stop + VWAP/momentum filters + ensemble threshold 0.60)
 #                 to make the structural theta headwind survivable.
 # "wheel"       = (unused) sell cash-secured puts. Kept in code for
 #                 optional future testing.
@@ -288,10 +289,10 @@ ml:
 # ===== Regime-aware ensemble =====
 ensemble:
   enabled: true
-  # Raised from 0.70 → 0.85: fewer entries, but each one has much
-  # higher cross-signal agreement. Operator feedback: too many weak
-  # trades were being opened.
-  min_weighted_confidence: 0.85
+  # Lowered from 0.85 → 0.60: 0.85 was so strict nothing triggered.
+  # Operator missed a SPY-put entry during a real dip because scores
+  # peaked at 0.70. With 0.60, today's 0.70 reads would have cleared.
+  min_weighted_confidence: 0.60
   dominance_ratio: 1.5               # dominant / opposing score required
   log_decisions: true                # every tick-per-symbol with >=1 signal → journal
   # Regime × signal-source weight overrides. Comment out to use DEFAULT_WEIGHTS
