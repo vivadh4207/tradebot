@@ -456,6 +456,63 @@ def _build_chat_context():
             ctx.last_audit_summary = recent[0].get("summary")
     except Exception:
         pass
+
+    # tradebot.out grep for the most recent regime, VIX, breadth, spot
+    # prices, and a few recent signal events. Lets the LLM see live
+    # state without a database query or locking the journal.
+    try:
+        import re as _re
+        log_path = ROOT / "logs" / "tradebot.out"
+        if log_path.exists():
+            import os as _os
+            size = log_path.stat().st_size
+            read_from = max(0, size - 300_000)        # last ~300 KB
+            with log_path.open("rb") as f:
+                f.seek(read_from)
+                if read_from > 0:
+                    f.readline()
+                tail = f.read().decode("utf-8", errors="replace")
+
+            # Latest regime: scan backwards for 'regime=<word>'
+            for m in _re.finditer(r"regime=(\w+)", tail):
+                ctx.regime = m.group(1)
+            # Latest VIX
+            m = None
+            for m in _re.finditer(r"\bvix=([0-9.]+)", tail):
+                pass
+            if m is not None:
+                try:
+                    ctx.vix = float(m.group(1))
+                except Exception:
+                    pass
+            # Latest breadth score
+            for m in _re.finditer(r"breadth_score=(-?[0-9.]+)", tail):
+                try:
+                    ctx.breadth_score = float(m.group(1))
+                except Exception:
+                    pass
+            # Latest spot price per symbol (last-seen wins)
+            spot: Dict[str, float] = {}
+            for m in _re.finditer(r"\bsymbol=([A-Z]{1,5})[^\n]*?(?:spot|price|last)=([0-9.]+)", tail):
+                try:
+                    spot[m.group(1)] = float(m.group(2))
+                except Exception:
+                    pass
+            if spot:
+                ctx.spot_by_symbol = spot
+            # Recent signals (last 8 ensemble events for context)
+            recent_sigs: List[str] = []
+            for line in tail.splitlines()[-400:]:
+                if "ensemble_skip" in line or "exec_chain_pass" in line:
+                    # keep it short; strip ANSI / structlog brackets
+                    clean = _re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", line)
+                    clean = _re.sub(r"\[[a-z]+\s*\]\s*", "", clean)
+                    recent_sigs.append(clean[:160])
+            if recent_sigs:
+                ctx.recent_signals = recent_sigs[-8:]
+    except Exception:
+        pass
+
     return ctx
 
 
