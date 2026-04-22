@@ -462,6 +462,19 @@ class TradeBot:
             sl_multi_pct=settings.get("exits.stop_loss_multi_dte_pct", 0.30),
             zero_dte_max_hold_minutes=_zero_dte_max_hold,
         ))
+        # Position-fade advisor: LLM + chart review -> Discord with
+        # action buttons when a winner starts fading. Runs alongside
+        # the automatic fast-exit layers; this is the manual override
+        # + second-opinion path.
+        try:
+            from .intelligence.position_advisor import PositionAdvisor
+            self.position_advisor = PositionAdvisor(
+                cooldown_sec=int(settings.get(
+                    "exits.position_advisor_cooldown_sec", 600,
+                )),
+            )
+        except Exception:
+            self.position_advisor = None
 
         # Strategy mode: "directional" (long options on momentum/ORB
         # signals, original behavior) or "wheel" (sell cash-secured puts
@@ -887,6 +900,139 @@ class TradeBot:
                     marks[p.symbol] = float(mark)
         return marks
 
+    def _process_manual_close_intents(self, open_pos) -> None:
+        """Read data/manual_close_intents.json, execute each queued
+        close/trim, then clear the file. Intents come from the Discord
+        `!close <aid|symbol>` and `!trim <aid>` commands and from
+        button clicks on the position-fade advisory card.
+        """
+        from pathlib import Path as _P
+        import json as _json
+        from .core.data_paths import data_path
+        intent_path = _P(data_path("manual_close_intents.json"))
+        if not intent_path.exists():
+            return
+        try:
+            intents = _json.loads(intent_path.read_text() or "[]")
+        except Exception:
+            intents = []
+        if not isinstance(intents, list) or not intents:
+            # Clear corrupt/empty file to avoid replay
+            try:
+                intent_path.write_text("[]")
+            except Exception:
+                pass
+            return
+        # Build lookup: symbol OR underlying -> Position
+        by_sym = {}
+        for p in open_pos:
+            by_sym.setdefault(p.symbol, p)
+            if p.underlying:
+                by_sym.setdefault(p.underlying, p)
+        remaining = []
+        for it in intents:
+            sym = str(it.get("symbol", "")).upper()
+            kind = it.get("kind", "full_close")
+            pos = by_sym.get(sym)
+            if pos is None:
+                log.info("manual_close_no_position", symbol=sym)
+                continue     # drop — position already closed
+            side = Side.SELL if pos.qty > 0 else Side.BUY
+            qty_to_close = abs(pos.qty)
+            if kind == "trim_half":
+                qty_to_close = max(1, qty_to_close // 2)
+            # Mark price (option: use chain; stock: spot)
+            try:
+                marks = self._build_mark_prices([pos])
+                price = marks.get(pos.symbol, pos.avg_price)
+            except Exception:
+                price = pos.avg_price
+            o = Order(
+                symbol=pos.symbol, side=side, qty=qty_to_close,
+                is_option=pos.is_option, limit_price=price,
+                tag=f"manual:{kind}:{it.get('source', 'discord')}",
+            )
+            try:
+                fill = self.broker.submit(o)
+                log.info("manual_close_executed",
+                          symbol=pos.symbol, kind=kind,
+                          qty=qty_to_close,
+                          fill_price=(float(fill.price) if fill else price))
+                try:
+                    self.notifier.notify(
+                        f"✅ **Manual {kind}** executed — `{pos.symbol}` "
+                        f"qty={qty_to_close} @ ~${price:.2f}",
+                        level="info", title="manual_close",
+                        meta={"Symbol": pos.symbol, "Kind": kind,
+                               "Qty": qty_to_close},
+                    )
+                except Exception:
+                    pass
+            except Exception as e:                          # noqa: BLE001
+                log.warning("manual_close_failed", symbol=sym, err=str(e))
+                # Keep the intent so the next tick retries.
+                remaining.append(it)
+        try:
+            intent_path.write_text(_json.dumps(remaining, indent=2,
+                                                 default=str))
+        except Exception:
+            pass
+
+    def _post_fade_advisory(self, adv) -> None:
+        """Post a position-fade advisory to Discord with action buttons.
+        Persists to data/position_advisories.json so the Discord button
+        handler can resolve advisory_id -> position on click."""
+        try:
+            from .intelligence.position_advisor import save_advisory
+            aid = save_advisory(adv)
+        except Exception:
+            aid = ""
+        urgency_icon = {"urgent": "🚨", "normal": "⚠️", "low": "💡"}.get(
+            adv.urgency, "⚠️"
+        )
+        rec_icon = {"close": "🛑 CLOSE", "trim": "✂️ TRIM",
+                     "hold": "✋ HOLD"}.get(adv.recommendation, "•")
+        lines = [
+            f"{urgency_icon} **Position Fade Advisory · {adv.symbol}**",
+            (f"*{adv.direction.upper()} ${adv.strike:g}"
+              if adv.strike else f"*{adv.direction.upper()}*")
+            + (f" {adv.expiry}*" if adv.expiry else "*"),
+            "",
+            f"**Peak:** +{adv.peak_pnl_pct*100:.2f}%  →  "
+            f"**Now:** {adv.current_pnl_pct*100:+.2f}%",
+            f"Entry ${adv.entry_price:.2f}  →  Now ${adv.current_price:.2f}  ·  qty {adv.qty}",
+            "",
+            f"**Recommendation:** {rec_icon} · confidence *{adv.confidence}*",
+        ]
+        if adv.rationale:
+            lines.append(f"> {adv.rationale}")
+        if adv.bars_summary:
+            lines.append(f"_Chart: {adv.bars_summary}_")
+        if adv.key_levels:
+            lines.append("**Key levels:** " + " · ".join(adv.key_levels[:3]))
+        if adv.model:
+            lines.append(f"_model: {adv.model}_")
+        if aid:
+            lines.append("")
+            lines.append(f"_advisory: `{aid}` · use `!close {aid}` or "
+                          "click buttons in control channel_")
+        meta = {
+            "Symbol":        adv.symbol,
+            "Peak":          f"{adv.peak_pnl_pct*100:+.2f}%",
+            "Now":           f"{adv.current_pnl_pct*100:+.2f}%",
+            "Recommend":     adv.recommendation,
+            "Urgency":       adv.urgency,
+            "_advisory_id":  aid,
+            "_footer":       "position_advisor",
+        }
+        try:
+            self.notifier.notify(
+                "\n".join(lines), level="info",
+                title="position_advisor", meta=meta,
+            )
+        except Exception:
+            pass
+
     def _evaluate_credit_spreads(self, open_pos, marks) -> None:
         """Group credit-spread legs by tag, evaluate each as a unit,
         submit a single close-combo if the exit criteria fire.
@@ -1016,6 +1162,12 @@ class TradeBot:
                 break
             try:
                 open_pos = list(self.broker.positions())
+                # Process any manual close/trim intents from Discord BEFORE
+                # the normal exit loop — so `!close SPY` closes within ~5s.
+                try:
+                    self._process_manual_close_intents(open_pos)
+                except Exception as _ie:                    # noqa: BLE001
+                    log.info("manual_close_intent_err", err=str(_ie)[:160])
                 if not open_pos:
                     self._stop.wait(interval)
                     continue
@@ -1073,6 +1225,22 @@ class TradeBot:
                         except Exception:
                             bars_for_exit = None
                         d = self.fast.evaluate(pos, price, bars=bars_for_exit)
+                    # Position-fade advisor: LLM-driven manual override path.
+                    # Fires when the automatic exits didn't trigger but the
+                    # position still looks like it's fading — posts to Discord
+                    # with Close / Hold / Trim buttons for the operator.
+                    if (d is None or not d.should_close) and \
+                            self.position_advisor is not None and \
+                            pos.is_option and pos.qty > 0:
+                        try:
+                            pnl_pct_now = pos.unrealized_pnl_pct(price)
+                            adv = self.position_advisor.maybe_advise(
+                                pos, price, pnl_pct_now, bars=bars_for_exit,
+                            )
+                            if adv is not None:
+                                self._post_fade_advisory(adv)
+                        except Exception as _e:             # noqa: BLE001
+                            log.info("position_advisor_err", err=str(_e)[:120])
                     if d and d.should_close:
                         side = Side.SELL if pos.qty > 0 else Side.BUY
                         qty_abs = abs(pos.qty)

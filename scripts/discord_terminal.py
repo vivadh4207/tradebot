@@ -323,6 +323,19 @@ class CommandRunner:
             parts = (raw_text or "").split()
             sub = parts[1].lower() if len(parts) >= 2 else "status"
             return self._handle_llm_autotrade(sub)
+        if command == "close":
+            # Manual close via advisory id: "!close <aid>"
+            parts = (raw_text or "").split()
+            if len(parts) < 2:
+                return ("usage: `!close <advisory_id>` or `!close <symbol>` — "
+                        "run `!positions` for live list")
+            return await self._handle_close(parts[1].strip())
+        if command == "trim":
+            # Manual half-close: "!trim <aid>"
+            parts = (raw_text or "").split()
+            if len(parts) < 2:
+                return "usage: `!trim <advisory_id>`"
+            return await self._handle_trim(parts[1].strip())
         if destroyed and subcmd == "reset-paper":
             # reset_paper.py supports --yes to skip its own interactive prompt
             extra_args = ["--yes"]
@@ -384,6 +397,89 @@ class CommandRunner:
             return msg
         except Exception as e:                          # noqa: BLE001
             return f"llm-autotrade failed: {type(e).__name__}: {str(e)[:200]}"
+
+    async def _handle_close(self, token: str) -> str:
+        """Close a position manually. Token can be an advisory_id (from
+        fade advisory) OR a symbol/underlying. Writes a close intent to
+        data/manual_close_intents.json which the bot polls and executes
+        on its next fast_loop tick.
+        """
+        try:
+            from pathlib import Path as _P
+            import json as _json, time as _t
+            from src.intelligence.position_advisor import load_advisory
+            from src.core.data_paths import data_path
+            intent_path = _P(data_path("manual_close_intents.json"))
+            intent_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Resolve token -> intent payload
+            payload = None
+            adv = load_advisory(token)
+            if adv:
+                payload = {
+                    "symbol": adv.get("symbol"),
+                    "kind": "full_close",
+                    "advisory_id": token,
+                    "source": "discord_manual",
+                    "ts": _t.time(),
+                }
+            else:
+                # Treat as symbol (closes ALL positions for that underlying)
+                payload = {
+                    "symbol": token.upper(),
+                    "kind": "full_close",
+                    "source": "discord_manual_symbol",
+                    "ts": _t.time(),
+                }
+            try:
+                existing = _json.loads(intent_path.read_text() or "[]")
+                if not isinstance(existing, list):
+                    existing = []
+            except Exception:
+                existing = []
+            existing.append(payload)
+            intent_path.write_text(_json.dumps(existing, indent=2,
+                                                 default=str))
+            _audit({"kind": "manual_close_requested",
+                    "token": token, "payload": payload})
+            return (
+                f"🛑 **Close intent queued** for `{payload['symbol']}` "
+                f"(source: {payload['source']}).\n"
+                "Bot will execute on the next fast_loop tick (~1s)."
+            )
+        except Exception as e:
+            return f"close failed: {type(e).__name__}: {str(e)[:200]}"
+
+    async def _handle_trim(self, token: str) -> str:
+        """Close 50% of the position. Same intent file, kind=trim_half."""
+        try:
+            from pathlib import Path as _P
+            import json as _json, time as _t
+            from src.intelligence.position_advisor import load_advisory
+            from src.core.data_paths import data_path
+            intent_path = _P(data_path("manual_close_intents.json"))
+            intent_path.parent.mkdir(parents=True, exist_ok=True)
+            adv = load_advisory(token)
+            symbol = (adv.get("symbol") if adv else token.upper())
+            payload = {
+                "symbol": symbol, "kind": "trim_half",
+                "advisory_id": token if adv else None,
+                "source": "discord_manual_trim", "ts": _t.time(),
+            }
+            try:
+                existing = _json.loads(intent_path.read_text() or "[]")
+                if not isinstance(existing, list):
+                    existing = []
+            except Exception:
+                existing = []
+            existing.append(payload)
+            intent_path.write_text(_json.dumps(existing, indent=2,
+                                                 default=str))
+            _audit({"kind": "manual_trim_requested",
+                    "token": token, "payload": payload})
+            return f"✂️ **Trim intent queued** for `{symbol}` (50% close)."
+        except Exception as e:
+            return f"trim failed: {type(e).__name__}: {str(e)[:200]}"
 
     async def _handle_catalyst(self, symbols: List[str]) -> str:
         """Run the catalyst deep-dive aggregator in a worker thread."""

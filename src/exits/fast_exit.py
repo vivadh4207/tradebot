@@ -73,14 +73,23 @@ class FastExitConfig:
     # Bigger peaks get tighter give-backs so massive winners don't
     # evaporate.
     profit_lock_enabled: bool = True
-    profit_lock_arm_pct: float = 0.10        # arm once we've been +10% (was 0.15)
+    profit_lock_arm_pct: float = 0.03        # arm once we've been +3%
     profit_lock_give_back_pct: float = 0.30  # base give-back (adaptive below)
-    # Adaptive give-back by peak tier:
-    #   peak >= +100% → 15% give-back (lock in big winners hard)
-    #   peak >= +50%  → 20% give-back
-    #   peak >= +25%  → 25% give-back
-    #   peak >= +10%  → 35% give-back (still learning the setup)
+    # Adaptive give-back by peak tier — SMALL WINNERS TOO, because
+    # operator saw +7% -> +1% -> negative. Rule: once we've touched a
+    # profit peak, the position must NEVER cross back to zero pnl.
+    #   peak >= +100% → 15% give-back (floor +85%)
+    #   peak >= +50%  → 20% give-back (floor +40%)
+    #   peak >= +25%  → 25% give-back (floor +19%)
+    #   peak >= +10%  → 40% give-back (floor +6%)
+    #   peak >= +5%   → 50% give-back (floor +2.5%)
+    #   peak >= +3%   → 60% give-back (floor +1.2%) — saves small winners
     profit_lock_tiers_enabled: bool = True
+    # Zero-tolerance floor: once we've been +3%+, never let the
+    # position cross back below +0.5% (minus round-trip slippage cost).
+    # This is the invariant the operator wants: "if +7% drops, we sell
+    # while still in profit, not after it goes negative."
+    zero_tolerance_floor_pct: float = 0.005
 
     # Ratcheting profit floor: once we've been above these thresholds,
     # SL tightens up. Ensures we don't give back big gains.
@@ -273,7 +282,8 @@ class FastExitEvaluator:
                 and peak_pnl_attr is not None
                 and peak_pnl_attr >= self.cfg.profit_lock_arm_pct):
             # Adaptive give-back: bigger winners get tighter protection.
-            # Operator: "+75% went back to +1% — can't let that happen."
+            # Operator: "+7% went to +1% then negative — can't let that
+            # happen. If we were up, we must NEVER close negative."
             if self.cfg.profit_lock_tiers_enabled:
                 if peak_pnl_attr >= 1.00:
                     give_back = 0.15    # +100%+ peak → lock hard
@@ -281,11 +291,21 @@ class FastExitEvaluator:
                     give_back = 0.20
                 elif peak_pnl_attr >= 0.25:
                     give_back = 0.25
+                elif peak_pnl_attr >= 0.10:
+                    give_back = 0.40
+                elif peak_pnl_attr >= 0.05:
+                    give_back = 0.50
                 else:
-                    give_back = 0.35    # +10-25% peak, still learning
+                    give_back = 0.60    # +3-5% peak → loose but still armed
             else:
                 give_back = self.cfg.profit_lock_give_back_pct
             close_threshold = peak_pnl_attr * (1.0 - give_back)
+            # Zero-tolerance floor: if we've been above arm threshold
+            # ever, the floor is at LEAST zero_tolerance_floor_pct.
+            # Even if the adaptive give-back would drop below, we
+            # never let a position that was +3%+ cross back to <= 0.
+            close_threshold = max(close_threshold,
+                                     self.cfg.zero_tolerance_floor_pct)
             if pnl <= close_threshold and pnl > 0:
                 return ExitDecision(
                     True,

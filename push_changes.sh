@@ -44,6 +44,7 @@ git add \
   src/intelligence/groq_client.py \
   src/intelligence/ollama_client.py \
   src/intelligence/options_research.py \
+  src/intelligence/position_advisor.py \
   src/intelligence/symbol_scanner.py \
   src/main.py \
   src/notify/base.py \

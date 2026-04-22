@@ -156,6 +156,8 @@ _TITLE_TO_CHANNEL = {
     "scan_postmarket": {"scan_postmarket", "postmarket_scan", "postmarket"},
     # Strategy-bucket P&L comparison (0DTE vs short vs swing).
     "strategy_report": {"strategy_report", "strategy", "bucket_report"},
+    # Position-fade advisory (LLM says close/hold/trim; operator clicks).
+    "position_advisor": {"position_advisor", "advisor", "fade_advisory"},
 }
 
 
