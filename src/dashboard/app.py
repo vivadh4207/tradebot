@@ -268,26 +268,133 @@ def health():
 
 @app.get("/api/positions_open", response_class=JSONResponse)
 def positions_open():
-    """Currently open positions (from snapshot) with estimated unrealized P&L."""
+    """Currently open positions — TRADIER is source of truth, not
+    local broker_state.json. Operator lost money last time because
+    local showed clean while Tradier had 5 orphaned positions
+    accumulating losses. We reverse that: Tradier is primary,
+    local is an overlay with auto_pt / auto_sl / entry_tag.
+
+    Returns:
+      positions: list of Tradier positions enriched with local metadata
+                 (auto_pt, auto_sl, entry_tag) where they match by symbol.
+      sync: {status, local_only, tradier_only, in_both} — reconcile diff.
+      source: 'tradier' | 'local_fallback'."""
+    import re as _re
+    from pathlib import Path as _P
+
     s, root = _settings()
-    snap = load_snapshot(s.get("broker.snapshot_path",
-                                 str(root / "logs" / "broker_state.json")))
-    if snap is None:
-        return {"positions": [], "saved_at": None}
+    # Load local snapshot for metadata overlay
+    local_snap = load_snapshot(s.get("broker.snapshot_path",
+                                        str(root / "logs" / "broker_state.json")))
+    local_by_sym: Dict[str, Any] = {}
+    if local_snap is not None:
+        for p in local_snap.positions:
+            local_by_sym[p.symbol] = p
+
+    # Query Tradier for truth
+    tradier_positions: List[Any] = []
+    tradier_error: Optional[str] = None
+    try:
+        from ..brokers.tradier_adapter import build_tradier_broker
+        tb = build_tradier_broker()
+        if tb is not None:
+            tradier_positions = list(tb.positions())
+    except Exception as e:                                  # noqa: BLE001
+        tradier_error = str(e)[:200]
+
+    # Get current marks so unrealized P&L is accurate
+    marks: Dict[str, float] = {}
+    try:
+        from ..data.multi_provider import MultiProvider
+        mp = MultiProvider.from_env()
+        for p in tradier_positions:
+            try:
+                q = mp.latest_quote(p.symbol)
+                if q is not None and q.mid and q.mid > 0:
+                    marks[p.symbol] = float(q.mid)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Build Tradier-primary list, enriched with local metadata
     positions = []
-    for p in snap.positions:
+    for p in tradier_positions:
+        mark = marks.get(p.symbol)
+        unrl = None
+        if mark is not None and p.avg_price > 0:
+            unrl = (mark - p.avg_price) * abs(p.qty) * p.multiplier * (
+                1 if p.qty > 0 else -1
+            )
+        # Extract underlying from OCC if option
+        underlying = p.symbol
+        if p.is_option:
+            m = _re.match(r"^([A-Z]{1,6})\d{6}[CP]\d{8}$", p.symbol)
+            if m:
+                underlying = m.group(1)
+        # Overlay local metadata if symbol matches
+        overlay = local_by_sym.get(p.symbol)
+        auto_pt = overlay.auto_profit_target if overlay else None
+        auto_sl = overlay.auto_stop_loss if overlay else None
+        entry_tag = overlay.entry_tag if overlay else ""
         positions.append({
-            "symbol": p.symbol, "qty": p.qty, "avg_price": p.avg_price,
-            "is_option": p.is_option, "underlying": p.underlying,
-            "strike": p.strike, "expiry": p.expiry_iso, "right": p.right,
-            "entry_tag": p.entry_tag,
-            "auto_profit_target": p.auto_profit_target,
-            "auto_stop_loss": p.auto_stop_loss,
-            "consecutive_holds": p.consecutive_holds,
+            "symbol": p.symbol,
+            "qty": p.qty,
+            "avg_price": p.avg_price,
+            "mark": mark,
+            "unrealized_pnl": round(unrl, 2) if unrl is not None else None,
+            "is_option": p.is_option,
+            "underlying": underlying,
+            "multiplier": p.multiplier,
+            "auto_profit_target": auto_pt,
+            "auto_stop_loss": auto_sl,
+            "entry_tag": entry_tag,
+            "in_local": p.symbol in local_by_sym,
         })
-    return {"positions": positions, "saved_at": snap.saved_at,
-            "cash": snap.cash, "day_pnl": snap.day_pnl,
-            "total_pnl": snap.total_pnl}
+
+    # Compute reconcile diff — the operator NEEDS to see this
+    tradier_syms = {p.symbol for p in tradier_positions}
+    local_syms = set(local_by_sym.keys())
+    local_only = sorted(local_syms - tradier_syms)
+    tradier_only = sorted(tradier_syms - local_syms)
+    in_both = sorted(tradier_syms & local_syms)
+    sync_status = "in_sync"
+    if local_only or tradier_only:
+        sync_status = "desynced"
+    if tradier_error:
+        sync_status = "tradier_unreachable"
+
+    # Day P&L — prefer Tradier account if reachable, else local
+    cash = None
+    day_pnl = None
+    try:
+        if tb is not None:
+            acct = tb.account()
+            # Tradier AccountSummary dataclass has these fields (check
+            # defensively since legacy code had a bug here):
+            cash = float(getattr(acct, "cash", 0) or 0)
+            day_pnl = float(getattr(acct, "day_pnl", 0) or 0)
+    except Exception:
+        pass
+    if cash is None and local_snap is not None:
+        cash = local_snap.cash
+        day_pnl = local_snap.day_pnl
+
+    return {
+        "positions": positions,
+        "cash": cash, "day_pnl": day_pnl,
+        "sync": {
+            "status": sync_status,
+            "tradier_n": len(tradier_positions),
+            "local_n": len(local_by_sym),
+            "local_only": local_only,
+            "tradier_only": tradier_only,
+            "in_both": in_both,
+            "tradier_error": tradier_error,
+        },
+        "source": ("tradier" if tradier_positions else
+                     ("local_fallback" if local_snap else "empty")),
+    }
 
 
 @app.get("/api/ml_recent", response_class=JSONResponse)
@@ -435,40 +542,164 @@ def run_strategy_audit():
 
 
 @app.get("/api/logs_tail", response_class=JSONResponse)
-def logs_tail(lines: int = Query(200, ge=10, le=5000),
-               grep: str = Query("", max_length=256)):
-    """Tail the bot's primary log file. Optional grep filter (plain substring)."""
+def logs_tail(lines: int = Query(80, ge=10, le=5000),
+               grep: str = Query("", max_length=256),
+               kinds: str = Query("all")):
+    """Tail the bot's log and STRUCTURE each line into a readable event.
+    Each returned item:
+        ts, level, event, kv (dict of key=value pairs), human (string),
+        icon (emoji tag), raw
+    Filters via `grep` (substring) and `kinds` (comma-sep event categories):
+      fills / exits / signals / warnings / errors / all
+    """
+    import re as _re
     from pathlib import Path
     s, root = _settings()
     log_path = root / "logs" / "tradebot.out"
     if not log_path.exists():
-        return {"lines": [], "path": str(log_path), "missing": True}
-    # Efficient-ish tail for small files; OK up to ~100 MB
+        return {"events": [], "path": str(log_path), "missing": True}
     try:
         with log_path.open("rb") as f:
-            # seek to end, read backward in chunks, collect last N lines
             f.seek(0, os.SEEK_END)
             size = f.tell()
-            chunk = 64 * 1024
+            chunk = 128 * 1024
             buf = b""
             pos = size
             collected = 0
-            while pos > 0 and collected <= lines * 2:
+            while pos > 0 and collected <= lines * 4:
                 read_size = min(chunk, pos)
                 pos -= read_size
                 f.seek(pos)
                 buf = f.read(read_size) + buf
                 collected = buf.count(b"\n")
             text = buf.decode("utf-8", errors="replace")
-            all_lines = text.splitlines()
     except Exception as e:
-        return {"lines": [], "path": str(log_path), "error": str(e)}
+        return {"events": [], "path": str(log_path), "error": str(e)}
+
+    # Strip ANSI colour codes
+    ansi_re = _re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+    # structured-log format:  ISO_TS  [level ]  event   key=val key=val...
+    line_re = _re.compile(
+        r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?)\s+"
+        r"\[(?P<level>\w+)\s*\]\s+(?P<event>\S+)\s*(?P<rest>.*)$"
+    )
+    kv_re = _re.compile(r"(\w+)=(?:'([^']*)'|\"([^\"]*)\"|(\S+))")
+
+    out: List[Dict[str, Any]] = []
+    for raw_line in text.splitlines():
+        clean = ansi_re.sub("", raw_line).strip()
+        if not clean:
+            continue
+        m = line_re.match(clean)
+        if not m:
+            continue
+        ts = m.group("ts")
+        level = m.group("level").lower()
+        event = m.group("event")
+        rest = m.group("rest") or ""
+        kv: Dict[str, str] = {}
+        for km in kv_re.finditer(rest):
+            val = km.group(2) if km.group(2) is not None else (
+                km.group(3) if km.group(3) is not None else km.group(4)
+            )
+            kv[km.group(1)] = val
+
+        # Classify + build human description
+        icon, kind, human = _humanize_event(event, level, kv)
+
+        out.append({
+            "ts": ts, "level": level, "event": event,
+            "icon": icon, "kind": kind, "human": human,
+            "kv": kv, "raw": clean[:400],
+        })
+
+    # Filter by kind
+    kinds_set = set(k.strip() for k in kinds.lower().split(",") if k.strip())
+    if kinds_set and "all" not in kinds_set:
+        out = [e for e in out if e["kind"] in kinds_set]
     if grep:
         g = grep.lower()
-        all_lines = [ln for ln in all_lines if g in ln.lower()]
-    tail = all_lines[-lines:]
-    return {"lines": tail, "path": str(log_path), "missing": False,
-            "total_matched": len(all_lines)}
+        out = [e for e in out
+                if g in e["event"].lower() or g in e["human"].lower()]
+
+    # Most-recent last
+    out = out[-lines:]
+    return {"events": out, "path": str(log_path), "missing": False,
+            "total": len(out)}
+
+
+def _humanize_event(event: str, level: str, kv: Dict[str, str]
+                    ) -> tuple:
+    """Convert a structured log event into a human-readable one-liner
+    + emoji icon + kind tag (fills / exits / signals / warnings)."""
+    e = event.lower()
+    sym = kv.get("symbol") or kv.get("sym") or ""
+    price = kv.get("price") or ""
+
+    # Entries / fills
+    if e == "fill":
+        right = (kv.get("right") or "").upper()
+        strike = kv.get("strike", "?")
+        dte = kv.get("dte", "")
+        dte_txt = f" · {dte}d" if dte else ""
+        return ("🟢", "fills",
+                f"ENTRY · {sym} {right} ${strike}{dte_txt} @ ${price} "
+                f"qty={kv.get('qty', '?')}")
+    if e == "fast_exit":
+        reason = (kv.get("reason") or "").strip("'\"")
+        reason_head = reason.split(":")[0] if reason else "exit"
+        pnl = kv.get("pnl_pct", "")
+        usd = kv.get("realized_usd", "")
+        usd_txt = f" ${usd}" if usd else ""
+        pnl_txt = f" ({pnl}%)" if pnl else ""
+        return ("🔴", "exits",
+                f"EXIT · {sym} {reason_head}{pnl_txt}{usd_txt}")
+    if e == "eod_force_close" or (e == "fast_exit" and "eod" in (kv.get("reason") or "")):
+        return ("🌇", "exits", f"EOD close · {sym}")
+
+    # Signals
+    if e == "ensemble_emit":
+        direction = kv.get("direction", "?")
+        score = kv.get("score", "?")
+        regime = kv.get("regime", "")
+        icon = "🔼" if direction == "bullish" else "🔽" if direction == "bearish" else "•"
+        return (icon, "signals",
+                f"Signal · {sym} {direction} score {score}"
+                + (f" [{regime}]" if regime else ""))
+    if e == "ensemble_skip":
+        reason = (kv.get("reason") or "").strip("'\"").split(":")[0]
+        return ("⏭", "signals", f"Skip · {sym} {reason}")
+    if e == "exec_chain_block":
+        filt = kv.get("filter", "")
+        reason = (kv.get("reason") or "").strip("'\"")
+        return ("🛑", "signals",
+                f"Block · {sym} {filt} — {reason[:80]}")
+    if e == "exec_chain_pass":
+        src = kv.get("signal") or kv.get("src") or ""
+        return ("✅", "signals", f"Pass · {sym} [{src}]")
+
+    # State
+    if e == "market_state_snapshot":
+        return ("📊", "state",
+                f"State · regime={kv.get('regime', '?')} "
+                f"vix={kv.get('vix', '?')} "
+                f"breadth={kv.get('breadth_score', '?')}")
+    if e == "data_adapter":
+        return ("🔌", "state", f"Data adapter: {kv.get('kind', '?')}")
+    if e == "strategy_mode":
+        return ("🎯", "state", f"Mode: {kv.get('mode', '?')}")
+
+    # Warnings / errors
+    if level in ("warning", "warn", "error"):
+        # Generic fallback with event + top kv
+        top = " · ".join(f"{k}={v[:30]}" for k, v in list(kv.items())[:3])
+        return ("⚠️" if level.startswith("warn") else "🛑",
+                "warnings" if level.startswith("warn") else "errors",
+                f"{event} · {top}")
+
+    # Default passthrough
+    top = " · ".join(f"{k}={v[:30]}" for k, v in list(kv.items())[:3])
+    return ("·", "other", f"{event}" + (f" · {top}" if top else ""))
 
 
 @app.get("/api/var", response_class=JSONResponse)
@@ -1622,6 +1853,338 @@ setInterval(refreshBrainTail, 15000);
 </script>
 </body></html>
 """
+
+
+# ---------------------------------------------------------------
+# Advanced endpoints — saves tracker, position advisories,
+# strategy buckets, LLM chat, on-demand research / catalyst / scan,
+# cleanup. Exposes the Discord flows via HTTP for the dashboard.
+# ---------------------------------------------------------------
+
+
+@app.get("/api/saves", response_class=JSONResponse)
+def saves_api(hours: int = Query(24, ge=1, le=720)):
+    """Saves tracker summary — defensive exits + $ saved vs. regret."""
+    try:
+        from ..intelligence.saves_tracker import summary
+        return summary(since_hours=int(hours))
+    except Exception as e:                                  # noqa: BLE001
+        return {"error": str(e)[:200], "n_exits": 0}
+
+
+@app.get("/api/advisories", response_class=JSONResponse)
+def advisories_api():
+    """Active position-fade advisories (last 6h)."""
+    try:
+        from ..intelligence.position_advisor import _store_path
+        from pathlib import Path as _P
+        import json as _json, time as _t
+        p = _P(str(_store_path()))
+        if not p.exists():
+            return {"advisories": []}
+        d = _json.loads(p.read_text() or "{}")
+        cutoff = _t.time() - 6 * 3600
+        out = []
+        for aid, rec in d.items():
+            if float(rec.get("ts", 0)) < cutoff:
+                continue
+            rec["id"] = aid
+            out.append(rec)
+        out.sort(key=lambda r: -float(r.get("ts", 0)))
+        return {"advisories": out[:20]}
+    except Exception as e:                                  # noqa: BLE001
+        return {"error": str(e)[:200], "advisories": []}
+
+
+@app.get("/api/strategy", response_class=JSONResponse)
+def strategy_buckets_api(days: int = Query(7, ge=1, le=365)):
+    """Per-bucket P&L (0DTE / short / swing)."""
+    from datetime import datetime, timedelta, timezone
+    import re as _re
+    from collections import defaultdict as _dd
+    j = _load_journal()
+    try:
+        since = datetime.now(tz=timezone.utc) - timedelta(days=days)
+        trades = j.closed_trades(since=since)
+    finally:
+        j.close()
+    buckets = _dd(lambda: {"count": 0, "wins": 0, "losses": 0,
+                             "total_pnl": 0.0, "pnl_pcts": []})
+    for t in trades:
+        tag = t.entry_tag or ""
+        m = _re.search(r"\|strategy=([a-z0-9_]+)", tag)
+        if m:
+            bkt = m.group(1)
+        else:
+            dm = _re.search(r"\|dte=(\d+)", tag)
+            if dm:
+                dte = int(dm.group(1))
+                bkt = ("0dte" if dte == 0 else
+                         "swing" if dte >= 14 else "short")
+            else:
+                bkt = "unknown"
+        b = buckets[bkt]
+        b["count"] += 1
+        pnl = t.pnl or 0
+        b["total_pnl"] += pnl
+        b["pnl_pcts"].append(t.pnl_pct or 0)
+        if pnl > 0:
+            b["wins"] += 1
+        elif pnl < 0:
+            b["losses"] += 1
+    out = []
+    for name, d in sorted(buckets.items(),
+                            key=lambda kv: -kv[1]["total_pnl"]):
+        n = d["count"]
+        out.append({
+            "bucket": name, "count": n,
+            "wins": d["wins"], "losses": d["losses"],
+            "win_rate": round(d["wins"] / n, 3) if n else None,
+            "total_pnl": round(d["total_pnl"], 2),
+            "avg_pnl_pct": (round(sum(d["pnl_pcts"]) / n, 4)
+                              if n else None),
+        })
+    return {"buckets": out, "window_days": days}
+
+
+@app.get("/api/exit_reasons", response_class=JSONResponse)
+def exit_reasons_api(days: int = Query(7, ge=1, le=365)):
+    """Exit reason breakdown for a donut/pie chart."""
+    from datetime import datetime, timedelta, timezone
+    from collections import Counter as _C
+    j = _load_journal()
+    try:
+        since = datetime.now(tz=timezone.utc) - timedelta(days=days)
+        trades = j.closed_trades(since=since)
+    finally:
+        j.close()
+    c = _C()
+    pnl_by_reason: Dict[str, float] = defaultdict(float)
+    for t in trades:
+        reason = (t.exit_reason or "unknown").split(":")[0] or "unknown"
+        c[reason] += 1
+        pnl_by_reason[reason] += float(t.pnl or 0)
+    return {
+        "reasons": [
+            {"reason": r, "count": n,
+             "pnl": round(pnl_by_reason[r], 2)}
+            for r, n in c.most_common(15)
+        ],
+    }
+
+
+@app.post("/api/chat", response_class=JSONResponse)
+async def chat_api(request: Request):
+    """LLM chat. Body: {message: str, model?: '70b'|'8b'}."""
+    import json as _json
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    msg = str(body.get("message", "")).strip()[:4000]
+    model_pref = str(body.get("model", "70b")).lower()
+    if not msg:
+        return {"error": "empty message"}
+    try:
+        from ..intelligence.groq_client import build_llm_client_for
+        role = "research" if model_pref == "70b" else "chat"
+        client, model = build_llm_client_for(role)
+        if client is None:
+            return {"error": "no LLM configured (set GROQ_API_KEY)"}
+        # Add brief bot-context so the model isn't answering in a vacuum
+        ctx = _chat_context_snippet()
+        prompt = (
+            "You are the operator's copilot for a long-options paper "
+            "trading bot. Answer concisely (max 6 sentences) citing "
+            "specific numbers from the CONTEXT when relevant. If the "
+            "question is about trading mechanics, be technical + "
+            "precise. If about bot status, use the CONTEXT.\n\n"
+            f"CONTEXT:\n{ctx}\n\n"
+            f"OPERATOR: {msg}\n\nCOPILOT:"
+        )
+        resp = client.generate(
+            model=model, prompt=prompt,
+            temperature=0.3, max_tokens=400,
+        )
+        return {"response": (resp or "").strip(), "model": model}
+    except Exception as e:                                  # noqa: BLE001
+        return {"error": str(e)[:200]}
+
+
+def _chat_context_snippet() -> str:
+    """One-paragraph bot-state snippet to give the chat LLM grounding."""
+    import re as _re
+    import json as _json
+    from pathlib import Path as _P
+    parts: List[str] = []
+    # Broker state
+    try:
+        snap = _P(__file__).resolve().parents[2] / "logs" / "broker_state.json"
+        if snap.exists():
+            d = _json.loads(snap.read_text())
+            parts.append(
+                f"cash=${d.get('cash', 0):.2f} "
+                f"day_pnl=${d.get('day_pnl', 0):+.2f} "
+                f"open_positions={len(d.get('positions') or [])}"
+            )
+    except Exception:
+        pass
+    # Regime + vix from log tail
+    try:
+        log = _P(__file__).resolve().parents[2] / "logs" / "tradebot.out"
+        if log.exists():
+            size = log.stat().st_size
+            with log.open("rb") as f:
+                f.seek(max(0, size - 80_000))
+                if size > 80_000:
+                    f.readline()
+                text = f.read().decode("utf-8", errors="replace")
+            text = _re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
+            regimes = _re.findall(r"regime=(\w+)", text)
+            vixs = _re.findall(r"\bvix=([0-9.]+)", text)
+            if regimes:
+                parts.append(f"regime={regimes[-1]}")
+            if vixs:
+                parts.append(f"vix={vixs[-1]}")
+    except Exception:
+        pass
+    return " · ".join(parts) if parts else "(no state available)"
+
+
+@app.post("/api/action/research", response_class=JSONResponse)
+async def action_research(request: Request):
+    """Trigger options research agent."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    symbols = body.get("symbols") or ["SPY", "QQQ"]
+    symbols = [str(s).upper()[:6] for s in symbols][:6]
+    try:
+        from ..data.multi_provider import MultiProvider
+        from ..intelligence.options_research import OptionsResearchAgent
+        mp = MultiProvider.from_env()
+        agent = OptionsResearchAgent(mp)
+        rep = agent.run(symbols)
+        return {
+            "ok": True,
+            "markdown": agent.to_markdown(rep),
+            "model": rep.model,
+            "latency_sec": rep.latency_sec,
+            "ideas": [
+                {
+                    "symbol": i.symbol, "direction": i.direction,
+                    "strike": i.strike, "expiry": i.expiry,
+                    "entry": i.entry, "profit_target": i.profit_target,
+                    "stop_loss": i.stop_loss,
+                    "confidence": i.confidence,
+                    "rationale": i.rationale[:300],
+                }
+                for i in rep.ideas
+            ],
+        }
+    except Exception as e:                                  # noqa: BLE001
+        return {"ok": False, "error": str(e)[:300]}
+
+
+@app.post("/api/action/close", response_class=JSONResponse)
+async def action_close(request: Request):
+    """Queue a manual close intent. Body: {symbol, kind?: 'full_close'|'trim_half'}."""
+    import json as _json, time as _t
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    symbol = str(body.get("symbol", "")).upper().strip()
+    kind = str(body.get("kind", "full_close"))
+    if not symbol:
+        return {"ok": False, "error": "symbol required"}
+    try:
+        from ..core.data_paths import data_path
+        from pathlib import Path as _P
+        intent_path = _P(data_path("manual_close_intents.json"))
+        intent_path.parent.mkdir(parents=True, exist_ok=True)
+        existing = []
+        if intent_path.exists():
+            try:
+                existing = _json.loads(intent_path.read_text() or "[]")
+                if not isinstance(existing, list):
+                    existing = []
+            except Exception:
+                existing = []
+        existing.append({
+            "symbol": symbol, "kind": kind,
+            "source": "dashboard_manual", "ts": _t.time(),
+        })
+        intent_path.write_text(_json.dumps(existing, indent=2, default=str))
+        return {"ok": True,
+                "message": f"close intent queued for {symbol} ({kind})"}
+    except Exception as e:                                  # noqa: BLE001
+        return {"ok": False, "error": str(e)[:200]}
+
+
+@app.post("/api/action/cleanup", response_class=JSONResponse)
+async def action_cleanup(request: Request):
+    """List orphans + optionally close all. Body: {close?: bool}."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    do_close = bool(body.get("close", False))
+    try:
+        from ..brokers.tradier_adapter import build_tradier_broker
+        from ..core.types import Order, Side
+        import json as _json
+        from pathlib import Path as _P
+        tb = build_tradier_broker()
+        if tb is None:
+            return {"ok": False, "error": "tradier not configured"}
+        # Local state
+        snap = _P(__file__).resolve().parents[2] / "logs" / "broker_state.json"
+        local_syms = set()
+        if snap.exists():
+            try:
+                d = _json.loads(snap.read_text())
+                local_syms = {p.get("symbol", "")
+                              for p in (d.get("positions") or [])}
+            except Exception:
+                pass
+        tradier_positions = list(tb.positions())
+        tradier_syms = {p.symbol for p in tradier_positions}
+        orphans_tradier = tradier_syms - local_syms
+        orphans_local   = local_syms - tradier_syms
+        actions: List[Dict[str, Any]] = []
+        if do_close and orphans_tradier:
+            for p in tradier_positions:
+                if p.symbol not in orphans_tradier:
+                    continue
+                side = Side.SELL if p.qty > 0 else Side.BUY
+                o = Order(symbol=p.symbol, side=side,
+                          qty=abs(p.qty), is_option=p.is_option,
+                          limit_price=max(0.01, p.avg_price * 0.5),
+                          tif="DAY", tag="dashboard_cleanup")
+                try:
+                    tb.submit(o)
+                    actions.append({"symbol": p.symbol, "status": "ok"})
+                except Exception as e:
+                    actions.append({"symbol": p.symbol,
+                                     "status": "failed",
+                                     "err": str(e)[:150]})
+        return {
+            "ok": True,
+            "local_n": len(local_syms),
+            "tradier_n": len(tradier_syms),
+            "orphans_tradier": sorted(orphans_tradier),
+            "orphans_local": sorted(orphans_local),
+            "actions": actions,
+            "tradier_positions": [
+                {"symbol": p.symbol, "qty": p.qty,
+                 "avg_price": p.avg_price, "is_option": p.is_option}
+                for p in tradier_positions
+            ],
+        }
+    except Exception as e:                                  # noqa: BLE001
+        return {"ok": False, "error": str(e)[:200]}
 
 
 _TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
