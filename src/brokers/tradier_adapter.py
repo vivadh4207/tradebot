@@ -83,9 +83,17 @@ class TradierBroker:
 
     def positions(self) -> List[Position]:
         data = self._get(f"/v1/accounts/{self._account}/positions") or {}
-        rows = ((data.get("positions") or {}).get("position")) or []
+        # Tradier quirk: when the account has no positions, this is
+        # the literal string "null" rather than JSON null or an empty
+        # dict. Handle all three shapes defensively.
+        positions_obj = data.get("positions")
+        if not positions_obj or not isinstance(positions_obj, dict):
+            return []
+        rows = positions_obj.get("position") or []
         if isinstance(rows, dict):
             rows = [rows]
+        if not isinstance(rows, list):
+            return []
         out: List[Position] = []
         for r in rows:
             try:
@@ -170,9 +178,14 @@ class TradierBroker:
 
     def cancel_all(self) -> None:
         data = self._get(f"/v1/accounts/{self._account}/orders") or {}
-        rows = ((data.get("orders") or {}).get("order")) or []
+        orders_obj = data.get("orders")
+        if not orders_obj or not isinstance(orders_obj, dict):
+            return
+        rows = orders_obj.get("order") or []
         if isinstance(rows, dict):
             rows = [rows]
+        if not isinstance(rows, list):
+            return
         for o in rows:
             oid = o.get("id")
             if oid and o.get("status") in ("open", "pending"):
