@@ -28,6 +28,9 @@ KILL_FILE="$ROOT/KILL"
 LAUNCHD_LABEL="com.tradebot.paper"
 LAUNCHD_SRC_PLIST="$ROOT/deploy/launchd/${LAUNCHD_LABEL}.plist"
 LAUNCHD_INSTALLED_PLIST="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+RESEARCH_LABEL="com.tradebot.research"
+RESEARCH_SRC_PLIST="$ROOT/deploy/launchd/${RESEARCH_LABEL}.plist"
+RESEARCH_INSTALLED_PLIST="$HOME/Library/LaunchAgents/${RESEARCH_LABEL}.plist"
 
 # launchd dashboard agent (separate from the bot watchdog).
 DASHBOARD_LABEL="com.tradebot.dashboard"
@@ -488,6 +491,47 @@ cmd_discord_uninstall() {
 # Button-triggered from Discord panel. Keeps common "fix hung LLM"
 # actions one click away instead of requiring SSH.
 
+cmd_research_install() {
+  if [[ "$HOST_OS" != "Darwin" ]]; then
+    echo "research-install is Mac-only (uses launchd). On Linux we'd"
+    echo "add a systemd timer here — not yet implemented."
+    return 2
+  fi
+  if [[ ! -f "$RESEARCH_SRC_PLIST" ]]; then
+    echo "source plist missing: $RESEARCH_SRC_PLIST"; return 1
+  fi
+  mkdir -p "$(dirname "$RESEARCH_INSTALLED_PLIST")"
+  # Rewrite __TRADEBOT_ROOT__ / __TRADEBOT_PY__ placeholders (same pattern
+  # as watchdog-install).
+  local tmp_plist; tmp_plist="$(mktemp)"
+  awk -v root="$ROOT" -v py="$ROOT/.venv/bin/python" '
+    { gsub(/__TRADEBOT_ROOT__/, root); gsub(/__TRADEBOT_PY__/, py); print }
+  ' "$RESEARCH_SRC_PLIST" > "$tmp_plist"
+  mv "$tmp_plist" "$RESEARCH_INSTALLED_PLIST"
+  launchctl unload "$RESEARCH_INSTALLED_PLIST" 2>/dev/null || true
+  if launchctl load "$RESEARCH_INSTALLED_PLIST"; then
+    echo "research installed + loaded: $RESEARCH_INSTALLED_PLIST"
+    echo "fires every 30 min on weekdays 09:30-16:00 ET"
+    echo "run now: launchctl start $RESEARCH_LABEL"
+    echo "logs:    $ROOT/logs/options_research.{out,err}"
+  else
+    echo "launchctl load failed"; return 1
+  fi
+}
+
+cmd_research_uninstall() {
+  if [[ "$HOST_OS" != "Darwin" ]]; then
+    echo "research-uninstall is Mac-only."; return 2
+  fi
+  if [[ -f "$RESEARCH_INSTALLED_PLIST" ]]; then
+    launchctl unload "$RESEARCH_INSTALLED_PLIST" 2>/dev/null || true
+    rm -f "$RESEARCH_INSTALLED_PLIST"
+    echo "research unloaded + removed"
+  else
+    echo "research: not installed"
+  fi
+}
+
 cmd_ollama_restart() {
   if [[ "$HOST_OS" != "Linux" ]]; then
     echo "ollama-restart is Linux-only."; return 2
@@ -727,6 +771,9 @@ case "${1:-}" in
   ollama-restart)     cmd_ollama_restart ;;
   ollama-warmup)      cmd_ollama_warmup ;;
   ollama-status)      cmd_ollama_status ;;
+  research-install)   cmd_research_install ;;
+  research-uninstall) cmd_research_uninstall ;;
+  options-research)   shift; "$PY" "$ROOT/scripts/run_options_research.py" "$@" ;;
   macro-sweep-install)   cmd_macro_sweep_install ;;
   macro-sweep-uninstall) cmd_macro_sweep_uninstall ;;
   macro-sweep)        shift; "$PY" "$ROOT/scripts/nightly_macro_sweep.py" "$@" ;;

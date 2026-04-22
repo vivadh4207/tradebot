@@ -139,6 +139,7 @@ COMMAND_MAP: Dict[str, Tuple[str, bool]] = {
     "ollama-status":  ("ollama-status",  False),
     "ollama-restart": ("ollama-restart", False),
     "ollama-warmup":  ("ollama-warmup",  False),
+    "research":       ("options-research", False),   # handled in-process; see _handle_research
     "reset-paper":   ("reset-paper",     True),       # requires DESTROY confirm
     "wipe":          ("wipe-journal",    True),       # requires DESTROY confirm
 }
@@ -160,6 +161,8 @@ HELP_TEXT = (
     f"  `{COMMAND_PREFIX}risk-switch`  — refresh CBOE put/call OI state\n"
     f"  `{COMMAND_PREFIX}audit`         — 70B strategy audit (~30-120s)\n"
     f"  `{COMMAND_PREFIX}summary [N]`   — concise digest of last N min (default 60)\n"
+    f"  `{COMMAND_PREFIX}research [SYMS]` — 70B options-research ideas "
+    "(default SPY QQQ)\n"
     f"  `{COMMAND_PREFIX}ollama-status` — Ollama daemon + loaded models\n"
     f"  `{COMMAND_PREFIX}ollama-warmup` — Pre-load 8B + 70B into GPU memory\n"
     f"  `{COMMAND_PREFIX}ollama-restart` — Restart Ollama daemon\n"
@@ -300,6 +303,11 @@ class CommandRunner:
             if len(parts) >= 2 and parts[1].isdigit():
                 window = max(5, min(1440, int(parts[1])))
             return await self._handle_summary(window)
+        if command == "research":
+            # "!research" (default SPY+QQQ) or "!research TSLA" etc.
+            parts = (raw_text or "").split()
+            syms = [s.upper() for s in parts[1:]] if len(parts) >= 2 else ["SPY", "QQQ"]
+            return await self._handle_research(syms)
         if destroyed and subcmd == "reset-paper":
             # reset_paper.py supports --yes to skip its own interactive prompt
             extra_args = ["--yes"]
@@ -330,6 +338,23 @@ class CommandRunner:
         if stderr and stderr.strip():
             body += f"\n**stderr:**```\n{_truncate(stderr, 400)}\n```"
         return head + body
+
+    async def _handle_research(self, symbols: List[str]) -> str:
+        """Run the options research agent in a worker thread (70B is
+        slow) and return its formatted markdown."""
+        try:
+            from src.data.multi_provider import MultiProvider
+            from src.intelligence.options_research import OptionsResearchAgent
+            mp = MultiProvider.from_env()
+            agent = OptionsResearchAgent(mp)
+            loop = asyncio.get_event_loop()
+            def _call():
+                rep = agent.run(symbols)
+                return agent.to_markdown(rep)
+            out = await loop.run_in_executor(None, _call)
+            return out
+        except Exception as e:                          # noqa: BLE001
+            return f"research failed: {type(e).__name__}: {str(e)[:200]}"
 
     async def _handle_summary(self, window_minutes: int) -> str:
         """Build an in-session digest of the last N minutes of
@@ -522,6 +547,53 @@ def _build_chat_context():
     return ctx
 
 
+def _enrich_context_with_options(ctx, question: str) -> None:
+    """When the question mentions options / strikes / news, pull a
+    compact snapshot of the live chain + top headlines for the
+    underlyings the user's universe covers (or SPY by default). Mutates
+    ctx in place. Fail-open — any exception leaves ctx untouched.
+    """
+    try:
+        from src.data.multi_provider import MultiProvider
+        mp = MultiProvider.from_env()
+        if not mp.active_providers():
+            return
+        # Which symbols? Prefer ones mentioned in the question, else fall
+        # back to the universe.
+        mentioned: List[str] = []
+        for sym in ("SPY", "QQQ", "IWM", "DIA"):
+            if sym.lower() in (question or "").lower():
+                mentioned.append(sym)
+        targets = mentioned or (ctx.universe[:2] if ctx.universe else ["SPY"])
+        atm_rows: List[dict] = []
+        headlines: List[dict] = []
+        for sym in targets[:2]:                              # cap 2 symbols
+            chain = mp.option_chain(sym)
+            if chain:
+                # Use the same near-ATM slicer the research agent uses.
+                try:
+                    from src.intelligence.options_research import (
+                        _best_contracts_near_atm,
+                    )
+                    spot = ctx.spot_by_symbol.get(sym) or 0.0
+                    if spot > 0:
+                        atm_rows.extend(
+                            _best_contracts_near_atm(chain, spot, n_each_side=3)
+                        )
+                except Exception:
+                    pass
+            for n in (mp.news(sym, limit=5) or [])[:5]:
+                headlines.append({
+                    "ts": n.ts, "symbol": sym,
+                    "headline": n.headline,
+                    "source": n.source,
+                })
+        ctx.option_chain_atm = atm_rows[:20]
+        ctx.news_headlines = headlines[:10]
+    except Exception as e:                                  # noqa: BLE001
+        _log.info("options_context_enrich_failed err=%s", e)
+
+
 def _build_app():
     """Construct the discord client + command router. Lazy-imports
     discord so `import discord_terminal` doesn't require the lib to be
@@ -564,6 +636,15 @@ def _build_app():
         try:
             async with message.channel.typing():
                 ctx = _build_chat_context()
+                # Enrich context with live options chain + news when the
+                # question sounds options-related. Saves a few hundred
+                # ms on "hi what's up" style questions that don't need it.
+                try:
+                    from src.intelligence.llm_chat import question_wants_options_context
+                    if question_wants_options_context(question):
+                        _enrich_context_with_options(ctx, question)
+                except Exception as _e:
+                    _log.info("chat_context_enrich_failed err=%s", _e)
                 loop = asyncio.get_event_loop()
                 answer = await loop.run_in_executor(
                     None,
@@ -680,6 +761,11 @@ def _build_app():
                             custom_id="tb:summary", row=3)
         async def btn_summary(self, interaction, _):
             await self._button(interaction, "summary")
+
+        @discord.ui.button(label="Research", style=discord.ButtonStyle.primary,
+                            custom_id="tb:research", row=3)
+        async def btn_research(self, interaction, _):
+            await self._button(interaction, "research")
 
     # ------------------------- events -------------------------
 

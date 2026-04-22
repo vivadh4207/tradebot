@@ -103,7 +103,7 @@ execution:
   # are rare but liquidity is still ample). Stocks need the surge for
   # momentum confirmation.
   min_volume_confirmation: 1.2        # legacy single-value (fallback)
-  min_volume_confirmation_etf: 0.80   # SPY, QQQ, IWM, XLF, etc.
+  min_volume_confirmation_etf: 0.55   # SPY, QQQ, IWM, XLF, etc.
   min_volume_confirmation_stock: 1.20 # individual stocks
   max_spread_pct_etf: 0.05
   max_spread_pct_stock: 0.10
@@ -376,6 +376,29 @@ price_action:
 
 breadth:
   enabled: true                    # composite risk-on/off probe
+
+# ===== Multi-source market data =====
+# Which providers to fan out to alongside Alpaca. Each is activated by
+# its .env key; listing here is purely informational + tuning.
+data_providers:
+  quote_disagreement_pct: 0.005   # >0.5% between sources triggers median fallback
+  fan_out_timeout_sec: 8.0
+  providers:
+    alpaca:   {enabled: true,  kind: primary}
+    polygon:  {enabled: true,  kind: options, note: "Needs POLYGON_API_KEY"}
+    tradier:  {enabled: true,  kind: options, note: "Needs TRADIER_TOKEN"}
+    finnhub:  {enabled: true,  kind: news_and_sentiment, note: "FINNHUB_KEY set"}
+
+# ===== Options research agent =====
+# Runs every 30 min during session AND on-demand via Discord
+# `!research [SYMBOL]`. Uses data_providers + the 70B auditor model.
+options_research:
+  enabled: true
+  underlyings: [SPY, QQQ]
+  strikes_each_side: 4
+  max_tokens: 700
+  timeout_sec: 240.0              # 70B can take 60-180s
+  auto_post_interval_min: 30      # in launchd plist; this is informational
   cache_seconds: 60
   risk_off_threshold: -0.3         # credit-spread runners stand down below this
 

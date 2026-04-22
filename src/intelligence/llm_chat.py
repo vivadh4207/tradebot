@@ -59,6 +59,13 @@ class ChatContext:
     last_audit_summary: Optional[str] = None
     last_audit_health: Optional[int] = None
     now_iso: str = ""
+    # Optional — populated on demand when the question references
+    # options / contracts / specific strike behavior. The chat
+    # dispatcher pulls this from MultiProvider before building the
+    # prompt. Keeping it in the context dataclass keeps serialization
+    # uniform.
+    option_chain_atm: List[Dict[str, Any]] = field(default_factory=list)
+    news_headlines: List[Dict[str, Any]] = field(default_factory=list)
 
 
 # -------------------------------------------------------------- sanitizers
@@ -96,7 +103,7 @@ _SYSTEM_HINT = (
 
 
 def _build_prompt(question: str, ctx: ChatContext) -> str:
-    snapshot = {
+    snapshot: Dict[str, Any] = {
         "now": ctx.now_iso,
         "mode": "live" if ctx.live_trading else "paper",
         "universe": ctx.universe,
@@ -113,12 +120,40 @@ def _build_prompt(question: str, ctx: ChatContext) -> str:
             if ctx.last_audit_health is not None else None
         ),
     }
+    # Only include these blocks when they contain data — keeps the
+    # prompt compact for simple questions.
+    if ctx.option_chain_atm:
+        snapshot["option_chain_atm"] = ctx.option_chain_atm[:20]
+    if ctx.news_headlines:
+        snapshot["headlines"] = ctx.news_headlines[:10]
     return (
         f"{_SYSTEM_HINT}\n\n"
         f"SNAPSHOT:\n{json.dumps(snapshot, indent=2, default=str)}\n\n"
         f"QUESTION:\n{question}\n\n"
         f"ANSWER:\n"
     )
+
+
+# Keywords that suggest the user wants an options-specific answer, so
+# the chat dispatcher should enrich the context with live chain + news.
+# Match case-insensitive, whole-word-ish.
+_OPTIONS_QUESTION_RE = re.compile(
+    r"\b("
+    r"option|options|strike|call|puts?|delta|gamma|theta|vega|"
+    r"iv|volatility|premium|expiry|expiration|chain|otm|itm|atm|"
+    r"credit spread|debit spread|straddle|strangle|butterfly|"
+    r"iron condor|wheel|csp|ccs|spx|spy|qqq|trade setup|setup|"
+    r"target price|sentiment|news|research"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def question_wants_options_context(question: str) -> bool:
+    """True when the question appears to need live options / chain
+    / news data. Used by the dispatcher to decide whether to pay the
+    data-fetch cost."""
+    return bool(_OPTIONS_QUESTION_RE.search(question or ""))
 
 
 # -------------------------------------------------------------- rate limit
