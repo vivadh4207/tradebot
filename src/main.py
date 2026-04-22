@@ -1298,6 +1298,30 @@ class TradeBot:
                                  f"_now={pnl_now:+.2%}_dte={pos_dte}"),
                                 layer=0,
                             )
+                        # Absolute drawdown kill — independent of peak
+                        # tracking. Protects against the case where peak
+                        # wasn't recorded (bot restart, old position).
+                        # Operator's QQQ case: 2-3% up → 5% down, no peak
+                        # memory due to restart. These thresholds ensure
+                        # that scenario closes at -5% max without any
+                        # peak tracking needed.
+                        if d is None or not d.should_close:
+                            if pos_dte == 0:
+                                max_dd = -0.03
+                            elif pos_dte >= 14:
+                                max_dd = -0.05
+                            else:
+                                max_dd = -0.04
+                            if pnl_now <= max_dd:
+                                from .exits.fast_exit import (
+                                    ExitDecision as _ED,
+                                )
+                                d = _ED(
+                                    True,
+                                    (f"absolute_drawdown_{dte_label}:"
+                                     f"now={pnl_now:+.2%}<={max_dd:+.2%}_dte={pos_dte}"),
+                                    layer=0,
+                                )
                     # Position-fade advisor: LLM second opinion + auto-
                     # execute on 'urgent close' recommendations.
                     if (d is None or not d.should_close) and \
@@ -1419,6 +1443,9 @@ class TradeBot:
                             "profit_lock_swing": "Swing profit-lock — loose threshold let it breathe, then locked",
                             "llm_urgent_close": "LLM chart review said URGENT CLOSE — auto-executed without waiting for operator",
                             "llm_urgent_trim": "LLM said urgent trim — closed 50%, trailing the rest",
+                            "absolute_drawdown_0dte": "0DTE down >5% from entry — hard cut (no peak memory needed)",
+                            "absolute_drawdown_short": "Short-dated down >8% from entry — hard cut",
+                            "absolute_drawdown_swing": "Swing down >12% from entry — hard cut",
                         }
                         prefix = reason_raw.split(":")[0]
                         why = reason_human.get(prefix, reason_raw)

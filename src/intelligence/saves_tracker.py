@@ -93,7 +93,18 @@ def record_exit(symbol: str, underlying: str, exit_reason: str,
                  exit_pnl_pct: float, dte: int) -> None:
     """Log a defensive exit. No-op if the exit reason isn't defensive."""
     if not _is_defensive(exit_reason):
+        _log.debug("saves_skip_non_defensive reason=%s", exit_reason[:60])
         return
+    # Scrub underlying: if caller passed the whole entry-tag blob or an
+    # OCC-format option symbol, extract just the ticker.
+    import re as _re
+    if underlying and ("|" in underlying or "=" in underlying):
+        m = _re.search(r"sym=([A-Z]{1,6})\b", underlying)
+        underlying = m.group(1) if m else underlying.split("|")[0][:6]
+    if underlying == symbol:
+        m = _re.match(r"^([A-Z]{1,6})\d{6}[CP]\d{8}$", symbol or "")
+        if m:
+            underlying = m.group(1)
     try:
         rec = SaveRecord(
             ts=time.time(), symbol=symbol, underlying=underlying,

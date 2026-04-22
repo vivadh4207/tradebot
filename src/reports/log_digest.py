@@ -34,6 +34,15 @@ _LINE_RE = re.compile(
     r"(?P<event>\S+)\s*(?P<rest>.*)$"
 )
 
+# Strip ANSI color codes — structlog emits them when stdout is a TTY
+# and some callers pipe to a file without TERM=dumb. Required before
+# regex match or _LINE_RE fails silently ("no parseable events").
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _strip_ansi(s: str) -> str:
+    return _ANSI_RE.sub("", s)
+
 # Python-stdlib logging line (WARNING / ERROR) looks like:
 #   2026-04-20 11:33:52,665 [WARNING] src.x.y :: event_name key=...
 _LEGACY_RE = re.compile(
@@ -209,8 +218,9 @@ def build_digest(log_path: Path, window_minutes: int = 60) -> Digest:
     except Exception:
         return d
 
-    for line in raw.splitlines():
+    for raw_line in raw.splitlines():
         d.n_lines += 1
+        line = _strip_ansi(raw_line)
         m = _LINE_RE.match(line)
         legacy = None
         if m is None:

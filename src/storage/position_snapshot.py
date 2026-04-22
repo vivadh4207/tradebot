@@ -44,6 +44,12 @@ class PositionRecord:
     auto_profit_target: Optional[float] = None
     auto_stop_loss: Optional[float] = None
     consecutive_holds: int = 0
+    # Trailing-stop state — must persist across restarts or the
+    # green-to-red killswitch and profit-lock can't fire on positions
+    # held longer than one bot session.
+    peak_price: Optional[float] = None
+    peak_pnl_pct: Optional[float] = None
+    scaled_out: bool = False
 
 
 @dataclass
@@ -85,6 +91,9 @@ def save_snapshot(path: str | Path, broker) -> None:
                 auto_profit_target=pos.auto_profit_target,
                 auto_stop_loss=pos.auto_stop_loss,
                 consecutive_holds=int(pos.consecutive_holds),
+                peak_price=getattr(pos, "peak_price", None),
+                peak_pnl_pct=getattr(pos, "peak_pnl_pct", None),
+                scaled_out=bool(getattr(pos, "scaled_out", False)),
             ))
         acct = broker.account()
         snap = BrokerSnapshot(
@@ -156,6 +165,11 @@ def restore_into_paper_broker(broker, snap: BrokerSnapshot) -> int:
                 auto_profit_target=r.auto_profit_target,
                 auto_stop_loss=r.auto_stop_loss,
                 consecutive_holds=int(r.consecutive_holds),
+                peak_price=(float(r.peak_price)
+                             if r.peak_price is not None else None),
+                peak_pnl_pct=(float(r.peak_pnl_pct)
+                                if r.peak_pnl_pct is not None else None),
+                scaled_out=bool(r.scaled_out),
             )
     _log.info("broker_snapshot_restored n=%d cash=%.2f", len(snap.positions), snap.cash)
     return len(snap.positions)

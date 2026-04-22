@@ -35,10 +35,14 @@ git add \
   .gitignore \
   config/settings.yaml \
   push_changes.sh \
+  scripts/backfill_saves.py \
   scripts/discord_terminal.py \
   scripts/run_morning_scan.py \
   scripts/run_saves_report.py \
   scripts/run_strategy_report.py \
+  src/core/types.py \
+  src/reports/log_digest.py \
+  src/storage/position_snapshot.py \
   src/core/runtime_overrides.py \
   src/data/market_data.py \
   src/exits/fast_exit.py \

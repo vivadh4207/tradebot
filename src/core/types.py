@@ -216,6 +216,11 @@ class Position:
     # remainder rides a trailing stop instead of the static PT.
     peak_price: Optional[float] = None
     scaled_out: bool = False
+    # Peak unrealized pnl percentage seen since entry — required for
+    # profit-lock, ratcheting floor, and green-to-red killswitch. MUST
+    # persist across restarts or those exits can't fire on long-held
+    # positions. Stored as a fraction (0.05 = +5%).
+    peak_pnl_pct: Optional[float] = None
 
     @property
     def is_long(self) -> bool:

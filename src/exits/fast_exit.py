@@ -279,8 +279,22 @@ class FastExitEvaluator:
         # ---- Profit-lock trailing (works for 1-contract positions) ----
         # Track peak unrealized PnL% on the position so single-contract
         # trades get trailing protection without waiting for scale-out.
+        #
+        # RECOVERY: if peak_pnl_pct is None (position came from
+        # pre-upgrade snapshot or bot restarted mid-trade), seed it
+        # from the CURRENT pnl. Worst case we miss one profit-lock cycle
+        # but the next uptick will properly update peak. Guarantees the
+        # green-to-red killswitch arms even on long-held positions.
         peak_pnl_attr = getattr(pos, "peak_pnl_pct", None)
-        if peak_pnl_attr is None or pnl > peak_pnl_attr:
+        if peak_pnl_attr is None:
+            # Seed with max(current pnl, 0) so we don't falsely arm on
+            # negative pnl; a trade underwater isn't "at peak."
+            peak_pnl_attr = max(pnl, 0.0)
+            try:
+                pos.peak_pnl_pct = peak_pnl_attr
+            except Exception:
+                pass
+        elif pnl > peak_pnl_attr:
             try:
                 pos.peak_pnl_pct = pnl
                 peak_pnl_attr = pnl
