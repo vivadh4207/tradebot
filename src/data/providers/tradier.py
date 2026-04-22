@@ -41,7 +41,11 @@ class TradierProvider:
     def __init__(self, token: Optional[str] = None,
                  *, sandbox: Optional[bool] = None,
                  timeout_sec: float = 6.0):
-        self._token = (token or os.getenv("TRADIER_TOKEN") or "").strip()
+        self._token = (token
+                        or os.getenv("TRADIER_TOKEN")
+                        or os.getenv("TRADIER_ACCOUNT_API_KEY")
+                        or os.getenv("TRADIER_API_KEY")
+                        or "").strip()
         use_sandbox = (sandbox if sandbox is not None
                        else os.getenv("TRADIER_SANDBOX", "").strip()
                              in ("1", "true", "yes"))

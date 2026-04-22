@@ -77,39 +77,77 @@ class QueuedIdea:
 # ----------------------------------------------------------- writer (agent)
 
 
-def _idea_has_sane_prices(idea: QueuedIdea) -> bool:
-    """Gate on prices. Rejects LLM hallucinations where:
-      - profit_target or stop_loss is negative / zero
-      - stop_loss >= entry (for LONG options, SL must be BELOW entry)
-      - profit_target <= entry (PT must be ABOVE entry for long-only)
-      - profit_target > 10x entry (unrealistic multi-bagger target)
-      - stop_loss > entry * 0.9 (SL too tight; LLM confused premium for spot)
-      - entry > 1000 (LLM mistook spot price for option premium)
+def _normalize_prices(idea: QueuedIdea) -> tuple:
+    """Return (fixed_idea, list_of_warnings). Auto-repair recoverable
+    issues instead of rejecting outright — the LLM often gets the
+    direction right but puts nonsense in stop_loss/profit_target. We
+    salvage those because the underlying signal may be real.
+
+    HARD REJECTS (return None, [reasons]):
+      - entry is None or non-numeric
+      - entry <= 0 or > 1000 (LLM confused spot price for option premium)
+
+    AUTO-REPAIRS (logs warning, idea accepted):
+      - stop_loss negative or > entry → clamp to entry * 0.5
+      - profit_target <= entry or > 10*entry → set to entry * 1.6
+      - missing PT or SL → fill with defaults around entry
     """
+    warnings: List[str] = []
     e = idea.entry
-    pt = idea.profit_target
-    sl = idea.stop_loss
-    if None in (e, pt, sl):
-        return False
+    if e is None:
+        return None, ["entry is None"]
     try:
-        e, pt, sl = float(e), float(pt), float(sl)
+        e = float(e)
     except Exception:
-        return False
-    if e <= 0 or pt <= 0 or sl <= 0:
-        return False                     # negative/zero anywhere = bad
-    if sl >= e:
-        return False                     # SL must be below entry
-    if pt <= e:
-        return False                     # PT must be above entry
-    if pt > 10 * e:
-        return False                     # unrealistic 10-bagger
-    if sl > e * 0.9:
-        return False                     # SL too tight / nonsense
+        return None, [f"entry unparseable: {idea.entry}"]
+    if e <= 0:
+        return None, [f"entry <= 0 ({e})"]
     if e > 1000:
         # Options on SPY/QQQ rarely cost >$100 per contract for 0-30 DTE.
-        # >$1000 means the LLM confused spot price for option premium.
-        return False
-    return True
+        # >$1000 almost certainly means LLM confused spot for premium.
+        return None, [f"entry too high for an option premium ({e:.2f}) — "
+                       f"LLM likely used underlying spot"]
+
+    # Auto-repair profit_target
+    pt = idea.profit_target
+    try:
+        pt = float(pt) if pt is not None else None
+    except Exception:
+        pt = None
+    if pt is None or pt <= e:
+        pt = round(e * 1.6, 2)
+        warnings.append(f"profit_target missing/low — defaulted to ${pt:.2f} (+60%)")
+    elif pt > 10 * e:
+        new_pt = round(e * 2.0, 2)
+        warnings.append(f"profit_target ${pt:.2f} unrealistic — capped at ${new_pt:.2f}")
+        pt = new_pt
+
+    # Auto-repair stop_loss
+    sl = idea.stop_loss
+    try:
+        sl = float(sl) if sl is not None else None
+    except Exception:
+        sl = None
+    if sl is None or sl < 0:
+        sl = round(e * 0.5, 2)
+        warnings.append(f"stop_loss missing/negative — defaulted to ${sl:.2f} (-50%)")
+    elif sl >= e:
+        sl = round(e * 0.5, 2)
+        warnings.append(f"stop_loss >= entry — clamped to ${sl:.2f} (-50%)")
+    elif sl > e * 0.9:
+        sl = round(e * 0.6, 2)
+        warnings.append(f"stop_loss too tight — widened to ${sl:.2f} (-40%)")
+
+    idea.profit_target = pt
+    idea.stop_loss = sl
+    return idea, warnings
+
+
+def _idea_has_sane_prices(idea: QueuedIdea) -> bool:
+    """Back-compat thin wrapper — returns True if the idea survived
+    normalization. Used by tests that still call this name."""
+    fixed, _ = _normalize_prices(idea)
+    return fixed is not None
 
 
 def write_ideas(ideas: List[QueuedIdea], data_root: Optional[Path] = None
@@ -125,20 +163,73 @@ def write_ideas(ideas: List[QueuedIdea], data_root: Optional[Path] = None
     if not ideas:
         return 0
     rejected = 0
-    valid = []
+    auto_fixed = 0
+    valid: List[QueuedIdea] = []
+    # Per-idea notification lines so operator sees exactly what the
+    # queue accepted, fixed, or dropped.
+    queue_notify_lines: List[str] = []
     for idea in ideas:
-        if _idea_has_sane_prices(idea):
-            valid.append(idea)
-        else:
+        fixed, warnings = _normalize_prices(idea)
+        if fixed is None:
             rejected += 1
             _log.warning(
-                "llm_autotrade_idea_rejected sym=%s dir=%s entry=%s pt=%s sl=%s "
-                "reason=insane_prices",
-                idea.symbol, idea.direction, idea.entry,
-                idea.profit_target, idea.stop_loss,
+                "llm_autotrade_idea_rejected sym=%s dir=%s entry=%s "
+                "reasons=%s",
+                idea.symbol, idea.direction, idea.entry, warnings,
             )
+            queue_notify_lines.append(
+                f"❌ **REJECTED** {idea.symbol} {idea.direction} "
+                f"${idea.strike or '?'} — {'; '.join(warnings)}"
+            )
+            continue
+        if warnings:
+            auto_fixed += 1
+            _log.info(
+                "llm_autotrade_idea_auto_fixed sym=%s dir=%s warnings=%s",
+                fixed.symbol, fixed.direction, warnings,
+            )
+            queue_notify_lines.append(
+                f"⚙️ **auto-fixed** {fixed.symbol} {fixed.direction} "
+                f"${fixed.strike or '?'} {fixed.expiry or ''} "
+                f"entry=${fixed.entry:.2f} PT=${fixed.profit_target:.2f} "
+                f"SL=${fixed.stop_loss:.2f} — {'; '.join(warnings)}"
+            )
+        else:
+            queue_notify_lines.append(
+                f"✅ **queued** {fixed.symbol} {fixed.direction} "
+                f"${fixed.strike or '?'} {fixed.expiry or ''} "
+                f"entry=${fixed.entry:.2f} PT=${fixed.profit_target:.2f} "
+                f"SL=${fixed.stop_loss:.2f} ({fixed.confidence})"
+            )
+        valid.append(fixed)
     if rejected:
         _log.warning("llm_autotrade_queue_rejected n=%d", rejected)
+    if auto_fixed:
+        _log.info("llm_autotrade_queue_auto_fixed n=%d", auto_fixed)
+
+    # Broadcast the queue summary to Discord so operator sees it live.
+    # Fail-open — notifier issues must never stop the queue write.
+    if queue_notify_lines:
+        try:
+            from ..notify.base import build_notifier
+            msg = ("**🧠 LLM autotrade queue**\n"
+                   + "\n".join(queue_notify_lines[:8]))
+            if len(queue_notify_lines) > 8:
+                msg += f"\n… and {len(queue_notify_lines) - 8} more"
+            build_notifier().notify(
+                msg,
+                level=("warn" if rejected else "info"),
+                title="llm_ideas",
+                meta={
+                    "Queued":   len(valid),
+                    "Fixed":    auto_fixed,
+                    "Rejected": rejected,
+                    "_footer":  "autotrade_queue",
+                },
+            )
+        except Exception as e:                          # noqa: BLE001
+            _log.info("autotrade_queue_notify_failed err=%s", e)
+
     ideas = valid
     if not ideas:
         return 0

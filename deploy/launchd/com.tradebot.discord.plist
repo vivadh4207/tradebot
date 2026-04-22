@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS launchd agent: Discord terminal bot + LLM chat + autotrade
+  panel. Survives terminal close, Mac sleep (while on power), reboot,
+  and bot crashes (KeepAlive auto-restart).
+
+  Install:  bash scripts/tradebotctl.sh discord-install
+  Logs:     logs/discord_terminal.{out,err}
+  Status:   launchctl list | grep discord
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.tradebot.discord</string>
+
+  <key>WorkingDirectory</key>
+  <string>__TRADEBOT_ROOT__</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__TRADEBOT_PY__</string>
+    <string>__TRADEBOT_ROOT__/scripts/discord_terminal.py</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    <key>TZ</key>
+    <string>America/New_York</string>
+    <key>PYTHONPATH</key>
+    <string>__TRADEBOT_ROOT__</string>
+  </dict>
+
+  <!-- Keep alive across crashes and reboots. -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- Don't hot-loop if the bot fails to start. -->
+  <key>ThrottleInterval</key>
+  <integer>15</integer>
+
+  <key>StandardOutPath</key>
+  <string>__TRADEBOT_ROOT__/logs/discord_terminal.out</string>
+  <key>StandardErrorPath</key>
+  <string>__TRADEBOT_ROOT__/logs/discord_terminal.err</string>
+</dict>
+</plist>
