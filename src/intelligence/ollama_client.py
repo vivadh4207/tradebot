@@ -27,7 +27,10 @@ _log = logging.getLogger(__name__)
 @dataclass
 class OllamaConfig:
     base_url: str = "http://127.0.0.1:11434"
-    timeout_sec: float = 180.0        # 70B on Jetson needs ~60s for 900 tokens
+    # 70B first-call cold-load is 60-90s; after that generation at
+    # 5-10 tok/sec means 300 tokens = 30-60s. Keep generous headroom
+    # so chat doesn't empty-return when the model is swapping in.
+    timeout_sec: float = 300.0
 
 
 class OllamaClient:
@@ -106,5 +109,5 @@ def build_ollama_client() -> OllamaClient:
     """Factory reading env overrides. No new settings.yaml plumbing
     needed — the caller supplies model names from its own config."""
     base = (os.getenv("OLLAMA_BASE_URL") or "http://127.0.0.1:11434").strip()
-    timeout = float(os.getenv("OLLAMA_TIMEOUT_SEC", "180.0"))
+    timeout = float(os.getenv("OLLAMA_TIMEOUT_SEC", "300.0"))
     return OllamaClient(OllamaConfig(base_url=base, timeout_sec=timeout))

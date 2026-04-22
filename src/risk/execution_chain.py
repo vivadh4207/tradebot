@@ -170,6 +170,26 @@ class ExecutionChain:
                else self._s["execution"]["max_spread_pct_stock"])
         if c.spread_pct > cap:
             return FilterResult(False, f"spread_too_wide: {c.spread_pct:.3f}>{cap}")
+        # Expensive-contract gate. Operator: "options bought are very
+        # expensive, hard to make big money when entry is higher".
+        # A $6 contract needs +50% just to hit PT; a $2 contract hits
+        # the same $ profit at +150% and lets us diversify. Skip
+        # contracts where the ask exceeds max_premium_per_contract_usd.
+        try:
+            from ..core.runtime_overrides import get_override
+            max_prem = float(get_override(
+                "max_premium_per_contract_usd",
+                self._s["execution"].get("max_premium_per_contract_usd", 0.0),
+            ) or 0.0)
+        except Exception:
+            max_prem = float(self._s["execution"].get(
+                "max_premium_per_contract_usd", 0.0) or 0.0)
+        if max_prem > 0 and (c.ask or 0) > max_prem:
+            return FilterResult(
+                False,
+                f"premium_too_high: ${c.ask:.2f}>${max_prem:.2f}_cap"
+                " (pick cheaper strike)",
+            )
         return FilterResult(True, "ok")
 
     def f12_open_interest(self, ctx: ExecutionContext) -> FilterResult:
@@ -207,8 +227,17 @@ class ExecutionChain:
             return FilterResult(True, "0dte_na", advisory=True)
         dte = (c.expiry - ctx.now.date()).days
         if dte == 0:
-            cap = self._s["execution"]["max_0dte_per_day"]
-            if ctx.zero_dte_count_today >= cap:
+            # Discord !autopanel 0DTE buttons write to runtime_overrides;
+            # we read override first, fall through to settings.
+            try:
+                from ..core.runtime_overrides import get_override
+                cap = get_override(
+                    "max_0dte_per_day",
+                    self._s["execution"]["max_0dte_per_day"],
+                )
+            except Exception:
+                cap = self._s["execution"]["max_0dte_per_day"]
+            if ctx.zero_dte_count_today >= int(cap):
                 return FilterResult(False, f"0dte_cap: {ctx.zero_dte_count_today}>={cap}")
         return FilterResult(True, "ok")
 

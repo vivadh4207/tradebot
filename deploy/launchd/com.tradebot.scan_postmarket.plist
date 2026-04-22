@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Post-market recap. Fires at 16:30 ET weekdays (30 min after close).
+  Posts to Discord title='scan_postmarket'. Summarizes what moved,
+  flags lingering momentum into tomorrow, uses Groq 70B for narrative.
+
+  Install:  scripts/tradebotctl.sh scan-postmarket-install
+  Status:   launchctl list | grep tradebot.scan_postmarket
+  Logs:     logs/scan_postmarket.out / .err
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.tradebot.scan_postmarket</string>
+
+  <key>WorkingDirectory</key>
+  <string>__TRADEBOT_ROOT__</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__TRADEBOT_PY__</string>
+    <string>__TRADEBOT_ROOT__/scripts/run_morning_scan.py</string>
+    <string>--session</string>
+    <string>post</string>
+    <string>--limit</string>
+    <string>15</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    <key>TZ</key>
+    <string>America/New_York</string>
+  </dict>
+
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>16</integer><key>Minute</key><integer>30</integer></dict>
+  </array>
+
+  <key>StandardOutPath</key>
+  <string>__TRADEBOT_ROOT__/logs/scan_postmarket.out</string>
+  <key>StandardErrorPath</key>
+  <string>__TRADEBOT_ROOT__/logs/scan_postmarket.err</string>
+</dict>
+</plist>

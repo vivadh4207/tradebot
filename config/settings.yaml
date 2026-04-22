@@ -41,7 +41,7 @@ account:
   # Drawdown guard toggle. When false, portfolio-wide DD scale-down and
   # halt tiers are disabled. Per-trade stops still fire.
   drawdown_guard_enabled: false
-  max_open_positions: 10
+  max_open_positions: 20
 
 # ===== Universe — locked to SPY + QQQ =====
 universe:
@@ -107,11 +107,18 @@ execution:
                                         # after operator noted 0.55 still blocked
                                         # trades during active-but-thin sessions
   min_volume_confirmation_stock: 1.20 # individual stocks
-  max_spread_pct_etf: 0.05
-  max_spread_pct_stock: 0.10
+  # Spread gates. Operator: bid/ask-cross on wide-spread contracts is
+  # a tax we can't afford. If the spread is >3% of mid on an ETF
+  # option, skip — there are always cheaper strikes elsewhere.
+  max_spread_pct_etf: 0.03
+  max_spread_pct_stock: 0.06
   min_open_interest: 100
   min_today_option_volume: 100
-  max_0dte_per_day: 50
+  max_0dte_per_day: 20
+  # Hard per-contract premium cap. Cheap contracts let us diversify
+  # within the same $-risk budget. $3.00 × 100 × 5 qty = $1,500 max
+  # exposure per entry — below 1% of a $100k account.
+  max_premium_per_contract_usd: 3.00
   order_ttl_seconds: 5
   # DTE strategy. Fixed (target_dte) OR diversified (target_dte_pool).
   # If target_dte_pool is a non-empty list, each entry randomly picks
@@ -120,11 +127,15 @@ execution:
   # makes them a losing lottery. 14-45 DTE gives directional thesis
   # time to play out (2-5%/day theta) without capital tied up forever.
   target_dte: 14
-  target_dte_pool: [7, 14, 30]
+  target_dte_pool: [0, 1, 7, 14, 30]
   # Entry spread aggressiveness. 0.00 = pay bid (won't fill), 1.00 =
-  # pay ask, 0.30 = bid + 30% of spread (aggressive buyer, saves ~70%
-  # of spread vs crossing ask).
-  entry_spread_pct: 0.30
+  # pay ask. 0.15 = bid + 15% of spread — we sit close to the bid
+  # and let market makers come to us. If we don't fill in
+  # order_ttl_seconds we re-quote instead of crossing the full spread.
+  entry_spread_pct: 0.15
+  # When order_ttl expires unfilled, how aggressive to chase on the
+  # re-quote: 0.50 = mid, 1.00 = ask. One re-price, then give up.
+  entry_chase_spread_pct: 0.50
   # Pattern/momentum gates — require underlying to have moved in
   # signal direction before entering. Set *_enabled=false to disable.
   vwap_alignment_enabled: true

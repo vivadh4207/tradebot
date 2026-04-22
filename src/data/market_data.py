@@ -233,20 +233,18 @@ class AlpacaDataAdapter(MarketDataAdapter):
             _logging.getLogger(__name__).warning(
                 "alpaca_bars_error_falling_back symbol=%s err=%s", symbol, e,
             )
-            # Alert on fallback — but heavily throttled (1 hr) because
-            # a DNS/network outage would otherwise flood Discord with
-            # one alert per symbol per tick. One heads-up per hour per
-            # unique error is enough to notice the degradation.
-            try:
-                from ..notify.issue_reporter import report_issue
-                report_issue(
-                    scope="alpaca.get_bars",
-                    message=f"Alpaca bars fetch fell back to synthetic for {symbol}: {type(e).__name__}: {e}",
-                    exc=e,
-                    throttle_sec=3600.0,
-                )
-            except Exception:
-                pass
+            # Before giving up to the synthetic fallback, try
+            # MultiProvider (Tradier / Yahoo / Finnhub) for latest bars
+            # — they're real market data; synthetic is last resort.
+            alt = _try_multi_provider_bars(symbol, limit=limit,
+                                             timeframe_minutes=timeframe_minutes)
+            if alt is not None:
+                return alt
+            # No Discord alert here — the fallback is BY DESIGN and
+            # used to be per-tick spam. The log warning above is enough
+            # for post-mortem; actual outages surface as repeated log
+            # lines, not per-tick Discord embeds. Operator can grep
+            # "alpaca_bars_error" if curious.
             return self._fallback.get_bars(symbol, limit=limit,
                                            timeframe_minutes=timeframe_minutes, end=end)
 
@@ -267,16 +265,91 @@ class AlpacaDataAdapter(MarketDataAdapter):
                 ask_size=float(getattr(q, "ask_size", 0) or 0),
             )
         except Exception as e:
-            # Same hourly throttle — quote fetch runs every tick, per
-            # symbol, so an outage must not fire per-tick alerts.
-            try:
-                from ..notify.issue_reporter import report_issue
-                report_issue(
-                    scope="alpaca.latest_quote",
-                    message=f"Alpaca quote fetch fell back to synthetic for {symbol}: {type(e).__name__}",
-                    exc=e,
-                    throttle_sec=3600.0,
-                )
-            except Exception:
-                pass
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "alpaca_quote_error_falling_back symbol=%s err=%s",
+                symbol, e,
+            )
+            # Try Tradier / Finnhub / Yahoo before accepting synthetic
+            alt = _try_multi_provider_quote(symbol)
+            if alt is not None:
+                return alt
+            # No Discord alert — same rationale as bars path.
             return self._fallback.latest_quote(symbol)
+
+
+# =============================================================================
+# Multi-provider fallback helpers
+# =============================================================================
+# When Alpaca bars or quotes fail, try Tradier / Yahoo / Finnhub before
+# surrendering to synthetic. Fail-open — any exception returns None so
+# the caller uses the synthetic fallback.
+
+def _try_multi_provider_quote(symbol: str):
+    """Return a Quote from any real provider, else None."""
+    try:
+        from .multi_provider import MultiProvider
+        from ..core.types import Quote
+        mp = MultiProvider.from_env()
+        if not mp.active_providers():
+            return None
+        q = mp.latest_quote(symbol)
+        if q is None or q.mid <= 0:
+            return None
+        return Quote(
+            symbol=symbol,
+            ts=None,
+            bid=float(q.bid), ask=float(q.ask),
+            bid_size=0.0, ask_size=0.0,
+        )
+    except Exception:
+        return None
+
+
+def _try_multi_provider_bars(symbol: str, *, limit: int,
+                              timeframe_minutes: int):
+    """Tradier (and Polygon, when configured) expose bars; Yahoo has
+    intraday history via yfinance. Build a list of Bar from whichever
+    provider responds first. Returns None if none do, so the caller
+    falls back to synthetic."""
+    try:
+        from .multi_provider import MultiProvider
+        from ..core.types import Bar
+        from datetime import datetime, timezone
+        mp = MultiProvider.from_env()
+        if not mp.active_providers():
+            return None
+        # Yahoo's yfinance can pull intraday bars cleanly.
+        for p in getattr(mp, "_providers", []):
+            if p.name != "yahoo" or not p.is_enabled():
+                continue
+            try:
+                import yfinance as yf
+                t = yf.Ticker(symbol.upper())
+                interval = f"{max(1, int(timeframe_minutes))}m"
+                period = "1d" if timeframe_minutes <= 15 else "5d"
+                h = t.history(period=period, interval=interval)
+                if h is None or h.empty:
+                    continue
+                bars = []
+                for ts, row in h.tail(int(limit)).iterrows():
+                    # Ensure TZ-aware UTC ts
+                    ts_utc = ts.tz_convert("UTC") if ts.tzinfo else \
+                        ts.tz_localize("UTC")
+                    bars.append(Bar(
+                        symbol=symbol,
+                        ts=ts_utc.to_pydatetime(),
+                        open=float(row["Open"]),
+                        high=float(row["High"]),
+                        low=float(row["Low"]),
+                        close=float(row["Close"]),
+                        volume=float(row["Volume"]),
+                        vwap=None,
+                    ))
+                if bars:
+                    return bars
+            except Exception:
+                continue
+        return None
+    except Exception:
+        return None

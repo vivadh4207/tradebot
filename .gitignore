@@ -43,6 +43,10 @@ data_cache/
 *.db
 KILL
 
+# Runtime-mutable state (Discord buttons write here; never committed)
+runtime_overrides.json
+data/runtime_overrides.json
+
 # Editor
 .vscode/
 .idea/

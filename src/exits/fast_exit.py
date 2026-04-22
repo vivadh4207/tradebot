@@ -62,6 +62,34 @@ class FastExitConfig:
     momentum_exit_vol_lookback: int = 15         # baseline volume window
     momentum_exit_stall_lookback: int = 5        # "no new high" window
 
+    # ---- Intelligent profit protection (operator-requested) ----
+    # "If we're in profit and price moves the other way we can lose
+    #  even if SL didn't hit. Need smarter detection."
+    #
+    # Profit-lock trailing: activates at `profit_lock_arm_pct`, closes
+    # when pnl retraces to `profit_lock_give_back_pct`. Works for
+    # single-contract positions (doesn't require scale-out to arm).
+    profit_lock_enabled: bool = True
+    profit_lock_arm_pct: float = 0.15        # arm once we've been +15%
+    profit_lock_give_back_pct: float = 0.30  # close if we give back 30% of peak gain
+    # Example: peak = +40%, give_back = 30% → close at +28% (40 * 0.70).
+    # Example: peak = +20%, give_back = 30% → close at +14%.
+    # Never lets a +20%+ winner turn into a loser.
+
+    # Ratcheting profit floor: once we've been above these thresholds,
+    # SL tightens up. Ensures we don't give back big gains.
+    #   Been above +25% → never exit below +10% (hard floor on that trade)
+    #   Been above +50% → never exit below +25%
+    #   Been above +100% → never exit below +50%
+    profit_floor_enabled: bool = True
+
+    # Support-break exit: when in profit AND underlying breaks VWAP /
+    # prior bar low (for calls) or high (for puts), take profit. The
+    # thesis for going long is broken once the underlying starts making
+    # lower highs / higher lows against us.
+    support_break_enabled: bool = True
+    support_break_min_profit: float = 0.08   # only fires if up 8%+
+
 
 class FastExitEvaluator:
     def __init__(self, cfg: FastExitConfig = FastExitConfig()):
@@ -204,6 +232,85 @@ class FastExitEvaluator:
             mx = self._momentum_exit(pos, bars)
             if mx is not None:
                 return mx
+
+        # ---- Profit-lock trailing (works for 1-contract positions) ----
+        # Track peak unrealized PnL% on the position so single-contract
+        # trades get trailing protection without waiting for scale-out.
+        peak_pnl_attr = getattr(pos, "peak_pnl_pct", None)
+        if peak_pnl_attr is None or pnl > peak_pnl_attr:
+            try:
+                pos.peak_pnl_pct = pnl
+                peak_pnl_attr = pnl
+            except Exception:
+                peak_pnl_attr = pnl
+        if (self.cfg.profit_lock_enabled
+                and peak_pnl_attr is not None
+                and peak_pnl_attr >= self.cfg.profit_lock_arm_pct):
+            give_back = self.cfg.profit_lock_give_back_pct
+            close_threshold = peak_pnl_attr * (1.0 - give_back)
+            if pnl <= close_threshold and pnl > 0:
+                return ExitDecision(
+                    True,
+                    f"profit_lock:peak={peak_pnl_attr:+.2%}_now={pnl:+.2%}"
+                    f"_gave_back_{give_back:.0%}",
+                    layer=0,
+                )
+
+        # ---- Ratcheting profit floor ----
+        # Once we've crossed a profit tier, never close below its floor.
+        # Triggered when current pnl falls below the floor of the
+        # highest tier we've ever touched.
+        if self.cfg.profit_floor_enabled and peak_pnl_attr is not None:
+            tiers = [
+                (1.00, 0.50),    # >+100% peak → floor +50%
+                (0.50, 0.25),    # >+50%  peak → floor +25%
+                (0.25, 0.10),    # >+25%  peak → floor +10%
+            ]
+            for tier_peak, tier_floor in tiers:
+                if peak_pnl_attr >= tier_peak and pnl <= tier_floor and pnl > 0:
+                    return ExitDecision(
+                        True,
+                        f"profit_floor:tier={tier_peak:+.0%}"
+                        f"_peak={peak_pnl_attr:+.2%}_floor={tier_floor:+.0%}"
+                        f"_now={pnl:+.2%}",
+                        layer=0,
+                    )
+                    # first matching tier wins; stop checking
+                    break
+
+        # ---- Support-break exit ----
+        # Long call thesis breaks when underlying makes a lower low on
+        # the close (support lost). Long put thesis breaks when it
+        # makes a higher high. Only fires when in profit — we don't
+        # cut losers on one red bar.
+        if (self.cfg.support_break_enabled
+                and bars is not None and len(bars) >= 5
+                and pnl >= self.cfg.support_break_min_profit):
+            is_bullish = (pos.right == OptionRight.CALL)
+            recent = bars[-5:]
+            closes = [b.close for b in recent]
+            lows = [b.low for b in recent]
+            highs = [b.high for b in recent]
+            if is_bullish:
+                # Support break = last close breaks the 5-bar low
+                prior_low = min(lows[:-1])
+                if closes[-1] < prior_low:
+                    return ExitDecision(
+                        True,
+                        f"support_break:close={closes[-1]:.2f}<5bar_low"
+                        f"={prior_low:.2f}_pnl={pnl:+.2%}",
+                        layer=0,
+                    )
+            else:
+                # Resistance break = last close breaks the 5-bar high
+                prior_high = max(highs[:-1])
+                if closes[-1] > prior_high:
+                    return ExitDecision(
+                        True,
+                        f"resistance_break:close={closes[-1]:.2f}>5bar_high"
+                        f"={prior_high:.2f}_pnl={pnl:+.2%}",
+                        layer=0,
+                    )
 
         # Scale-out at first PT hit: close half, flag pos.scaled_out,
         # let the remainder trail the high. Requires at least 2 contracts

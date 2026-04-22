@@ -1179,6 +1179,209 @@ def _build_app():
                     f"counter reset failed: {e}", ephemeral=True,
                 )
 
+        # ---- Row 3: 0DTE cap controls ----------------------------
+
+        def _current_zdte_cap(self) -> int:
+            try:
+                from src.core.runtime_overrides import get_override
+                from src.core.settings import load_settings
+                s = load_settings()
+                return int(get_override(
+                    "max_0dte_per_day",
+                    s["execution"]["max_0dte_per_day"],
+                ))
+            except Exception:
+                return 20
+
+        @discord.ui.button(label="🎯 0DTE +1",
+                            style=discord.ButtonStyle.secondary,
+                            custom_id="ta:zdte_up", row=3)
+        async def btn_zdte_up(self, interaction, _):
+            if not await self._authorized(interaction):
+                return
+            try:
+                from src.core.runtime_overrides import set_override
+                new_cap = self._current_zdte_cap() + 1
+                set_override("max_0dte_per_day", new_cap)
+                _audit({"kind": "zdte_cap_up", "user": interaction.user.id,
+                        "new_cap": new_cap})
+                await interaction.response.send_message(
+                    f"🎯 0DTE cap raised to **{new_cap}** trades/day "
+                    "(live, no restart needed).", ephemeral=True,
+                )
+            except Exception as e:
+                await interaction.response.send_message(
+                    f"0DTE +1 failed: {e}", ephemeral=True,
+                )
+
+        @discord.ui.button(label="🎯🎯 0DTE +5",
+                            style=discord.ButtonStyle.secondary,
+                            custom_id="ta:zdte_up5", row=3)
+        async def btn_zdte_up5(self, interaction, _):
+            if not await self._authorized(interaction):
+                return
+            try:
+                from src.core.runtime_overrides import set_override
+                new_cap = self._current_zdte_cap() + 5
+                set_override("max_0dte_per_day", new_cap)
+                _audit({"kind": "zdte_cap_up5", "user": interaction.user.id,
+                        "new_cap": new_cap})
+                await interaction.response.send_message(
+                    f"🎯🎯 0DTE cap raised to **{new_cap}** trades/day.",
+                    ephemeral=True,
+                )
+            except Exception as e:
+                await interaction.response.send_message(
+                    f"0DTE +5 failed: {e}", ephemeral=True,
+                )
+
+        @discord.ui.button(label="⬇ 0DTE -1",
+                            style=discord.ButtonStyle.secondary,
+                            custom_id="ta:zdte_down", row=3)
+        async def btn_zdte_down(self, interaction, _):
+            if not await self._authorized(interaction):
+                return
+            try:
+                from src.core.runtime_overrides import set_override
+                new_cap = max(0, self._current_zdte_cap() - 1)
+                set_override("max_0dte_per_day", new_cap)
+                _audit({"kind": "zdte_cap_down", "user": interaction.user.id,
+                        "new_cap": new_cap})
+                await interaction.response.send_message(
+                    f"⬇ 0DTE cap lowered to **{new_cap}** trades/day.",
+                    ephemeral=True,
+                )
+            except Exception as e:
+                await interaction.response.send_message(
+                    f"0DTE -1 failed: {e}", ephemeral=True,
+                )
+
+        @discord.ui.button(label="🎯 0DTE=20",
+                            style=discord.ButtonStyle.primary,
+                            custom_id="ta:zdte_set20", row=3)
+        async def btn_zdte_set20(self, interaction, _):
+            if not await self._authorized(interaction):
+                return
+            try:
+                from src.core.runtime_overrides import set_override
+                set_override("max_0dte_per_day", 20)
+                _audit({"kind": "zdte_cap_set", "user": interaction.user.id,
+                        "new_cap": 20})
+                await interaction.response.send_message(
+                    "🎯 0DTE cap set to **20** trades/day (operator default).",
+                    ephemeral=True,
+                )
+            except Exception as e:
+                await interaction.response.send_message(
+                    f"0DTE set failed: {e}", ephemeral=True,
+                )
+
+        @discord.ui.button(label="🔄 0DTE Reset",
+                            style=discord.ButtonStyle.secondary,
+                            custom_id="ta:zdte_reset", row=3)
+        async def btn_zdte_reset(self, interaction, _):
+            if not await self._authorized(interaction):
+                return
+            try:
+                from src.core.runtime_overrides import set_override
+                set_override("max_0dte_per_day", None)
+                _audit({"kind": "zdte_cap_reset", "user": interaction.user.id})
+                await interaction.response.send_message(
+                    "🔄 0DTE cap reset to config default.", ephemeral=True,
+                )
+            except Exception as e:
+                await interaction.response.send_message(
+                    f"0DTE reset failed: {e}", ephemeral=True,
+                )
+
+        # ---- Row 4: smart-bid pricing controls -------------------
+
+        @discord.ui.button(label="💰 Smarter Bids",
+                            style=discord.ButtonStyle.primary,
+                            custom_id="ta:bid_tighten", row=4)
+        async def btn_bid_tighten(self, interaction, _):
+            """Lower entry_spread_pct — sit closer to bid (pay less,
+            fill less often). Good when you want quality over volume."""
+            if not await self._authorized(interaction):
+                return
+            try:
+                from src.core.runtime_overrides import set_override
+                set_override("entry_spread_pct", 0.10)
+                _audit({"kind": "bid_tighten", "user": interaction.user.id})
+                await interaction.response.send_message(
+                    "💰 Entry now at **bid + 10% of spread** — tighter "
+                    "fills, less slippage, may miss some trades.",
+                    ephemeral=True,
+                )
+            except Exception as e:
+                await interaction.response.send_message(
+                    f"bid tighten failed: {e}", ephemeral=True,
+                )
+
+        @discord.ui.button(label="⚖ Mid Price",
+                            style=discord.ButtonStyle.secondary,
+                            custom_id="ta:bid_mid", row=4)
+        async def btn_bid_mid(self, interaction, _):
+            if not await self._authorized(interaction):
+                return
+            try:
+                from src.core.runtime_overrides import set_override
+                set_override("entry_spread_pct", 0.50)
+                _audit({"kind": "bid_mid", "user": interaction.user.id})
+                await interaction.response.send_message(
+                    "⚖ Entry now at **mid** (bid + 50% spread) — "
+                    "balance of fill rate vs cost.", ephemeral=True,
+                )
+            except Exception as e:
+                await interaction.response.send_message(
+                    f"bid mid failed: {e}", ephemeral=True,
+                )
+
+        @discord.ui.button(label="🚀 Chase",
+                            style=discord.ButtonStyle.danger,
+                            custom_id="ta:bid_chase", row=4)
+        async def btn_bid_chase(self, interaction, _):
+            """Pay ask * 0.95 — use only when you MUST get filled
+            (closing a position, catalyst breaking). Bleeds spread."""
+            if not await self._authorized(interaction):
+                return
+            try:
+                from src.core.runtime_overrides import set_override
+                set_override("entry_spread_pct", 0.90)
+                _audit({"kind": "bid_chase", "user": interaction.user.id})
+                await interaction.response.send_message(
+                    "🚀 Entry now at **bid + 90% spread** — aggressive "
+                    "taker. Use sparingly.", ephemeral=True,
+                )
+            except Exception as e:
+                await interaction.response.send_message(
+                    f"bid chase failed: {e}", ephemeral=True,
+                )
+
+        @discord.ui.button(label="💵 Cheap Only",
+                            style=discord.ButtonStyle.primary,
+                            custom_id="ta:premium_cap_low", row=4)
+        async def btn_premium_cap_low(self, interaction, _):
+            """Cap max premium at $2/contract — force the bot to pick
+            cheaper, farther-OTM strikes. Protects budget, spreads
+            risk across more positions."""
+            if not await self._authorized(interaction):
+                return
+            try:
+                from src.core.runtime_overrides import set_override
+                set_override("max_premium_per_contract_usd", 2.00)
+                _audit({"kind": "premium_cap_low",
+                        "user": interaction.user.id})
+                await interaction.response.send_message(
+                    "💵 Max premium per contract → **$2.00**. Bot will "
+                    "skip expensive strikes and pick cheaper OTM ones.",
+                    ephemeral=True,
+                )
+            except Exception as e:
+                await interaction.response.send_message(
+                    f"premium cap failed: {e}", ephemeral=True,
+                )
+
     class ControlPanel(discord.ui.View):
         """Persistent button panel. `custom_id`s survive bot restart
         when we call client.add_view(ControlPanel()) on_ready."""

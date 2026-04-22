@@ -640,41 +640,41 @@ class OptionsResearchAgent:
     # ------------------------------------------------ llm
 
     def _call_llm(self, prompt: str) -> tuple:
-        """Try 70B first (more thoughtful), fall back to 8B if 70B not
-        configured or fails. Returns (raw_text, model_used)."""
+        """Route through build_llm_client_for('research') — prefers Groq
+        70B (cloud, free tier), falls back to local Ollama 8B. Returns
+        (raw_text, model_used)."""
         import os as _os
-        model_candidates: List[str] = []
-        if self._model:
-            model_candidates.append(self._model)
-        else:
-            audit = (_os.getenv("LLM_AUDITOR_MODEL", "").strip()
-                     or "llama3.1:70b")
-            brain = (_os.getenv("LLM_BRAIN_MODEL", "").strip()
-                     or "llama3.1:8b")
-            model_candidates = [audit, brain]
         try:
-            from .ollama_client import build_ollama_client
-            client = build_ollama_client()
-            client.cfg.timeout_sec = self._timeout
-            if not client.ping():
-                _log.warning("options_research_ollama_unreachable")
+            from .groq_client import build_llm_client_for
+            client, model = build_llm_client_for("research")
+            if self._model:
+                model = self._model
+            if client is None:
+                _log.warning("options_research_no_llm_client")
                 return "", ""
-            for model in model_candidates:
-                try:
-                    raw = client.generate(
-                        model=model,
-                        prompt=prompt,
-                        temperature=0.2,
-                        max_tokens=self._max_tokens,
-                        num_ctx=6144,
-                        stop=["\n\nSNAPSHOT:", "\n\nYOUR JSON:"],
-                    )
-                    if raw and raw.strip():
-                        return raw, model
-                except Exception as e:                  # noqa: BLE001
-                    _log.info("options_research_model_failed model=%s err=%s",
-                              model, e)
-                    continue
+            # Groq ignores num_ctx; Ollama honors it
+            try:
+                if hasattr(client, "cfg") and hasattr(client.cfg, "timeout_sec"):
+                    client.cfg.timeout_sec = self._timeout
+            except Exception:
+                pass
+            # Ping when available (Ollama path)
+            try:
+                if hasattr(client, "ping") and not client.ping():
+                    _log.warning("options_research_llm_unreachable")
+                    return "", ""
+            except Exception:
+                pass
+            raw = client.generate(
+                model=model,
+                prompt=prompt,
+                temperature=0.2,
+                max_tokens=self._max_tokens,
+                num_ctx=6144,
+                stop=["\n\nSNAPSHOT:", "\n\nYOUR JSON:"],
+            )
+            if raw and raw.strip():
+                return raw, model
         except Exception as e:                          # noqa: BLE001
             _log.warning("options_research_llm_err err=%s", e)
         return "", ""

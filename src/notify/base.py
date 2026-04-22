@@ -150,6 +150,10 @@ _TITLE_TO_CHANNEL = {
     "macro":          {"macro_sweep", "macro"},
     # Hourly log digest + !summary outputs.
     "terminal":       {"summary", "status", "terminal", "digest"},
+    # Pre-market scan (08:30 ET weekdays — setups for the open).
+    "scan_premarket": {"scan_premarket", "premarket_scan", "premarket"},
+    # Post-market recap (16:30 ET weekdays — what moved + tomorrow).
+    "scan_postmarket": {"scan_postmarket", "postmarket_scan", "postmarket"},
 }
 
 

@@ -1854,7 +1854,17 @@ class TradeBot:
         # this works. Operator asked: "optimize bid/ask entry, don't
         # just enter at full ask."
         spread = max(0.0, contract.ask - contract.bid)
-        aggressiveness = float(self.s.get("execution.entry_spread_pct", 0.30))
+        # Runtime override honored — Discord !autopanel → Smarter Bids
+        # can tighten this live without a restart. Lower = closer to
+        # bid (better price, worse fill odds); higher = closer to ask.
+        try:
+            from .core.runtime_overrides import get_override
+            aggressiveness = float(get_override(
+                "entry_spread_pct",
+                self.s.get("execution.entry_spread_pct", 0.15),
+            ))
+        except Exception:
+            aggressiveness = float(self.s.get("execution.entry_spread_pct", 0.15))
         limit = round(contract.bid + spread * aggressiveness, 2)
         if limit <= 0:
             limit = round(contract.ask * 0.98, 2)   # fallback if bid=0
