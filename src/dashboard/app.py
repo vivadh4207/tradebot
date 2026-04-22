@@ -1947,6 +1947,127 @@ def strategy_buckets_api(days: int = Query(7, ge=1, le=365)):
     return {"buckets": out, "window_days": days}
 
 
+@app.get("/api/hourly_pnl", response_class=JSONResponse)
+def hourly_pnl_api(days: int = Query(1, ge=1, le=90)):
+    """P&L bucketed by ET hour of day. Useful to see which time windows
+    are carrying performance (opening, mid-day, power hour)."""
+    from datetime import datetime, timedelta, timezone
+    try:
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
+    except Exception:
+        et = None
+    j = _load_journal()
+    try:
+        since = datetime.now(tz=timezone.utc) - timedelta(days=days)
+        trades = j.closed_trades(since=since)
+    finally:
+        j.close()
+    from collections import defaultdict as _dd
+    buckets = _dd(lambda: {"n": 0, "pnl": 0.0, "wins": 0})
+    for t in trades:
+        if not t.closed_at:
+            continue
+        tt = t.closed_at
+        if et is not None:
+            tt = tt.astimezone(et)
+        hour = tt.hour
+        b = buckets[hour]
+        b["n"] += 1
+        b["pnl"] += t.pnl or 0
+        if (t.pnl or 0) > 0:
+            b["wins"] += 1
+    out = []
+    for h in range(4, 21):     # 04:00 pre-market → 20:00 after-hours
+        b = buckets.get(h, {"n": 0, "pnl": 0.0, "wins": 0})
+        out.append({
+            "hour": h,
+            "label": f"{h:02d}:00",
+            "count": b["n"],
+            "pnl": round(b["pnl"], 2),
+            "win_rate": round(b["wins"] / b["n"], 3) if b["n"] else None,
+        })
+    return {"hourly": out, "days": days}
+
+
+@app.get("/api/symbol_pnl", response_class=JSONResponse)
+def symbol_pnl_api(days: int = Query(30, ge=1, le=365),
+                    limit: int = Query(15, ge=1, le=50)):
+    """P&L aggregated per underlying — shows which tickers are
+    carrying the book (or bleeding it). Groups by tag sym= or OCC."""
+    from datetime import datetime, timedelta, timezone
+    import re as _re
+    from collections import defaultdict as _dd
+    j = _load_journal()
+    try:
+        since = datetime.now(tz=timezone.utc) - timedelta(days=days)
+        trades = j.closed_trades(since=since)
+    finally:
+        j.close()
+    buckets = _dd(lambda: {"n": 0, "pnl": 0.0, "wins": 0,
+                             "losses": 0, "pnl_pcts": []})
+    for t in trades:
+        # Underlying from entry_tag or OCC prefix
+        und = t.symbol
+        if t.entry_tag:
+            m = _re.search(r"\|sym=([A-Z]{1,6})", t.entry_tag)
+            if m:
+                und = m.group(1)
+        if len(und) > 6:
+            m = _re.match(r"^([A-Z]{1,6})\d{6}[CP]\d{8}$", und)
+            if m:
+                und = m.group(1)
+        b = buckets[und]
+        b["n"] += 1
+        b["pnl"] += t.pnl or 0
+        b["pnl_pcts"].append(t.pnl_pct or 0)
+        if (t.pnl or 0) > 0:
+            b["wins"] += 1
+        elif (t.pnl or 0) < 0:
+            b["losses"] += 1
+    out = []
+    for sym, b in sorted(buckets.items(),
+                           key=lambda kv: -kv[1]["pnl"])[:limit]:
+        n = b["n"]
+        out.append({
+            "symbol": sym, "count": n,
+            "wins": b["wins"], "losses": b["losses"],
+            "win_rate": round(b["wins"] / n, 3) if n else None,
+            "total_pnl": round(b["pnl"], 2),
+            "avg_pnl_pct": (round(sum(b["pnl_pcts"]) / n, 4)
+                              if n else None),
+        })
+    return {"symbols": out, "days": days}
+
+
+@app.get("/api/pnl_curve", response_class=JSONResponse)
+def pnl_curve_api(days: int = Query(1, ge=1, le=90)):
+    """Cumulative P&L curve — sum of realized pnl ordered by close time.
+    Simpler than equity curve (no cash fluctuations), shows pure
+    trading edge over time."""
+    from datetime import datetime, timedelta, timezone
+    j = _load_journal()
+    try:
+        since = datetime.now(tz=timezone.utc) - timedelta(days=days)
+        trades = j.closed_trades(since=since)
+    finally:
+        j.close()
+    trades = sorted(trades, key=lambda t: t.closed_at or datetime.min)
+    cum = 0.0
+    points = []
+    for t in trades:
+        if not t.closed_at:
+            continue
+        cum += t.pnl or 0
+        points.append({
+            "ts": t.closed_at.isoformat(),
+            "cum_pnl": round(cum, 2),
+            "pnl": round(t.pnl or 0, 2),
+            "symbol": t.symbol[:20],
+        })
+    return {"points": points, "days": days, "final_pnl": round(cum, 2)}
+
+
 @app.get("/api/exit_reasons", response_class=JSONResponse)
 def exit_reasons_api(days: int = Query(7, ge=1, le=365)):
     """Exit reason breakdown for a donut/pie chart."""

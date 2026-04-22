@@ -369,6 +369,21 @@ canvas { max-height: 260px; }
         </div>
       </div>
     </div>
+    <!-- Today's analytics row — cumulative P&L + hourly + symbol bars -->
+    <div class="grid" style="margin-bottom: var(--gap)">
+      <div class="col-4 card" style="min-height: 240px">
+        <div class="head"><span class="title">cumulative P&amp;L (session)</span><span class="sub" id="pnl-curve-sub">—</span></div>
+        <canvas id="pnl-curve-chart"></canvas>
+      </div>
+      <div class="col-4 card" style="min-height: 240px">
+        <div class="head"><span class="title">hourly P&amp;L (ET)</span><span class="sub" id="hourly-sub">—</span></div>
+        <canvas id="hourly-chart"></canvas>
+      </div>
+      <div class="col-4 card" style="min-height: 240px">
+        <div class="head"><span class="title">P&amp;L by underlying</span><span class="sub" id="sym-sub">—</span></div>
+        <canvas id="sym-chart"></canvas>
+      </div>
+    </div>
     <div class="grid" style="margin-bottom: var(--gap)">
       <div class="col-8 card" style="min-height: 320px">
         <div class="head"><span class="title">equity curve</span><span class="sub" id="equity-sub">—</span></div>
@@ -424,6 +439,16 @@ canvas { max-height: 260px; }
       </div>
       <div class="col-6 card"><div class="head"><span class="title">exit reasons</span></div>
         <canvas id="exit-chart"></canvas>
+      </div>
+    </div>
+    <div class="grid" style="margin-bottom: var(--gap)">
+      <div class="col-12 card" style="min-height:180px">
+        <div class="head"><span class="title">hourly win-rate heatmap (last 7d)</span></div>
+        <div id="hour-heat" style="display:flex;gap:4px;padding-top:8px;overflow-x:auto"></div>
+        <div class="mut" style="font-size:10px;margin-top:6px">
+          Green = win rate ≥ 60% · Red = win rate ≤ 40% · Grey = no trades.
+          Numbers are trade counts.
+        </div>
       </div>
     </div>
     <div class="card"><div class="head"><span class="title">per-bucket detail</span></div>
@@ -587,13 +612,15 @@ canvas { max-height: 260px; }
       <div class="chat-side">
         <div class="card"><div class="head"><span class="title">quick prompts</span></div>
           <div class="chat-suggestions" id="chat-suggestions">
-            <button class="btn ghost" onclick="askChat('What is the bot doing right now?')">What's the bot doing right now?</button>
-            <button class="btn ghost" onclick="askChat('Summarize today&apos;s P&amp;L + best / worst trades')">Summarize today's P&amp;L</button>
-            <button class="btn ghost" onclick="askChat('Why did the last trade exit?')">Why did last trade exit?</button>
-            <button class="btn ghost" onclick="askChat('What&apos;s the current market regime + breadth?')">Current regime + breadth?</button>
-            <button class="btn ghost" onclick="askChat('Should I tighten the 0DTE exit thresholds based on today&apos;s data?')">Should I tighten 0DTE exits?</button>
-            <button class="btn ghost" onclick="askChat('Which strategy bucket is carrying the P&amp;L?')">Which bucket is carrying P&amp;L?</button>
-            <button class="btn ghost" onclick="askChat('What filters are blocking most signals today?')">What filters block most?</button>
+            <button class="btn ghost" data-chat-prompt="What is the bot doing right now?">What's the bot doing right now?</button>
+            <button class="btn ghost" data-chat-prompt="Summarize today P&amp;L and best versus worst trades">Summarize today's P&amp;L</button>
+            <button class="btn ghost" data-chat-prompt="Why did the last trade exit?">Why did last trade exit?</button>
+            <button class="btn ghost" data-chat-prompt="What is the current market regime and breadth?">Current regime + breadth?</button>
+            <button class="btn ghost" data-chat-prompt="Should I tighten 0DTE exit thresholds based on today data?">Should I tighten 0DTE exits?</button>
+            <button class="btn ghost" data-chat-prompt="Which strategy bucket is carrying the P&amp;L?">Which bucket is carrying P&amp;L?</button>
+            <button class="btn ghost" data-chat-prompt="What filters are blocking most signals today?">What filters block most?</button>
+            <button class="btn ghost" data-chat-prompt="Review the last 5 exits and tell me which ones were good calls">Review last 5 exits</button>
+            <button class="btn ghost" data-chat-prompt="What should I tune to get more signal execution without breaking risk discipline?">What to tune for more trades?</button>
           </div>
         </div>
         <div class="card"><div class="head"><span class="title">model</span></div>
@@ -622,6 +649,7 @@ canvas { max-height: 260px; }
 let windowDays = 30;
 let currentView = 'overview';
 let equityChart = null, stratChart = null, exitChart = null;
+let pnlCurveChart = null, hourlyChart = null, symChart = null, hourHeatChart = null;
 let chatModel = '70b';
 let eventFilter = 'all';
 
@@ -703,6 +731,167 @@ async function refreshTopBar() {
 async function refreshOverview() {
   if (currentView !== 'overview') return;
   loadMetrics(); loadEquity(); loadPositions(); loadTrades(); loadEnsemble();
+  loadPnlCurve(); loadHourlyPnl(); loadSymbolPnl();
+}
+
+const CHART_BASE = {
+  color: '#94A3B8', borderColor: '#334155', gridColor: '#1E2540',
+  tooltipBg: '#0E1223', tooltipFg: '#F8FAFC', tooltipMuted: '#94A3B8',
+};
+
+function commonChartOpts(extra) {
+  const base = {
+    responsive: true, maintainAspectRatio: false,
+    plugins: {
+      legend: { display: false },
+      tooltip: {
+        backgroundColor: CHART_BASE.tooltipBg,
+        titleColor: CHART_BASE.tooltipFg,
+        bodyColor: CHART_BASE.tooltipMuted,
+        borderColor: CHART_BASE.borderColor, borderWidth: 1,
+      },
+    },
+    scales: {
+      x: { ticks: { color: CHART_BASE.color,
+                    font: { family: 'JetBrains Mono', size: 10 } },
+           grid: { color: CHART_BASE.gridColor } },
+      y: { ticks: { color: CHART_BASE.color,
+                    font: { family: 'JetBrains Mono', size: 10 } },
+           grid: { color: CHART_BASE.gridColor } },
+    },
+  };
+  return Object.assign(base, extra || {});
+}
+
+async function loadPnlCurve() {
+  const d = await api(`/api/pnl_curve?days=${Math.min(windowDays, 7)}`);
+  const pts = (d.points || []).map((p, i) => ({x: i, y: p.cum_pnl, ts: p.ts, sym: p.symbol}));
+  document.getElementById('pnl-curve-sub').textContent =
+    pts.length ? `${pts.length} trades · ${fmtUsd(d.final_pnl)}` : 'no trades';
+  if (pnlCurveChart) pnlCurveChart.destroy();
+  if (!pts.length) return;
+  const ctx = document.getElementById('pnl-curve-chart').getContext('2d');
+  const final = d.final_pnl || 0;
+  const color = final >= 0 ? '#22C55E' : '#EF4444';
+  const bg = final >= 0 ? 'rgba(34,197,94,0.08)' : 'rgba(239,68,68,0.08)';
+  pnlCurveChart = new Chart(ctx, {
+    type: 'line',
+    data: { datasets: [{ label: 'Cum P&L', data: pts,
+      borderColor: color, backgroundColor: bg, fill: true, tension: 0.25,
+      borderWidth: 2, pointRadius: 2, pointHoverRadius: 5,
+      pointBackgroundColor: color }] },
+    options: commonChartOpts({
+      plugins: { legend: { display: false },
+        tooltip: {
+          backgroundColor: CHART_BASE.tooltipBg,
+          titleColor: CHART_BASE.tooltipFg,
+          bodyColor: CHART_BASE.tooltipMuted,
+          borderColor: CHART_BASE.borderColor, borderWidth: 1,
+          callbacks: {
+            title: (items) => pts[items[0].dataIndex].sym,
+            label: c => '$' + c.parsed.y.toFixed(2),
+          }
+        } },
+      scales: {
+        x: { ticks: { color: CHART_BASE.color, callback: v => `#${v+1}` },
+             grid: { color: CHART_BASE.gridColor } },
+        y: { ticks: { color: CHART_BASE.color,
+                       callback: v => '$' + v.toFixed(0) },
+             grid: { color: CHART_BASE.gridColor } },
+      },
+    }),
+  });
+}
+
+async function loadHourlyPnl() {
+  const d = await api(`/api/hourly_pnl?days=1`);
+  const rows = (d.hourly || []).filter(h => h.count > 0);
+  document.getElementById('hourly-sub').textContent =
+    rows.length ? `${rows.length} active hours` : 'no trades today';
+  if (hourlyChart) hourlyChart.destroy();
+  if (!rows.length) return;
+  const ctx = document.getElementById('hourly-chart').getContext('2d');
+  hourlyChart = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: rows.map(r => r.label),
+      datasets: [{
+        label: 'P&L',
+        data: rows.map(r => r.pnl),
+        backgroundColor: rows.map(r => r.pnl >= 0 ? 'rgba(34,197,94,0.6)' : 'rgba(239,68,68,0.6)'),
+        borderColor: rows.map(r => r.pnl >= 0 ? '#22C55E' : '#EF4444'),
+        borderWidth: 1, borderRadius: 3,
+      }]
+    },
+    options: commonChartOpts({
+      plugins: { legend: { display: false },
+        tooltip: {
+          backgroundColor: CHART_BASE.tooltipBg,
+          titleColor: CHART_BASE.tooltipFg,
+          bodyColor: CHART_BASE.tooltipMuted,
+          borderColor: CHART_BASE.borderColor, borderWidth: 1,
+          callbacks: {
+            label: c => {
+              const r = rows[c.dataIndex];
+              return `${fmtUsd(r.pnl)} · ${r.count} trades · wr ${r.win_rate != null ? (r.win_rate*100).toFixed(0)+'%' : '—'}`;
+            }
+          },
+        },
+      },
+      scales: {
+        x: { ticks: { color: CHART_BASE.color }, grid: { color: CHART_BASE.gridColor } },
+        y: { ticks: { color: CHART_BASE.color, callback: v => '$' + v },
+             grid: { color: CHART_BASE.gridColor } },
+      },
+    }),
+  });
+}
+
+async function loadSymbolPnl() {
+  const d = await api(`/api/symbol_pnl?days=${windowDays}&limit=10`);
+  const rows = d.symbols || [];
+  document.getElementById('sym-sub').textContent =
+    rows.length ? `${rows.length} tickers · ${windowDays}d` : 'no data';
+  if (symChart) symChart.destroy();
+  if (!rows.length) return;
+  const ctx = document.getElementById('sym-chart').getContext('2d');
+  symChart = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: rows.map(r => r.symbol),
+      datasets: [{
+        label: 'Total P&L',
+        data: rows.map(r => r.total_pnl),
+        backgroundColor: rows.map(r => r.total_pnl >= 0 ? 'rgba(34,197,94,0.6)' : 'rgba(239,68,68,0.6)'),
+        borderColor: rows.map(r => r.total_pnl >= 0 ? '#22C55E' : '#EF4444'),
+        borderWidth: 1, borderRadius: 3,
+      }]
+    },
+    options: commonChartOpts({
+      indexAxis: 'y',
+      plugins: { legend: { display: false },
+        tooltip: {
+          backgroundColor: CHART_BASE.tooltipBg,
+          titleColor: CHART_BASE.tooltipFg,
+          bodyColor: CHART_BASE.tooltipMuted,
+          borderColor: CHART_BASE.borderColor, borderWidth: 1,
+          callbacks: {
+            label: c => {
+              const r = rows[c.dataIndex];
+              return `${fmtUsd(r.total_pnl)} · ${r.count} trades · wr ${r.win_rate != null ? (r.win_rate*100).toFixed(0)+'%' : '—'}`;
+            }
+          },
+        },
+      },
+      scales: {
+        x: { ticks: { color: CHART_BASE.color, callback: v => '$' + v },
+             grid: { color: CHART_BASE.gridColor } },
+        y: { ticks: { color: CHART_BASE.color,
+                       font: { family: 'JetBrains Mono', size: 11 } },
+             grid: { display: false } },
+      },
+    }),
+  });
 }
 
 async function loadMetrics() {
@@ -887,6 +1076,35 @@ async function refreshStrategy() {
         y: { ticks: { color: '#94A3B8', callback: v => '$' + v }, grid: { color: '#1E2540' } }
       } }
   });
+
+  // Hourly heatmap — fixed 7-day window
+  try {
+    const hh = await api('/api/hourly_pnl?days=7');
+    const heatHost = document.getElementById('hour-heat');
+    const hours = (hh.hourly || []);
+    heatHost.innerHTML = hours.map(h => {
+      const wr = h.win_rate;
+      let bg = 'var(--muted)', color = 'var(--fg-subtle)';
+      if (h.count > 0) {
+        if (wr >= 0.6)        { bg = 'rgba(34,197,94,0.55)';  color = 'var(--fg)'; }
+        else if (wr >= 0.5)   { bg = 'rgba(34,197,94,0.25)';  color = 'var(--fg)'; }
+        else if (wr >= 0.4)   { bg = 'rgba(239,68,68,0.25)';  color = 'var(--fg)'; }
+        else                  { bg = 'rgba(239,68,68,0.55)';  color = 'var(--fg)'; }
+      }
+      const wrPct = wr != null ? (wr * 100).toFixed(0) + '%' : '—';
+      const pnlTxt = h.count > 0 ? fmtUsd(h.pnl) : '';
+      return `<div style="
+        flex:1; min-width:46px; background:${bg}; color:${color};
+        border-radius:6px; padding:8px 4px; text-align:center;
+        font-family:var(--font-mono); font-size:11px; line-height:1.3;
+        border:1px solid var(--border-soft);"
+        title="${h.label} ET · ${h.count} trades · wr ${wrPct} · ${pnlTxt}">
+        <div style="font-size:10px;opacity:0.7">${h.label}</div>
+        <div style="font-weight:600;font-size:13px">${h.count || '—'}</div>
+        <div style="font-size:10px">${wrPct}</div>
+      </div>`;
+    }).join('');
+  } catch (e) {}
 
   // Exit reasons pie
   const er = await api(`/api/exit_reasons?days=${windowDays}`);
@@ -1250,6 +1468,14 @@ document.getElementById('chat-input').addEventListener('keydown', (ev) => {
   if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) {
     ev.preventDefault(); sendChat();
   }
+});
+
+// Quick-prompt buttons via data-attribute (no more apostrophe-escape bugs).
+document.addEventListener('click', (ev) => {
+  const btn = ev.target.closest('[data-chat-prompt]');
+  if (!btn) return;
+  const text = btn.getAttribute('data-chat-prompt') || '';
+  if (text) askChat(text);
 });
 
 /* =========================================================
