@@ -225,6 +225,13 @@ sizing:
 # is ~$1,000 = 10% of account. That's the implicit portfolio floor now
 # that the halt is disabled.
 exits:
+  # Entry grace period — how long after a fill before the green-to-red
+  # killswitch and absolute-drawdown exits can fire. Without this,
+  # bid/ask spread wash on fresh entries makes pnl look like -5 to -8%
+  # on the first tick, killing every trade 6 seconds after entry.
+  # Operator saw this on QQQ put: entered $0.58, killed at $0.54 6s
+  # later. 60s gives the spread time to tighten and price to develop.
+  entry_grace_sec: 60.0
   profit_target_short_dte_pct: 0.35  # 0DTE/1DTE
   profit_target_multi_dte_pct: 0.50  # 2+ DTE
   stop_loss_short_dte_pct: 0.10      # was 0.20 — tightened per operator

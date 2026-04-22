@@ -1289,10 +1289,17 @@ class TradeBot:
                     # Green-to-red kill switch — DTE-aware thresholds.
                     # 0DTE: ANY fade from positive to negative = close.
                     # Short: was +1%+, now below -0.5% = close.
-                    # Swing: was +3%+, now below -2% = close (breathing
-                    #   room for thesis).
+                    # Swing: was +3%+, now below -2% = close.
+                    # Honors entry_grace_sec — no fade kill inside
+                    # the grace window to avoid closing on spread wash.
+                    import time as _t_g
+                    _entry_age_g = _t_g.time() - float(pos.entry_ts or 0)
+                    _grace_g = float(self.s.get(
+                        "exits.entry_grace_sec", 60.0
+                    ))
                     if (d is None or not d.should_close) and \
-                            pos.is_option and pos.qty > 0:
+                            pos.is_option and pos.qty > 0 and \
+                            _entry_age_g >= _grace_g:
                         peak_pnl = getattr(pos, "peak_pnl_pct", None) or 0.0
                         pnl_now = pos.unrealized_pnl_pct(price)
                         pos_dte = pos.dte() if hasattr(pos, "dte") else 7
@@ -1317,17 +1324,28 @@ class TradeBot:
                         # Absolute drawdown kill — independent of peak
                         # tracking. Protects against the case where peak
                         # wasn't recorded (bot restart, old position).
-                        # Operator's QQQ case: 2-3% up → 5% down, no peak
-                        # memory due to restart. These thresholds ensure
-                        # that scenario closes at -5% max without any
-                        # peak tracking needed.
-                        if d is None or not d.should_close:
+                        #
+                        # Grace period: don't fire within the first
+                        # `entry_grace_sec` (60s default) because the
+                        # bid/ask spread wash on fresh entries makes
+                        # pnl look like -5-8% on the first tick even
+                        # though the market hasn't moved. Without this
+                        # grace period, the killswitch fires 6 seconds
+                        # after every entry, never giving trades a
+                        # chance to develop.
+                        import time as _t
+                        _entry_age = _t.time() - float(pos.entry_ts or 0)
+                        _grace = float(self.s.get(
+                            "exits.entry_grace_sec", 60.0
+                        ))
+                        if (d is None or not d.should_close) and \
+                                _entry_age >= _grace:
                             if pos_dte == 0:
-                                max_dd = -0.03
-                            elif pos_dte >= 14:
                                 max_dd = -0.05
+                            elif pos_dte >= 14:
+                                max_dd = -0.08
                             else:
-                                max_dd = -0.04
+                                max_dd = -0.06
                             if pnl_now <= max_dd:
                                 from .exits.fast_exit import (
                                     ExitDecision as _ED,
