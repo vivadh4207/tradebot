@@ -703,7 +703,169 @@ def _build_app():
                 "model": model_override or chat.cfg.model_name,
                 "q_len": len(question), "a_len": len(answer)})
 
-    # ------------------------- button panel -------------------------
+    # ------------------------- button panels -------------------------
+
+    class AutotradePanel(discord.ui.View):
+        """Persistent autotrade control panel. One per channel; user
+        runs `!autopanel` in the channel they want to control from.
+
+        Buttons adapt to state:
+          - Shows 'Enable' when killed, 'Disable' when active
+          - Shows current trade count / cap in status button label
+          - Research Now button triggers immediate 70B run
+          - View Queue button shows pending ideas
+        """
+        def __init__(self):
+            super().__init__(timeout=None)                # persistent
+
+        async def _status_text(self) -> str:
+            from src.intelligence.llm_autotrade_queue import LLMAutotradeQueue
+            import os as _os
+            q = LLMAutotradeQueue()
+            s = q.peek_state()
+            env_on = _os.getenv("LLM_AUTOTRADE", "").strip() in ("1", "true", "yes")
+            state_line = (
+                "🟢 **ACTIVE** (executing LLM-originated trades)"
+                if env_on and not s["killed"] else
+                "🔴 **KILLED** (kill switch ON)" if s["killed"] else
+                "⚪ **ENV DISABLED** (LLM_AUTOTRADE not set in .env)"
+            )
+            return (
+                f"**LLM Autotrade Panel**\n{state_line}\n"
+                f"· today: {s['daily_count']}/{s['daily_cap']} trades · "
+                f"queue: {s['queue_fresh']} fresh ideas · "
+                f"max age: {s['max_age_min']} min · "
+                f"confidence: {', '.join(s['allowed_confidences'])}"
+            )
+
+        async def _authorized(self, interaction) -> bool:
+            if not runner.is_authorized(interaction.user.id):
+                await interaction.response.send_message(
+                    "Not authorized.", ephemeral=True)
+                _audit({"kind": "autopanel_rejected_auth",
+                        "user": interaction.user.id})
+                return False
+            return True
+
+        @discord.ui.button(label="✅ Enable", style=discord.ButtonStyle.success,
+                            custom_id="ta:enable", row=0)
+        async def btn_enable(self, interaction, _):
+            if not await self._authorized(interaction):
+                return
+            await interaction.response.defer(thinking=True, ephemeral=True)
+            try:
+                from src.intelligence.llm_autotrade_queue import LLMAutotradeQueue
+                LLMAutotradeQueue().set_killed(False)
+                _audit({"kind": "autopanel_enable", "user": interaction.user.id})
+                await interaction.followup.send(
+                    "✅ Kill switch CLEARED. LLM autotrade will execute "
+                    "fresh ideas (if `LLM_AUTOTRADE=1` is set in `.env`).",
+                    ephemeral=True,
+                )
+            except Exception as e:
+                await interaction.followup.send(
+                    f"enable failed: {e}", ephemeral=True,
+                )
+
+        @discord.ui.button(label="⛔ Disable", style=discord.ButtonStyle.danger,
+                            custom_id="ta:disable", row=0)
+        async def btn_disable(self, interaction, _):
+            if not await self._authorized(interaction):
+                return
+            await interaction.response.defer(thinking=True, ephemeral=True)
+            try:
+                from src.intelligence.llm_autotrade_queue import LLMAutotradeQueue
+                LLMAutotradeQueue().set_killed(True)
+                _audit({"kind": "autopanel_disable", "user": interaction.user.id})
+                await interaction.followup.send(
+                    "⛔ KILLED. No more LLM-originated trades until you "
+                    "press **Enable** again.", ephemeral=True,
+                )
+            except Exception as e:
+                await interaction.followup.send(
+                    f"disable failed: {e}", ephemeral=True,
+                )
+
+        @discord.ui.button(label="📊 Status", style=discord.ButtonStyle.primary,
+                            custom_id="ta:status", row=0)
+        async def btn_status(self, interaction, _):
+            if not await self._authorized(interaction):
+                return
+            try:
+                text = await self._status_text()
+            except Exception as e:
+                text = f"status failed: {e}"
+            await interaction.response.send_message(text, ephemeral=True)
+
+        @discord.ui.button(label="🔬 Research Now", style=discord.ButtonStyle.primary,
+                            custom_id="ta:research", row=1)
+        async def btn_research(self, interaction, _):
+            if not await self._authorized(interaction):
+                return
+            await interaction.response.defer(thinking=True)
+            try:
+                from src.data.multi_provider import MultiProvider
+                from src.intelligence.options_research import OptionsResearchAgent
+                mp = MultiProvider.from_env()
+                agent = OptionsResearchAgent(mp)
+                loop = asyncio.get_event_loop()
+                def _call():
+                    return agent.to_markdown(agent.run(["SPY", "QQQ"]))
+                out = await loop.run_in_executor(None, _call)
+                await interaction.followup.send(_truncate(out))
+            except Exception as e:
+                await interaction.followup.send(
+                    f"research failed: {e}", ephemeral=True,
+                )
+
+        @discord.ui.button(label="📋 View Queue", style=discord.ButtonStyle.secondary,
+                            custom_id="ta:queue", row=1)
+        async def btn_queue(self, interaction, _):
+            if not await self._authorized(interaction):
+                return
+            try:
+                from src.intelligence.llm_autotrade_queue import LLMAutotradeQueue
+                q = LLMAutotradeQueue()
+                q._maybe_refresh()
+                ideas = [
+                    i for i in q._cached_rows
+                    if i.id not in q._consumed and q._is_fresh(i)
+                ]
+                if not ideas:
+                    await interaction.response.send_message(
+                        "Queue empty — no fresh ideas. Press 🔬 Research Now.",
+                        ephemeral=True,
+                    )
+                    return
+                lines = [f"**{len(ideas)} fresh ideas in queue:**"]
+                for i in ideas[:6]:
+                    lines.append(
+                        f"· {i.symbol} {i.direction.upper()} "
+                        f"${i.strike or '?'} {i.expiry or '?'} "
+                        f"({i.confidence}) — {i.rationale[:80]}"
+                    )
+                await interaction.response.send_message(
+                    "\n".join(lines), ephemeral=True,
+                )
+            except Exception as e:
+                await interaction.response.send_message(
+                    f"queue view failed: {e}", ephemeral=True,
+                )
+
+        @discord.ui.button(label="🔄 Refresh Status", style=discord.ButtonStyle.secondary,
+                            custom_id="ta:refresh", row=1)
+        async def btn_refresh(self, interaction, _):
+            if not await self._authorized(interaction):
+                return
+            try:
+                text = await self._status_text()
+                # Edit the original panel message so the top line
+                # reflects current state without posting a new one.
+                await interaction.response.edit_message(content=text, view=self)
+            except Exception as e:
+                await interaction.response.send_message(
+                    f"refresh failed: {e}", ephemeral=True,
+                )
 
     class ControlPanel(discord.ui.View):
         """Persistent button panel. `custom_id`s survive bot restart
@@ -823,6 +985,7 @@ def _build_app():
         # across every channel the user has !panel-ed in. Safe to call
         # on every reconnect.
         client.add_view(ControlPanel())
+        client.add_view(AutotradePanel())
 
         if _hello_state["sent"]:
             _log.info("discord_terminal_hello_skipped reason=already_sent_this_process")
@@ -900,6 +1063,21 @@ def _build_app():
                 "**tradebot control panel**",
                 view=ControlPanel(),
             )
+            return
+        if command == "autopanel":
+            # Post the LLM autotrade control panel. Operator runs this
+            # once in the channel they want to control autotrade from
+            # (typically #control-panel or #sagarbot). Persistent —
+            # survives bot restart.
+            if not runner.is_authorized(message.author.id):
+                await message.channel.send("Not authorized.")
+                return
+            view = AutotradePanel()
+            try:
+                status_text = await view._status_text()
+            except Exception:
+                status_text = "**LLM Autotrade Panel**"
+            await message.channel.send(status_text, view=view)
             return
         if command == "ask":
             # Explicit LLM chat: !ask <question>

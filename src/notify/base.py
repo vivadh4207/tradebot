@@ -136,7 +136,20 @@ _TITLE_TO_CHANNEL = {
     # explain *why* the bot would (or would not) be trading. Nightly
     # walk-forward edge report, regime-shift notices, ensemble
     # attribution summaries. Should never be spammy.
-    "reason":      {"backtest_report", "edge_report", "regime_shift"},
+    "reason":         {"backtest_report", "edge_report", "regime_shift", "reason"},
+    # Alias — when the operator names their env var
+    # DISCORD_WEBHOOK_URL_REASONFORENTRY (our default naming convention
+    # in recent deployments), same content routes there too.
+    "reasonforentry": {"backtest_report", "edge_report", "regime_shift",
+                        "reason", "reasonforentry"},
+    # LLM research agent + per-trade brain review posts.
+    "llm":            {"llm_ideas", "llm_review", "llm"},
+    # Options-research agent (separate from generic LLM messages).
+    "options":        {"options_research", "options", "research"},
+    # Nightly 70B macro sweep.
+    "macro":          {"macro_sweep", "macro"},
+    # Hourly log digest + !summary outputs.
+    "terminal":       {"summary", "status", "terminal", "digest"},
 }
 
 
