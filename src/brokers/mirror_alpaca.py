@@ -267,6 +267,28 @@ class MirrorAlpacaBroker(PaperBroker):
                     "alpaca_reconcile_close_failed symbol=%s err=%s",
                     sym, e,
                 )
+                # Alpaca paper sometimes rejects SELL-to-close with
+                # "account not eligible to trade uncovered option
+                # contracts" — means Alpaca's view of the account
+                # disagrees with what we bought. Fire a loud Discord
+                # alert so the operator can intervene before theta
+                # decay or a market move wipes the orphaned position.
+                err_str = str(e)
+                try:
+                    from ..notify.issue_reporter import report_issue
+                    report_issue(
+                        scope="alpaca_mirror_orphan",
+                        message=(
+                            f"Alpaca REJECTED close for orphan position "
+                            f"`{sym}` qty={qty}. Alpaca error: "
+                            f"{err_str[:200]}. Local bot has no "
+                            "position but ALPACA DOES — go close it "
+                            "manually on alpaca.markets/paper or your "
+                            "account will sit exposed."
+                        ),
+                    )
+                except Exception:
+                    pass
         return result
 
     def _close_limit_for(self, ap_position, sym: str) -> Optional[float]:

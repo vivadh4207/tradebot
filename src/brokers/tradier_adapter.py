@@ -99,15 +99,24 @@ class TradierBroker:
             try:
                 sym = str(r.get("symbol", ""))
                 qty = int(r.get("quantity", 0))
-                avg = float(r.get("cost_basis", 0)) / max(1, abs(qty))
                 # OCC-format options: 15+ chars
                 is_option = len(sym) >= 15 and any(c.isdigit() for c in sym)
+                multiplier = 100 if is_option else 1
+                # Tradier returns `cost_basis` as TOTAL dollars paid
+                # (qty × price × multiplier). For options that means
+                # $75 for a single 1-lot of a $0.75 option. Divide by
+                # qty * multiplier for per-share price. Before fix the
+                # adapter was returning prices 100× too large for
+                # options, which broke mark-to-market + P&L math and
+                # left the user unable to reconcile with Tradier UI.
+                cost_basis = float(r.get("cost_basis", 0))
+                avg = cost_basis / max(1, abs(qty) * multiplier)
                 out.append(Position(
                     symbol=sym,
                     qty=qty,
                     avg_price=round(avg, 4),
                     is_option=is_option,
-                    multiplier=(100 if is_option else 1),
+                    multiplier=multiplier,
                     entry_ts=0.0,
                 ))
             except Exception:

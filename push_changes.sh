@@ -40,6 +40,8 @@ git add \
   scripts/run_morning_scan.py \
   scripts/run_saves_report.py \
   scripts/run_strategy_report.py \
+  src/brokers/mirror_alpaca.py \
+  src/brokers/tradier_adapter.py \
   src/core/types.py \
   src/reports/log_digest.py \
   src/storage/position_snapshot.py \

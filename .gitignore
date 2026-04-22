@@ -46,6 +46,12 @@ KILL
 # Runtime-mutable state (Discord buttons write here; never committed)
 runtime_overrides.json
 data/runtime_overrides.json
+position_advisories.json
+data/position_advisories.json
+logs/exit_saves.jsonl
+logs/fast_loop_heartbeat.txt
+manual_close_intents.json
+data/manual_close_intents.json
 
 # Editor
 .vscode/

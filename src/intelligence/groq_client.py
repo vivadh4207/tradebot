@@ -55,13 +55,31 @@ class GroqClient:
         try:
             req = request.Request(
                 f"{self.cfg.base_url}/models",
-                headers={"Authorization": f"Bearer {self.cfg.api_key}"},
+                headers=self._headers(),
             )
             with request.urlopen(req, timeout=5.0):
                 return True
         except Exception as e:
             _log.info("groq_ping_failed err=%s", e)
             return False
+
+    def _headers(self, extra: Optional[dict] = None) -> dict:
+        """Standard headers. Sends a browser-like User-Agent because
+        Groq's Cloudflare front-end returns 403 error 1010 on the
+        default urllib UA (blocks suspected bot fingerprints)."""
+        h = {
+            "Authorization": f"Bearer {self.cfg.api_key}",
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        if extra:
+            h.update(extra)
+        return h
 
     def generate(
         self,
@@ -91,10 +109,7 @@ class GroqClient:
             req = request.Request(
                 f"{self.cfg.base_url}/chat/completions",
                 data=json.dumps(payload).encode("utf-8"),
-                headers={
-                    "Authorization": f"Bearer {self.cfg.api_key}",
-                    "Content-Type": "application/json",
-                },
+                headers=self._headers({"Content-Type": "application/json"}),
             )
             with request.urlopen(req, timeout=self.cfg.timeout_sec) as resp:
                 raw = resp.read()
