@@ -1447,6 +1447,34 @@ class TradeBot:
             recent_closes=[b.close for b in bars[-60:]],
         )
         regime = regime_snap.regime
+        # Periodic snapshot log so the LLM chat / research agent can
+        # scrape current VIX + regime from tradebot.out even when no
+        # ensemble decision fires. Throttled to once every 5 minutes
+        # per process so it doesn't spam.
+        try:
+            import time as _time
+            _last = getattr(self, "_regime_log_last", 0.0)
+            if _time.time() - _last > 300.0:
+                # Include breadth when we have it — otherwise the chat
+                # LLM falls back to "no breadth available".
+                breadth_val = None
+                if hasattr(self, "breadth_probe") and self.breadth_probe:
+                    try:
+                        breadth_val = self.breadth_probe.latest_snapshot()
+                        if isinstance(breadth_val, dict):
+                            breadth_val = breadth_val.get("score")
+                    except Exception:
+                        breadth_val = None
+                log.info(
+                    "market_state_snapshot",
+                    regime=regime.value,
+                    vix=round(float(vix_reading.value), 2),
+                    breadth_score=(round(float(breadth_val), 3)
+                                     if breadth_val is not None else None),
+                )
+                self._regime_log_last = _time.time()
+        except Exception:
+            pass
 
         # HMM overlay: if the HMM says we're in a high-vol regime, override
         # the rule-based classifier's low-vol label. The rule-based one is

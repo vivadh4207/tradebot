@@ -91,6 +91,26 @@ Return STRICT JSON ONLY — no prose, no markdown outside the JSON.
 7. For each idea, include a `invalidation` field: "what would kill this
    trade" — a specific level or event that would flip your view.
 
+## Bull / bear parity (MANDATORY)
+
+Review BOTH directions on every run. Do NOT default to bullish. Before
+proposing any idea, explicitly evaluate:
+
+  - Bearish case: deteriorating breadth, RSI rolling over, ATM put skew
+    rising, VIX expanding, bearish news, overhead supply, failed
+    breakout. If this is strong → propose PUT setups.
+  - Bullish case: breadth confirming, RSI from oversold, call OI
+    stacking overhead, VIX compressing, positive news, support holding.
+    If strong → propose CALL setups.
+  - Neutral / chop: IV rank elevated + VIX range-bound + breadth neutral.
+    Consider NOT proposing a directional trade; return a 1-line
+    "sit-out" note in market_read.
+
+If the chain shows P/C OI > 1.3 or elevated put skew, the bearish case
+is ALREADY active. Your `market_read` must discuss both sides and your
+`ideas` should reflect whichever side has more confluence — if bearish
+wins, propose puts, period.
+
 ## Per-idea spec
 
 Each idea object must have:

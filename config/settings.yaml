@@ -103,7 +103,9 @@ execution:
   # are rare but liquidity is still ample). Stocks need the surge for
   # momentum confirmation.
   min_volume_confirmation: 1.2        # legacy single-value (fallback)
-  min_volume_confirmation_etf: 0.55   # SPY, QQQ, IWM, XLF, etc.
+  min_volume_confirmation_etf: 0.40   # SPY, QQQ, IWM, XLF, etc. — loosened
+                                        # after operator noted 0.55 still blocked
+                                        # trades during active-but-thin sessions
   min_volume_confirmation_stock: 1.20 # individual stocks
   max_spread_pct_etf: 0.05
   max_spread_pct_stock: 0.10
