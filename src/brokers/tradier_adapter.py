@@ -152,17 +152,18 @@ class TradierBroker:
         )
         # Sandbox fills are asynchronous; we return a placeholder Fill
         # with the LIMIT price (or 0 for market, operator monitors via
-        # positions() call).
+        # positions() call). Fill dataclass takes (order, price, qty)
+        # plus optional fee/ts — stash order_id via the order's tag
+        # since Fill itself doesn't carry one.
+        try:
+            order.tag = (getattr(order, "tag", "") or "") + \
+                f"|tradier_oid={order_id or ''}"
+        except Exception:
+            pass
         return Fill(
-            symbol=order.symbol,
-            side=order.side,
-            qty=order.qty,
+            order=order,
             price=float(order.limit_price or 0.0),
-            ts=datetime.now(tz=timezone.utc).timestamp(),
-            is_option=order.is_option,
-            multiplier=order.multiplier if hasattr(order, "multiplier") else (
-                100 if order.is_option else 1),
-            order_id=str(order_id or ""),
+            qty=int(order.qty),
         )
 
     # ------------------------------------------------ cancel
