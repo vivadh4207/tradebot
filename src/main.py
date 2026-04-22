@@ -572,6 +572,20 @@ class TradeBot:
                     get_breadth_fn=_brd_fn,
                 ))
                 log.info("long_put_dip_signal_enabled")
+            # Optional LLM-origination signal — the bot treats ideas
+            # from the research agent as first-class signals. Queue is
+            # file-backed so research can run in a separate process
+            # and hand off async. Safety: env gate (LLM_AUTOTRADE=1) +
+            # kill switch file + daily cap + confidence floor.
+            llmo_cfg = settings.raw.get("signals", {}).get("llm_origination", {}) or {}
+            if llmo_cfg.get("enabled", False):
+                from .signals.llm_origination import LLMOriginationSignal
+                self.strategies.append(LLMOriginationSignal(
+                    max_age_min=int(llmo_cfg.get("max_age_min", 30)),
+                    max_trades_per_day=int(llmo_cfg.get("max_trades_per_day", 3)),
+                    min_confidence=str(llmo_cfg.get("min_confidence", "medium")),
+                ))
+                log.info("llm_origination_signal_enabled")
             # Optional TradingView webhook signal. The ingest side runs
             # in the dashboard process (POST /webhook/tradingview). This
             # source polls the file-backed queue each tick. The bot

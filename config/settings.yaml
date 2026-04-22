@@ -347,6 +347,17 @@ signals:
     short_tf_group: 5              # ~5-min equivalent on 1-min bars
     long_tf_group: 15             # ~15-min equivalent
     low_vol_damp: 0.15
+  # LLM-originated trades (Level 1 autotrade). When enabled + the
+  # LLM_AUTOTRADE env is set to 1, the research agent writes ideas to
+  # logs/llm_autotrade_queue.jsonl and this signal source emits them
+  # back into the ensemble as first-class signals. They still clear
+  # the full 19-filter chain, the order validator, the sizer, and the
+  # mirror broker. Kill switch via Discord `!llm-autotrade off`.
+  llm_origination:
+    enabled: true
+    max_age_min: 30                # drop ideas older than this
+    max_trades_per_day: 3
+    min_confidence: medium         # "medium" or "high" — "low" never fires
   # Long-put-dip — explicit "profit from the fall" trigger. Fires when
   # price drops >0.4% below VWAP with RSI(5) oversold AND a macro
   # confirmation (VIX spike OR breadth deterioration). If no macro

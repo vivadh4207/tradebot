@@ -140,6 +140,7 @@ COMMAND_MAP: Dict[str, Tuple[str, bool]] = {
     "ollama-restart": ("ollama-restart", False),
     "ollama-warmup":  ("ollama-warmup",  False),
     "research":       ("options-research", False),   # handled in-process; see _handle_research
+    "llm-autotrade":  ("llm-autotrade",   False),    # handled in-process; see _handle_llm_autotrade
     "reset-paper":   ("reset-paper",     True),       # requires DESTROY confirm
     "wipe":          ("wipe-journal",    True),       # requires DESTROY confirm
 }
@@ -163,6 +164,7 @@ HELP_TEXT = (
     f"  `{COMMAND_PREFIX}summary [N]`   — concise digest of last N min (default 60)\n"
     f"  `{COMMAND_PREFIX}research [SYMS]` — 70B options-research ideas "
     "(default SPY QQQ)\n"
+    f"  `{COMMAND_PREFIX}llm-autotrade [on|off|status]` — toggle LLM-originated trades\n"
     f"  `{COMMAND_PREFIX}ollama-status` — Ollama daemon + loaded models\n"
     f"  `{COMMAND_PREFIX}ollama-warmup` — Pre-load 8B + 70B into GPU memory\n"
     f"  `{COMMAND_PREFIX}ollama-restart` — Restart Ollama daemon\n"
@@ -308,6 +310,10 @@ class CommandRunner:
             parts = (raw_text or "").split()
             syms = [s.upper() for s in parts[1:]] if len(parts) >= 2 else ["SPY", "QQQ"]
             return await self._handle_research(syms)
+        if command == "llm-autotrade":
+            parts = (raw_text or "").split()
+            sub = parts[1].lower() if len(parts) >= 2 else "status"
+            return self._handle_llm_autotrade(sub)
         if destroyed and subcmd == "reset-paper":
             # reset_paper.py supports --yes to skip its own interactive prompt
             extra_args = ["--yes"]
@@ -338,6 +344,37 @@ class CommandRunner:
         if stderr and stderr.strip():
             body += f"\n**stderr:**```\n{_truncate(stderr, 400)}\n```"
         return head + body
+
+    def _handle_llm_autotrade(self, sub: str) -> str:
+        """Status / kill-switch for LLM-originated trades. Writes a
+        file-based sentinel so bot picks it up on next tick — no
+        restart required."""
+        try:
+            from src.intelligence.llm_autotrade_queue import LLMAutotradeQueue
+            q = LLMAutotradeQueue()
+            if sub == "on":
+                q.set_killed(False)
+                msg = "LLM autotrade kill-switch CLEARED (bot will execute fresh ideas if LLM_AUTOTRADE=1)."
+            elif sub in ("off", "kill"):
+                q.set_killed(True)
+                msg = "LLM autotrade KILLED — no more LLM-originated trades until you run `!llm-autotrade on`."
+            else:
+                s = q.peek_state()
+                import os as _os
+                env_enabled = _os.getenv("LLM_AUTOTRADE", "").strip() in ("1", "true", "yes")
+                lines = [
+                    f"**LLM autotrade status**",
+                    f"· env `LLM_AUTOTRADE`: {'ENABLED' if env_enabled else 'DISABLED'}",
+                    f"· kill switch: {'ACTIVE' if s['killed'] else 'clear'}",
+                    f"· today: {s['daily_count']}/{s['daily_cap']} trades",
+                    f"· queue: {s['queue_fresh']} fresh ideas waiting ({s['queue_total']} total)",
+                    f"· allowed confidence: {', '.join(s['allowed_confidences'])}",
+                    f"· max idea age: {s['max_age_min']} min",
+                ]
+                msg = "\n".join(lines)
+            return msg
+        except Exception as e:                          # noqa: BLE001
+            return f"llm-autotrade failed: {type(e).__name__}: {str(e)[:200]}"
 
     async def _handle_research(self, symbols: List[str]) -> str:
         """Run the options research agent in a worker thread (70B is
