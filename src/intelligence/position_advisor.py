@@ -66,19 +66,26 @@ class PositionAdvisor:
         return getattr(pos, "peak_pnl_pct", None)
 
     def _should_fire(self, pos, current_pnl_pct: float) -> bool:
-        """Decide whether this position qualifies for an LLM advisory."""
+        """Decide whether this position qualifies for an LLM advisory.
+        Operator: 'position went green then red — we waited.' Lowered
+        threshold so we fire EARLIER, while still in profit."""
         peak = self._peak(pos) or 0.0
-        # A: peak >= +3% and retraced >= 40% from peak
+        # A: peak >= +3% and retraced >= 25% from peak (was 40%)
         if peak >= 0.03:
             give_back = (peak - current_pnl_pct) / max(peak, 1e-9)
-            if give_back >= 0.40:
+            if give_back >= 0.25:
                 return True
-        # B: open > 15 min and flat/negative (stuck trade)
+        # B: green-to-red — was positive, now negative. ALWAYS fire
+        # regardless of peak size; this is exactly the scenario the
+        # operator called out.
+        if peak > 0 and current_pnl_pct < 0:
+            return True
+        # C: open > 10 min (was 15) and flat/negative (stuck trade)
         try:
             held_sec = time.time() - float(pos.entry_ts)
         except Exception:
             held_sec = 0
-        if held_sec > 900 and current_pnl_pct <= 0.005:
+        if held_sec > 600 and current_pnl_pct <= 0.005:
             return True
         return False
 
@@ -142,27 +149,30 @@ class PositionAdvisor:
             ts=time.time(),
         )
 
-        # Fallback rule-based recommendation first — ensures SOMETHING
-        # gets posted even if LLM times out.
+        # Fallback rule-based recommendation — this is what gets
+        # ACTED ON if the LLM times out. Tuned aggressive per operator
+        # feedback ("we waited when it went green to red").
         give_back = (peak - current_pnl_pct) / max(peak, 1e-9) if peak > 0 else 0
         if peak > 0 and current_pnl_pct < 0:
+            # GREEN-TO-RED: immediate close, no waiting.
             adv.recommendation = "close"
             adv.urgency = "urgent"
             adv.rationale = (
-                f"Position was +{peak*100:.1f}% peak, now NEGATIVE at "
-                f"{current_pnl_pct*100:+.1f}%. Cut and preserve capital."
+                f"Position was +{peak*100:.1f}% peak, NOW NEGATIVE at "
+                f"{current_pnl_pct*100:+.1f}%. Cut to preserve capital."
             )
-        elif give_back >= 0.60:
+        elif give_back >= 0.50:
+            # Gave back half or more — close urgently.
             adv.recommendation = "close"
             adv.urgency = "urgent"
             adv.rationale = (
                 f"Gave back {give_back*100:.0f}% of +{peak*100:.1f}% peak. "
-                f"Take the remaining {current_pnl_pct*100:+.1f}% before "
-                "it goes negative."
+                f"Take the remaining {current_pnl_pct*100:+.1f}% NOW."
             )
-        elif give_back >= 0.40:
+        elif give_back >= 0.25:
+            # Moderate fade — trim half, trail the rest.
             adv.recommendation = "trim"
-            adv.urgency = "normal"
+            adv.urgency = "urgent"   # still urgent so it auto-executes
             adv.rationale = (
                 f"Gave back {give_back*100:.0f}% from +{peak*100:.1f}% peak. "
                 "Trim half, trail the rest with a tight stop."

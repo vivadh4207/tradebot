@@ -1225,10 +1225,26 @@ class TradeBot:
                         except Exception:
                             bars_for_exit = None
                         d = self.fast.evaluate(pos, price, bars=bars_for_exit)
-                    # Position-fade advisor: LLM-driven manual override path.
-                    # Fires when the automatic exits didn't trigger but the
-                    # position still looks like it's fading — posts to Discord
-                    # with Close / Hold / Trim buttons for the operator.
+                    # Green-to-red kill switch — the #1 operator
+                    # complaint: "we waited when it went green to red."
+                    # Rule-based, runs BEFORE the LLM so we don't lose
+                    # another second to the network call.
+                    if (d is None or not d.should_close) and \
+                            pos.is_option and pos.qty > 0:
+                        peak_pnl = getattr(pos, "peak_pnl_pct", None) or 0.0
+                        pnl_now = pos.unrealized_pnl_pct(price)
+                        # If we were ever +1%+ and are now negative, CLOSE.
+                        # Primary safety net for the fade-to-loss scenario.
+                        if peak_pnl >= 0.01 and pnl_now < -0.005:
+                            from .exits.fast_exit import ExitDecision as _ED
+                            d = _ED(
+                                True,
+                                (f"green_to_red_killswitch:peak={peak_pnl:+.2%}"
+                                 f"_now={pnl_now:+.2%}_was_up_now_down"),
+                                layer=0,
+                            )
+                    # Position-fade advisor: LLM second opinion + auto-
+                    # execute on 'urgent close' recommendations.
                     if (d is None or not d.should_close) and \
                             self.position_advisor is not None and \
                             pos.is_option and pos.qty > 0:
@@ -1239,6 +1255,38 @@ class TradeBot:
                             )
                             if adv is not None:
                                 self._post_fade_advisory(adv)
+                                # AUTO-EXECUTE urgent close recommendations
+                                # — operator: "it set signal in discord but
+                                # didn't close itself."
+                                if (adv.recommendation == "close"
+                                        and adv.urgency == "urgent"):
+                                    from .exits.fast_exit import (
+                                        ExitDecision as _ED,
+                                    )
+                                    d = _ED(
+                                        True,
+                                        (f"llm_urgent_close:peak="
+                                         f"{adv.peak_pnl_pct:+.2%}_now="
+                                         f"{adv.current_pnl_pct:+.2%}"),
+                                        layer=0,
+                                    )
+                                elif (adv.recommendation == "trim"
+                                        and adv.urgency == "urgent"):
+                                    # Trim half — close_qty set so fast
+                                    # exit only closes 50%.
+                                    from .exits.fast_exit import (
+                                        ExitDecision as _ED,
+                                    )
+                                    d = _ED(
+                                        True,
+                                        (f"llm_urgent_trim:peak="
+                                         f"{adv.peak_pnl_pct:+.2%}_now="
+                                         f"{adv.current_pnl_pct:+.2%}"),
+                                        layer=0,
+                                        close_qty=max(
+                                            1, abs(pos.qty) // 2,
+                                        ),
+                                    )
                         except Exception as _e:             # noqa: BLE001
                             log.info("position_advisor_err", err=str(_e)[:120])
                     if d and d.should_close:
@@ -1290,6 +1338,9 @@ class TradeBot:
                             "chart_higher_lows": "Chart made consecutive higher lows — downtrend broken, took profit",
                             "vwap_break": "Underlying lost VWAP — institutional value line gone, took profit",
                             "vwap_break_up": "Underlying reclaimed VWAP — bearish thesis invalid, took profit",
+                            "green_to_red_killswitch": "Was in profit and started going red — auto-closed to preserve any gain / stop the bleed",
+                            "llm_urgent_close": "LLM chart review said URGENT CLOSE — auto-executed without waiting for operator",
+                            "llm_urgent_trim": "LLM said urgent trim — closed 50%, trailing the rest",
                         }
                         prefix = reason_raw.split(":")[0]
                         why = reason_human.get(prefix, reason_raw)
