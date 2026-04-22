@@ -1225,22 +1225,32 @@ class TradeBot:
                         except Exception:
                             bars_for_exit = None
                         d = self.fast.evaluate(pos, price, bars=bars_for_exit)
-                    # Green-to-red kill switch — the #1 operator
-                    # complaint: "we waited when it went green to red."
-                    # Rule-based, runs BEFORE the LLM so we don't lose
-                    # another second to the network call.
+                    # Green-to-red kill switch — DTE-aware thresholds.
+                    # 0DTE: ANY fade from positive to negative = close.
+                    # Short: was +1%+, now below -0.5% = close.
+                    # Swing: was +3%+, now below -2% = close (breathing
+                    #   room for thesis).
                     if (d is None or not d.should_close) and \
                             pos.is_option and pos.qty > 0:
                         peak_pnl = getattr(pos, "peak_pnl_pct", None) or 0.0
                         pnl_now = pos.unrealized_pnl_pct(price)
-                        # If we were ever +1%+ and are now negative, CLOSE.
-                        # Primary safety net for the fade-to-loss scenario.
-                        if peak_pnl >= 0.01 and pnl_now < -0.005:
+                        pos_dte = pos.dte() if hasattr(pos, "dte") else 7
+                        # DTE-aware thresholds
+                        if pos_dte == 0:
+                            peak_min, now_max = 0.005, -0.001
+                            dte_label = "0dte"
+                        elif pos_dte >= 14:
+                            peak_min, now_max = 0.03, -0.02
+                            dte_label = "swing"
+                        else:
+                            peak_min, now_max = 0.01, -0.005
+                            dte_label = "short"
+                        if peak_pnl >= peak_min and pnl_now <= now_max:
                             from .exits.fast_exit import ExitDecision as _ED
                             d = _ED(
                                 True,
-                                (f"green_to_red_killswitch:peak={peak_pnl:+.2%}"
-                                 f"_now={pnl_now:+.2%}_was_up_now_down"),
+                                (f"green_to_red_{dte_label}:peak={peak_pnl:+.2%}"
+                                 f"_now={pnl_now:+.2%}_dte={pos_dte}"),
                                 layer=0,
                             )
                     # Position-fade advisor: LLM second opinion + auto-
@@ -1313,6 +1323,23 @@ class TradeBot:
                                   reason=d.reason, price=price,
                                   realized_usd=round(realized_usd, 2),
                                   pnl_pct=round(pnl_pct, 2))
+                        # Saves tracker — log defensive exits for
+                        # later re-check to prove the exit engine is
+                        # paying off. No-op if reason isn't defensive.
+                        try:
+                            from .intelligence.saves_tracker import record_exit
+                            record_exit(
+                                symbol=pos.symbol,
+                                underlying=pos.underlying or pos.symbol,
+                                exit_reason=str(d.reason),
+                                exit_price=float(fill.price) if fill else float(price),
+                                qty=int(qty_abs),
+                                peak_pnl_pct=float(getattr(pos, "peak_pnl_pct", 0) or 0),
+                                exit_pnl_pct=float(pnl_pct) / 100.0,
+                                dte=int(pos.dte() if hasattr(pos, "dte") else 7),
+                            )
+                        except Exception:
+                            pass
                         # Discord: green if profit, red if loss.
                         underlying = pos.underlying or pos.symbol
                         right_str = (pos.right.value.upper() if pos.right
@@ -1339,6 +1366,12 @@ class TradeBot:
                             "vwap_break": "Underlying lost VWAP — institutional value line gone, took profit",
                             "vwap_break_up": "Underlying reclaimed VWAP — bearish thesis invalid, took profit",
                             "green_to_red_killswitch": "Was in profit and started going red — auto-closed to preserve any gain / stop the bleed",
+                            "green_to_red_0dte": "0DTE went green → red — closed instantly (no recovery window on same-day expiry)",
+                            "green_to_red_short": "Short-dated position went green → red — closed before the bleed deepens",
+                            "green_to_red_swing": "Swing position: was +3%+, now -2%+ — thesis broken, cutting",
+                            "profit_lock_0dte": "0DTE profit-lock — tight retrace detected, locked the gain fast",
+                            "profit_lock_short": "Profit-lock — retraced past the floor, took the gain",
+                            "profit_lock_swing": "Swing profit-lock — loose threshold let it breathe, then locked",
                             "llm_urgent_close": "LLM chart review said URGENT CLOSE — auto-executed without waiting for operator",
                             "llm_urgent_trim": "LLM said urgent trim — closed 50%, trailing the rest",
                         }

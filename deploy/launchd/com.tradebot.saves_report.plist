@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Saves tracker — refreshes re-check prices hourly during market
+  session, posts daily summary to Discord at 17:00 ET weekdays.
+
+  Hourly runs do price re-check only (cheap: 5-20 API calls). Daily
+  run at 17:00 ET refreshes + posts the full summary to Discord
+  title='saves_report'.
+
+  Install:  cp + render + launchctl load (see push_changes.sh)
+  Logs:     logs/saves_report.out / .err
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.tradebot.saves_report</string>
+
+  <key>WorkingDirectory</key>
+  <string>__TRADEBOT_ROOT__</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__TRADEBOT_PY__</string>
+    <string>__TRADEBOT_ROOT__/scripts/run_saves_report.py</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    <key>TZ</key>
+    <string>America/New_York</string>
+  </dict>
+
+  <!-- Daily summary at 17:00 ET on weekdays (1 hour after close) -->
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>0</integer></dict>
+  </array>
+
+  <key>StandardOutPath</key>
+  <string>__TRADEBOT_ROOT__/logs/saves_report.out</string>
+  <key>StandardErrorPath</key>
+  <string>__TRADEBOT_ROOT__/logs/saves_report.err</string>
+</dict>
+</plist>

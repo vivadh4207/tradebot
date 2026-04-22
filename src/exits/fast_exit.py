@@ -75,6 +75,14 @@ class FastExitConfig:
     profit_lock_enabled: bool = True
     profit_lock_arm_pct: float = 0.03        # arm once we've been +3%
     profit_lock_give_back_pct: float = 0.30  # base give-back (adaptive below)
+    # DTE-aware tightening: 0DTE can't recover, so exits must fire
+    # FASTER than for swing trades. Multipliers applied to thresholds.
+    # Operator: "0DTE we need to act fast. Fine with longer ones since
+    # we still have ways to go."
+    #   0DTE:     arm +2%, give-back multiplied 0.5x (tighter)
+    #   short:    default (1-7 DTE)
+    #   swing:    arm +4%, give-back multiplied 1.5x (looser)
+    dte_aware_enabled: bool = True
     # Adaptive give-back by peak tier — SMALL WINNERS TOO, because
     # operator saw +7% -> +1% -> negative. Rule: once we've touched a
     # profit peak, the position must NEVER cross back to zero pnl.
@@ -278,9 +286,17 @@ class FastExitEvaluator:
                 peak_pnl_attr = pnl
             except Exception:
                 peak_pnl_attr = pnl
+        # DTE-aware arm threshold: 0DTE fires sooner, swing fires later.
+        arm_pct = self.cfg.profit_lock_arm_pct
+        if self.cfg.dte_aware_enabled:
+            if dte == 0:
+                arm_pct = 0.02     # 0DTE: arm at +2%
+            elif dte >= 14:
+                arm_pct = 0.04     # swing: arm at +4% (let it breathe)
+
         if (self.cfg.profit_lock_enabled
                 and peak_pnl_attr is not None
-                and peak_pnl_attr >= self.cfg.profit_lock_arm_pct):
+                and peak_pnl_attr >= arm_pct):
             # Adaptive give-back: bigger winners get tighter protection.
             # Operator: "+7% went to +1% then negative — can't let that
             # happen. If we were up, we must NEVER close negative."
@@ -299,6 +315,12 @@ class FastExitEvaluator:
                     give_back = 0.60    # +3-5% peak → loose but still armed
             else:
                 give_back = self.cfg.profit_lock_give_back_pct
+            # DTE-aware give-back: 0DTE tighter, swing looser
+            if self.cfg.dte_aware_enabled:
+                if dte == 0:
+                    give_back = min(give_back * 0.5, 0.30)   # much tighter
+                elif dte >= 14:
+                    give_back = min(give_back * 1.5, 0.80)   # much looser
             close_threshold = peak_pnl_attr * (1.0 - give_back)
             # Zero-tolerance floor: if we've been above arm threshold
             # ever, the floor is at LEAST zero_tolerance_floor_pct.
@@ -307,10 +329,13 @@ class FastExitEvaluator:
             close_threshold = max(close_threshold,
                                      self.cfg.zero_tolerance_floor_pct)
             if pnl <= close_threshold and pnl > 0:
+                dte_tag = ("0dte" if dte == 0 else
+                             "swing" if dte >= 14 else "short")
                 return ExitDecision(
                     True,
-                    f"profit_lock:peak={peak_pnl_attr:+.2%}_now={pnl:+.2%}"
-                    f"_gave_back_{give_back:.0%}_floor={close_threshold:+.2%}",
+                    f"profit_lock_{dte_tag}:peak={peak_pnl_attr:+.2%}"
+                    f"_now={pnl:+.2%}_gave_back_{give_back:.0%}"
+                    f"_floor={close_threshold:+.2%}",
                     layer=0,
                 )
 

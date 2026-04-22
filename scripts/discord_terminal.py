@@ -336,6 +336,13 @@ class CommandRunner:
             if len(parts) < 2:
                 return "usage: `!trim <advisory_id>`"
             return await self._handle_trim(parts[1].strip())
+        if command == "saves":
+            # "!saves" or "!saves 168" (weekly)
+            parts = (raw_text or "").split()
+            hours = 24
+            if len(parts) >= 2 and parts[1].isdigit():
+                hours = max(1, min(720, int(parts[1])))
+            return await self._handle_saves(hours)
         if destroyed and subcmd == "reset-paper":
             # reset_paper.py supports --yes to skip its own interactive prompt
             extra_args = ["--yes"]
@@ -480,6 +487,25 @@ class CommandRunner:
             return f"✂️ **Trim intent queued** for `{symbol}` (50% close)."
         except Exception as e:
             return f"trim failed: {type(e).__name__}: {str(e)[:200]}"
+
+    async def _handle_saves(self, hours: int) -> str:
+        """On-demand saves report. Refreshes re-checks + returns the
+        formatted summary without posting to Discord again (the reply
+        goes to the channel where the command was issued)."""
+        try:
+            from src.data.multi_provider import MultiProvider
+            from src.intelligence.saves_tracker import (
+                recheck_pending, summary,
+            )
+            from scripts.run_saves_report import _format_discord
+            loop = asyncio.get_event_loop()
+            def _call():
+                mp = MultiProvider.from_env()
+                recheck_pending(mp)
+                return _format_discord(summary(since_hours=hours))
+            return await loop.run_in_executor(None, _call)
+        except Exception as e:
+            return f"saves report failed: {type(e).__name__}: {str(e)[:200]}"
 
     async def _handle_catalyst(self, symbols: List[str]) -> str:
         """Run the catalyst deep-dive aggregator in a worker thread."""

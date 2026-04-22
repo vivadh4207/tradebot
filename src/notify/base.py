@@ -158,6 +158,10 @@ _TITLE_TO_CHANNEL = {
     "strategy_report": {"strategy_report", "strategy", "bucket_report"},
     # Position-fade advisory (LLM says close/hold/trim; operator clicks).
     "position_advisor": {"position_advisor", "advisor", "fade_advisory"},
+    # Saves tracker — proves defensive exits are paying off.
+    "saves_report": {"saves_report", "saves", "exit_saves"},
+    # Manual close confirmations (from Discord !close / !trim).
+    "manual_close": {"manual_close", "manual_trim"},
 }
 
 

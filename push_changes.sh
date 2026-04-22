@@ -37,6 +37,7 @@ git add \
   push_changes.sh \
   scripts/discord_terminal.py \
   scripts/run_morning_scan.py \
+  scripts/run_saves_report.py \
   scripts/run_strategy_report.py \
   src/core/runtime_overrides.py \
   src/data/market_data.py \
@@ -45,12 +46,14 @@ git add \
   src/intelligence/ollama_client.py \
   src/intelligence/options_research.py \
   src/intelligence/position_advisor.py \
+  src/intelligence/saves_tracker.py \
   src/intelligence/symbol_scanner.py \
   src/main.py \
   src/notify/base.py \
   src/risk/execution_chain.py \
   deploy/launchd/com.tradebot.scan_premarket.plist \
-  deploy/launchd/com.tradebot.scan_postmarket.plist
+  deploy/launchd/com.tradebot.scan_postmarket.plist \
+  deploy/launchd/com.tradebot.saves_report.plist
 
 MSG_FILE="$(mktemp "${TMPDIR:-/tmp}/tradebot_commit_msg.XXXXXX")"
 {
