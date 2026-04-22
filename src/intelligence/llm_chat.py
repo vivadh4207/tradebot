@@ -59,6 +59,10 @@ class ChatContext:
     last_audit_summary: Optional[str] = None
     last_audit_health: Optional[int] = None
     now_iso: str = ""
+    # Session awareness — tells the LLM whether to analyze "live" vs
+    # "overnight / next-open". Populated by the dispatcher.
+    market_is_open: bool = False
+    hours_until_open: Optional[float] = None
     # Optional — populated on demand when the question references
     # options / contracts / specific strike behavior. The chat
     # dispatcher pulls this from MultiProvider before building the
@@ -66,6 +70,9 @@ class ChatContext:
     # uniform.
     option_chain_atm: List[Dict[str, Any]] = field(default_factory=list)
     news_headlines: List[Dict[str, Any]] = field(default_factory=list)
+    # Political / macro news (Fed speeches, White House, Truth Social,
+    # Treasury, Reddit WSB) pulled from political_news provider.
+    political_headlines: List[Dict[str, Any]] = field(default_factory=list)
 
 
 # -------------------------------------------------------------- sanitizers
@@ -90,15 +97,36 @@ def _sanitize(out: str, max_len: int = 1800) -> str:
 
 
 _SYSTEM_HINT = (
-    "You are the sanity-check assistant for a retail options-trading "
-    "bot called tradebot. You help the operator understand current state "
-    "and make sense of what the bot is doing. You do NOT place trades or "
-    "trigger actions — the bot has its own rules engine for that. "
-    "Keep answers concise (under 8 sentences) and concrete. If asked "
-    "about specific numbers, only reference numbers in the SNAPSHOT "
-    "below — do not invent. If the snapshot is insufficient, say so. "
-    "Do not use @everyone, @here, or any @-mention. Do not suggest live "
-    "trades; defer to the rules engine."
+    "You are a senior options-strategy analyst advising the operator of "
+    "a retail paper-trading bot called tradebot. You help make sense of "
+    "live state + market data. You do NOT place trades — the rules "
+    "engine owns that.\n\n"
+    "HARD CITATION RULES:\n"
+    "• Every price, VIX number, OI, IV, or score you cite MUST come "
+    "directly from the SNAPSHOT. Don't invent or guess.\n"
+    "• When you reference news, name the source tag shown in the "
+    "snapshot (e.g. '[finnhub] Powell held...', '[whitehouse] tariff...').\n"
+    "• When claiming something about the market ('selling pressure', "
+    "'weakness', 'breakout'), cite the SPECIFIC number in the snapshot "
+    "that supports it (a price level, a P/C ratio, a sentiment score).\n"
+    "• If the snapshot lacks data to answer, SAY SO — don't fill with "
+    "generic statements.\n\n"
+    "SESSION AWARENESS:\n"
+    "• Check `market_is_open` in the snapshot. If false, frame your "
+    "analysis as 'overnight developments + next-open setup', not "
+    "'what's happening now'.\n"
+    "• After-hours questions about SPY/QQQ should reference VIX close, "
+    "overnight news, and positioning implications for the open.\n\n"
+    "OUTPUT DEMANDS:\n"
+    "• End every substantive answer with 2-3 RISK FLAGS citing specific "
+    "snapshot data (political news headline, VIX level, breadth "
+    "deterioration, open-position risk, etc.).\n"
+    "• For SPY/QQQ trade questions, name a specific strike + expiry "
+    "from the option_chain_atm if chain is provided.\n"
+    "• Keep answers under 10 sentences + risk flags. Concrete over verbose.\n\n"
+    "SAFETY:\n"
+    "• No @everyone / @here / role mentions.\n"
+    "• Don't suggest live trades — the rules engine decides."
 )
 
 
@@ -106,6 +134,7 @@ def _build_prompt(question: str, ctx: ChatContext) -> str:
     snapshot: Dict[str, Any] = {
         "now": ctx.now_iso,
         "mode": "live" if ctx.live_trading else "paper",
+        "market_is_open": ctx.market_is_open,
         "universe": ctx.universe,
         "spot_prices": ctx.spot_by_symbol,
         "vix": ctx.vix,
@@ -120,12 +149,16 @@ def _build_prompt(question: str, ctx: ChatContext) -> str:
             if ctx.last_audit_health is not None else None
         ),
     }
+    if ctx.hours_until_open is not None and not ctx.market_is_open:
+        snapshot["hours_until_next_open"] = round(ctx.hours_until_open, 1)
     # Only include these blocks when they contain data — keeps the
     # prompt compact for simple questions.
     if ctx.option_chain_atm:
         snapshot["option_chain_atm"] = ctx.option_chain_atm[:20]
     if ctx.news_headlines:
-        snapshot["headlines"] = ctx.news_headlines[:10]
+        snapshot["headlines"] = ctx.news_headlines[:12]
+    if ctx.political_headlines:
+        snapshot["political_news"] = ctx.political_headlines[:15]
     return (
         f"{_SYSTEM_HINT}\n\n"
         f"SNAPSHOT:\n{json.dumps(snapshot, indent=2, default=str)}\n\n"

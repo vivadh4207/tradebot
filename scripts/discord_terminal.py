@@ -565,6 +565,58 @@ def _build_chat_context():
     except Exception:
         pass
 
+    # Session awareness: tell the LLM whether market is open right now
+    # so it frames analysis correctly (overnight vs live).
+    try:
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        now_utc = _dt.now(tz=_tz.utc)
+        # US Eastern = UTC-5 (standard) or UTC-4 (DST). Approximate with
+        # UTC-4 -- we're in DST for most of the year, fine for "is open".
+        now_et = now_utc - _td(hours=4)
+        weekday = now_et.weekday()                   # Mon=0 ... Sun=6
+        is_weekday = weekday < 5
+        tmin = now_et.hour * 60 + now_et.minute
+        open_min = 9 * 60 + 30
+        close_min = 16 * 60
+        ctx.market_is_open = (is_weekday
+                                and open_min <= tmin <= close_min)
+        # Hours until next open (for Friday close / weekend questions)
+        if not ctx.market_is_open:
+            tgt = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+            if tmin > close_min or not is_weekday:
+                while True:
+                    tgt = tgt + _td(days=1)
+                    if tgt.weekday() < 5:
+                        break
+            elif tmin < open_min:
+                pass                                   # same-day later
+            ctx.hours_until_open = round(
+                (tgt - now_et).total_seconds() / 3600.0, 1,
+            )
+    except Exception:
+        pass
+
+    # Political-news pulse so chat can reference Fed / WH / Truth / WSB.
+    try:
+        from src.core.config import load_settings
+        from src.intelligence.political_news import build_political_news_provider
+        s = load_settings(ROOT / "config" / "settings.yaml")
+        pol = build_political_news_provider(s)
+        if pol is not None:
+            snap = pol.snapshot_for_auditor()
+            items = (snap.get("headlines", []) if isinstance(snap, dict)
+                     else snap if isinstance(snap, list) else [])
+            ctx.political_headlines = [
+                {"ts": x.get("ts") or x.get("published", ""),
+                  "source": x.get("source", "?"),
+                  "headline": (x.get("headline") or x.get("title") or "")[:200],
+                  "summary": (x.get("summary") or "")[:200]}
+                for x in items[:15]
+                if (x.get("headline") or x.get("title"))
+            ]
+    except Exception as _e:
+        _log.info("political_headlines_enrich_failed err=%s", _e)
+
     # Actively pull LIVE quotes from the multi-provider stack. This is
     # the critical fix: without this the LLM sees an empty spot_prices
     # object and answers "I don't have prices." Cached at the provider
@@ -801,7 +853,11 @@ def _build_app():
             super().__init__(timeout=None)
 
         async def _ask(self, interaction, question: str):
-            await interaction.response.defer(thinking=True)
+            # Guard against double-ack — Discord rejects with
+            # "Interaction already acknowledged" if we defer twice
+            # (can happen when the button is double-clicked).
+            if not interaction.response.is_done():
+                await interaction.response.defer(thinking=True)
             try:
                 if chat is None or not chat.cfg.enabled:
                     await interaction.followup.send(

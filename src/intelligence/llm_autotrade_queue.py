@@ -77,14 +77,69 @@ class QueuedIdea:
 # ----------------------------------------------------------- writer (agent)
 
 
+def _idea_has_sane_prices(idea: QueuedIdea) -> bool:
+    """Gate on prices. Rejects LLM hallucinations where:
+      - profit_target or stop_loss is negative / zero
+      - stop_loss >= entry (for LONG options, SL must be BELOW entry)
+      - profit_target <= entry (PT must be ABOVE entry for long-only)
+      - profit_target > 10x entry (unrealistic multi-bagger target)
+      - stop_loss > entry * 0.9 (SL too tight; LLM confused premium for spot)
+      - entry > 1000 (LLM mistook spot price for option premium)
+    """
+    e = idea.entry
+    pt = idea.profit_target
+    sl = idea.stop_loss
+    if None in (e, pt, sl):
+        return False
+    try:
+        e, pt, sl = float(e), float(pt), float(sl)
+    except Exception:
+        return False
+    if e <= 0 or pt <= 0 or sl <= 0:
+        return False                     # negative/zero anywhere = bad
+    if sl >= e:
+        return False                     # SL must be below entry
+    if pt <= e:
+        return False                     # PT must be above entry
+    if pt > 10 * e:
+        return False                     # unrealistic 10-bagger
+    if sl > e * 0.9:
+        return False                     # SL too tight / nonsense
+    if e > 1000:
+        # Options on SPY/QQQ rarely cost >$100 per contract for 0-30 DTE.
+        # >$1000 means the LLM confused spot price for option premium.
+        return False
+    return True
+
+
 def write_ideas(ideas: List[QueuedIdea], data_root: Optional[Path] = None
                 ) -> int:
     """Append ideas to the queue. Called by the research agent when
     LLM_AUTOTRADE=1 is set in env. Returns number written.
 
+    Gates each idea through _idea_has_sane_prices to reject LLM
+    hallucinations (negative stops, spot-priced entries, etc.).
     Dedupe by id — an agent run that re-proposes the same idea doesn't
     double-enter.
     """
+    if not ideas:
+        return 0
+    rejected = 0
+    valid = []
+    for idea in ideas:
+        if _idea_has_sane_prices(idea):
+            valid.append(idea)
+        else:
+            rejected += 1
+            _log.warning(
+                "llm_autotrade_idea_rejected sym=%s dir=%s entry=%s pt=%s sl=%s "
+                "reason=insane_prices",
+                idea.symbol, idea.direction, idea.entry,
+                idea.profit_target, idea.stop_loss,
+            )
+    if rejected:
+        _log.warning("llm_autotrade_queue_rejected n=%d", rejected)
+    ideas = valid
     if not ideas:
         return 0
     path = _resolve_path(_QUEUE_PATH, data_root)

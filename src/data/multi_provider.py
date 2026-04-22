@@ -55,7 +55,25 @@ class MultiProvider:
     @classmethod
     def from_env(cls) -> "MultiProvider":
         """Build a MultiProvider from whatever providers the env enables.
-        Missing keys are no-ops — no exception."""
+        Missing keys are no-ops — no exception.
+
+        Reloads .env on each call so runtime edits (operator rotates a
+        key, fixes a duplicate) take effect without restarting the bot.
+        """
+        try:
+            # override=True so a key added after process start wins
+            from dotenv import load_dotenv
+            from pathlib import Path as _P
+            # Walk up to find .env; handles both bot-root and test-cwd calls.
+            cur = _P(".").resolve()
+            for _ in range(4):
+                candidate = cur / ".env"
+                if candidate.exists():
+                    load_dotenv(candidate, override=True)
+                    break
+                cur = cur.parent
+        except Exception:
+            pass
         from .providers.polygon import PolygonProvider
         from .providers.tradier import TradierProvider
         from .providers.finnhub import FinnhubProvider
