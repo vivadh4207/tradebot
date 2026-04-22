@@ -31,6 +31,9 @@ LAUNCHD_INSTALLED_PLIST="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
 RESEARCH_LABEL="com.tradebot.research"
 RESEARCH_SRC_PLIST="$ROOT/deploy/launchd/${RESEARCH_LABEL}.plist"
 RESEARCH_INSTALLED_PLIST="$HOME/Library/LaunchAgents/${RESEARCH_LABEL}.plist"
+DISCORD_MAC_LABEL="com.tradebot.discord"
+DISCORD_MAC_SRC_PLIST="$ROOT/deploy/launchd/${DISCORD_MAC_LABEL}.plist"
+DISCORD_MAC_INSTALLED_PLIST="$HOME/Library/LaunchAgents/${DISCORD_MAC_LABEL}.plist"
 
 # launchd dashboard agent (separate from the bot watchdog).
 DASHBOARD_LABEL="com.tradebot.dashboard"
@@ -455,11 +458,31 @@ _dashboard_status_systemd() {
   echo "open:      http://127.0.0.1:8000"
 }
 
-# ----- Discord terminal service (Linux only — uses systemd --user) -----
+# ----- Discord terminal service (Mac launchd + Linux systemd) -----
 cmd_discord_install() {
+  if [[ "$HOST_OS" == "Darwin" ]]; then
+    # macOS path — install launchd agent so bot survives terminal close.
+    if [[ ! -f "$DISCORD_MAC_SRC_PLIST" ]]; then
+      echo "source plist missing: $DISCORD_MAC_SRC_PLIST"; return 1
+    fi
+    mkdir -p "$(dirname "$DISCORD_MAC_INSTALLED_PLIST")"
+    local tmp; tmp="$(mktemp)"
+    awk -v root="$ROOT" -v py="$ROOT/.venv/bin/python" '
+      { gsub(/__TRADEBOT_ROOT__/, root); gsub(/__TRADEBOT_PY__/, py); print }
+    ' "$DISCORD_MAC_SRC_PLIST" > "$tmp"
+    mv "$tmp" "$DISCORD_MAC_INSTALLED_PLIST"
+    launchctl unload "$DISCORD_MAC_INSTALLED_PLIST" 2>/dev/null || true
+    if launchctl load "$DISCORD_MAC_INSTALLED_PLIST"; then
+      echo "discord terminal installed + loaded: $DISCORD_MAC_INSTALLED_PLIST"
+      echo "logs:    $ROOT/logs/discord_terminal.{out,err}"
+      echo "check:   launchctl list | grep tradebot.discord"
+    else
+      echo "launchctl load failed"; return 1
+    fi
+    return 0
+  fi
   if [[ "$HOST_OS" != "Linux" ]]; then
-    echo "discord-install is Linux-only (uses systemd --user)."
-    return 2
+    echo "unsupported OS: $HOST_OS"; return 2
   fi
   _require_systemctl || return 1
   if [[ ! -f "$SYSTEMD_DISCORD_SRC" ]]; then
@@ -477,8 +500,18 @@ cmd_discord_install() {
 }
 
 cmd_discord_uninstall() {
+  if [[ "$HOST_OS" == "Darwin" ]]; then
+    if [[ -f "$DISCORD_MAC_INSTALLED_PLIST" ]]; then
+      launchctl unload "$DISCORD_MAC_INSTALLED_PLIST" 2>/dev/null || true
+      rm -f "$DISCORD_MAC_INSTALLED_PLIST"
+      echo "discord terminal unloaded + removed"
+    else
+      echo "discord terminal: not installed"
+    fi
+    return 0
+  fi
   if [[ "$HOST_OS" != "Linux" ]]; then
-    echo "discord-uninstall is Linux-only."; return 2
+    echo "unsupported OS: $HOST_OS"; return 2
   fi
   _require_systemctl || return 1
   systemctl --user disable --now "$SYSTEMD_DISCORD_UNIT" 2>/dev/null || true
