@@ -140,6 +140,7 @@ COMMAND_MAP: Dict[str, Tuple[str, bool]] = {
     "ollama-restart": ("ollama-restart", False),
     "ollama-warmup":  ("ollama-warmup",  False),
     "research":       ("options-research", False),   # handled in-process; see _handle_research
+    "catalyst":       ("catalyst-dive",   False),    # handled in-process; see _handle_catalyst
     "llm-autotrade":  ("llm-autotrade",   False),    # handled in-process; see _handle_llm_autotrade
     "reset-paper":   ("reset-paper",     True),       # requires DESTROY confirm
     "wipe":          ("wipe-journal",    True),       # requires DESTROY confirm
@@ -164,6 +165,8 @@ HELP_TEXT = (
     f"  `{COMMAND_PREFIX}summary [N]`   — concise digest of last N min (default 60)\n"
     f"  `{COMMAND_PREFIX}research [SYMS]` — 70B options-research ideas "
     "(default SPY QQQ)\n"
+    f"  `{COMMAND_PREFIX}catalyst [SYMS]` — deep catalyst dive across news, "
+    "social, earnings (default: SPY QQQ + big tech)\n"
     f"  `{COMMAND_PREFIX}llm-autotrade [on|off|status]` — toggle LLM-originated trades\n"
     f"  `{COMMAND_PREFIX}ollama-status` — Ollama daemon + loaded models\n"
     f"  `{COMMAND_PREFIX}ollama-warmup` — Pre-load 8B + 70B into GPU memory\n"
@@ -310,6 +313,12 @@ class CommandRunner:
             parts = (raw_text or "").split()
             syms = [s.upper() for s in parts[1:]] if len(parts) >= 2 else ["SPY", "QQQ"]
             return await self._handle_research(syms)
+        if command == "catalyst":
+            # `!catalyst` or `!catalyst AAPL MSFT NVDA`
+            parts = (raw_text or "").split()
+            syms = [s.upper() for s in parts[1:]] if len(parts) >= 2 \
+                else ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "TSLA"]
+            return await self._handle_catalyst(syms)
         if command == "llm-autotrade":
             parts = (raw_text or "").split()
             sub = parts[1].lower() if len(parts) >= 2 else "status"
@@ -375,6 +384,37 @@ class CommandRunner:
             return msg
         except Exception as e:                          # noqa: BLE001
             return f"llm-autotrade failed: {type(e).__name__}: {str(e)[:200]}"
+
+    async def _handle_catalyst(self, symbols: List[str]) -> str:
+        """Run the catalyst deep-dive aggregator in a worker thread."""
+        try:
+            from src.data.multi_provider import MultiProvider
+            from scripts.run_catalyst_dive import (
+                _gather_snapshot, _PROMPT_TEMPLATE, _call_llm,
+                _parse_llm_json, _format_discord,
+            )
+            import time as _t
+            mp = MultiProvider.from_env()
+            loop = asyncio.get_event_loop()
+            def _call():
+                snap = _gather_snapshot(mp, symbols)
+                prompt = _PROMPT_TEMPLATE.format(
+                    snapshot=json.dumps(snap, indent=2, default=str)[:14000],
+                )
+                t0 = _t.time()
+                raw, model = _call_llm(prompt, timeout_sec=300.0,
+                                         max_tokens=800)
+                parsed = _parse_llm_json(raw)
+                if not parsed:
+                    return (f"**📰 Catalyst dive** — no structured output "
+                            f"(model={model or 'n/a'})")
+                return _format_discord(parsed,
+                                         model=model or "n/a",
+                                         latency=_t.time() - t0)
+            out = await loop.run_in_executor(None, _call)
+            return out
+        except Exception as e:                          # noqa: BLE001
+            return f"catalyst failed: {type(e).__name__}: {str(e)[:200]}"
 
     async def _handle_research(self, symbols: List[str]) -> str:
         """Run the options research agent in a worker thread (70B is
