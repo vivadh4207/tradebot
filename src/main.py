@@ -979,9 +979,9 @@ class TradeBot:
             pass
 
     def _post_fade_advisory(self, adv) -> None:
-        """Post a position-fade advisory to Discord with action buttons.
-        Persists to data/position_advisories.json so the Discord button
-        handler can resolve advisory_id -> position on click."""
+        """Post a richly-formatted position-fade advisory to Discord.
+        Includes LLM reasoning, chart signals cited by name, risk/reward
+        remaining, alternative actions, and manual-override CTA."""
         try:
             from .intelligence.position_advisor import save_advisory
             aid = save_advisory(adv)
@@ -992,30 +992,75 @@ class TradeBot:
         )
         rec_icon = {"close": "🛑 CLOSE", "trim": "✂️ TRIM",
                      "hold": "✋ HOLD"}.get(adv.recommendation, "•")
+        # Header
         lines = [
             f"{urgency_icon} **Position Fade Advisory · {adv.symbol}**",
-            (f"*{adv.direction.upper()} ${adv.strike:g}"
-              if adv.strike else f"*{adv.direction.upper()}*")
-            + (f" {adv.expiry}*" if adv.expiry else "*"),
-            "",
-            f"**Peak:** +{adv.peak_pnl_pct*100:.2f}%  →  "
-            f"**Now:** {adv.current_pnl_pct*100:+.2f}%",
-            f"Entry ${adv.entry_price:.2f}  →  Now ${adv.current_price:.2f}  ·  qty {adv.qty}",
-            "",
-            f"**Recommendation:** {rec_icon} · confidence *{adv.confidence}*",
         ]
+        contract = (f"{adv.direction.upper()} ${adv.strike:g}"
+                     if adv.strike else adv.direction.upper())
+        if adv.expiry:
+            contract += f" · exp {adv.expiry}"
+        contract += f" · qty {adv.qty}"
+        lines.append(f"_{contract}_")
+        lines.append("")
+        # P&L snapshot
+        give_back_pct = (
+            ((adv.peak_pnl_pct - adv.current_pnl_pct) /
+              max(adv.peak_pnl_pct, 1e-9)) * 100
+            if adv.peak_pnl_pct > 0 else 0
+        )
+        lines.append(
+            f"**Peak:** +{adv.peak_pnl_pct*100:.2f}%  →  "
+            f"**Now:** {adv.current_pnl_pct*100:+.2f}%  "
+            f"(gave back **{give_back_pct:.0f}%**)"
+        )
+        lines.append(
+            f"Entry ${adv.entry_price:.2f} → Now ${adv.current_price:.2f}"
+        )
+        lines.append("")
+        # Recommendation header
+        lines.append(
+            f"**Recommendation:** {rec_icon} · *{adv.confidence}* confidence"
+        )
+        # LLM rationale (the "why")
         if adv.rationale:
-            lines.append(f"> {adv.rationale}")
-        if adv.bars_summary:
-            lines.append(f"_Chart: {adv.bars_summary}_")
-        if adv.key_levels:
-            lines.append("**Key levels:** " + " · ".join(adv.key_levels[:3]))
-        if adv.model:
-            lines.append(f"_model: {adv.model}_")
-        if aid:
+            lines.append(f"> 💭 {adv.rationale}")
+        # Chart signals — the specific features driving the call
+        if adv.chart_signals:
             lines.append("")
-            lines.append(f"_advisory: `{aid}` · use `!close {aid}` or "
-                          "click buttons in control channel_")
+            lines.append("**📊 Chart signals**")
+            for sig in adv.chart_signals[:4]:
+                lines.append(f"  · {sig}")
+        elif adv.bars_summary:
+            lines.append(f"_Chart: {adv.bars_summary}_")
+        # Key levels
+        if adv.key_levels:
+            lines.append("")
+            lines.append("**🎯 Key levels**")
+            for kl in adv.key_levels[:4]:
+                lines.append(f"  · {kl}")
+        # Risk/reward remaining
+        if adv.risk_reward_remaining:
+            lines.append("")
+            lines.append(f"**⚖ R:R if held** — {adv.risk_reward_remaining}")
+        # Time context (DTE + theta)
+        if adv.time_context:
+            lines.append(f"**⏱ Time** — {adv.time_context}")
+        # Alternative actions
+        if adv.alternative_actions:
+            lines.append("")
+            lines.append("**🔀 Alternatives**")
+            for alt in adv.alternative_actions[:3]:
+                lines.append(f"  · {alt}")
+        # Footer
+        lines.append("")
+        if adv.model:
+            lines.append(f"_source: {adv.model}_")
+        if aid:
+            lines.append(
+                f"_advisory `{aid}` · manual override: `!close {aid}` / "
+                f"`!trim {aid}`_"
+            )
         meta = {
             "Symbol":        adv.symbol,
             "Peak":          f"{adv.peak_pnl_pct*100:+.2f}%",

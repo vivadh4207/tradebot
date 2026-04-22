@@ -142,6 +142,9 @@ COMMAND_MAP: Dict[str, Tuple[str, bool]] = {
     "research":       ("options-research", False),   # handled in-process; see _handle_research
     "catalyst":       ("catalyst-dive",   False),    # handled in-process; see _handle_catalyst
     "llm-autotrade":  ("llm-autotrade",   False),    # handled in-process; see _handle_llm_autotrade
+    "saves":          ("saves-report",    False),    # handled in-process; see _handle_saves
+    "close":          ("manual-close",    False),    # handled in-process; see _handle_close
+    "trim":           ("manual-trim",     False),    # handled in-process; see _handle_trim
     "reset-paper":   ("reset-paper",     True),       # requires DESTROY confirm
     "wipe":          ("wipe-journal",    True),       # requires DESTROY confirm
 }

@@ -51,6 +51,20 @@ class FadeAdvisory:
     bars_summary: str = ""          # one-line chart read
     model: str = ""
     ts: float = 0.0
+    # ---- Rich LLM insights (new) ----
+    chart_signals: List[str] = field(default_factory=list)
+    # e.g. "lower-high pattern on last 3 bars", "volume spike against us",
+    #      "broke session VWAP at 679.80", "RSI(14) rolled over from 68→52"
+    risk_reward_remaining: str = ""
+    # e.g. "Upside capped at ~$1.55 resistance ($0.08 more). Downside
+    #       open to $0.40 support ($0.57 loss)."
+    alternative_actions: List[str] = field(default_factory=list)
+    # e.g. ["Trim 50% and set stop at entry ($1.45)",
+    #        "Roll to further-dated contract for breathing room"]
+    fade_trigger: str = ""
+    # e.g. "peak_retrace_30pct" | "green_to_red" | "stale_flat"
+    time_context: str = ""
+    # e.g. "Position held 42 min, 3h 17m to expiry — theta accelerating"
 
 
 class PositionAdvisor:
@@ -205,10 +219,26 @@ class PositionAdvisor:
                     if parsed.get("confidence"):
                         adv.confidence = str(parsed["confidence"])[:10]
                     if parsed.get("rationale"):
-                        adv.rationale = str(parsed["rationale"])[:300]
+                        adv.rationale = str(parsed["rationale"])[:500]
                     if parsed.get("key_levels"):
-                        adv.key_levels = [str(x)[:60]
-                                             for x in parsed["key_levels"][:3]]
+                        adv.key_levels = [str(x)[:80]
+                                             for x in parsed["key_levels"][:4]]
+                    if parsed.get("chart_signals"):
+                        adv.chart_signals = [
+                            str(x)[:100]
+                            for x in parsed["chart_signals"][:4]
+                        ]
+                    if parsed.get("risk_reward_remaining"):
+                        adv.risk_reward_remaining = str(
+                            parsed["risk_reward_remaining"]
+                        )[:300]
+                    if parsed.get("alternative_actions"):
+                        adv.alternative_actions = [
+                            str(x)[:120]
+                            for x in parsed["alternative_actions"][:3]
+                        ]
+                    if parsed.get("time_context"):
+                        adv.time_context = str(parsed["time_context"])[:200]
                     adv.model = model
         except Exception as e:                              # noqa: BLE001
             _log.info("position_advisor_llm_err err=%s", e)
@@ -219,14 +249,22 @@ class PositionAdvisor:
 
 
 def _build_prompt(adv: FadeAdvisory, bars) -> str:
+    # Rich bar snapshot with computed signals the LLM can cite.
     recent_bars: List[Dict[str, Any]] = []
     if bars:
-        for b in bars[-12:]:
+        for b in bars[-15:]:
             recent_bars.append({
                 "o": round(b.open, 2), "h": round(b.high, 2),
                 "l": round(b.low, 2), "c": round(b.close, 2),
                 "v": int(b.volume or 0),
             })
+    # Pre-compute chart metrics so LLM can cite them by name
+    computed = _compute_chart_metrics(bars) if bars else {}
+
+    # Pull session-wide context: recent ensemble emits, regime, VIX.
+    # Fail-open — missing pieces are omitted from the snapshot.
+    session_ctx = _gather_session_context()
+
     snap = {
         "symbol": adv.symbol,
         "direction": adv.direction,
@@ -236,28 +274,156 @@ def _build_prompt(adv: FadeAdvisory, bars) -> str:
         "current_price": adv.current_price,
         "peak_pnl_pct": round(adv.peak_pnl_pct * 100, 2),
         "current_pnl_pct": round(adv.current_pnl_pct * 100, 2),
+        "gave_back_pct": round(
+            ((adv.peak_pnl_pct - adv.current_pnl_pct) /
+              max(adv.peak_pnl_pct, 1e-9)) * 100, 1
+        ) if adv.peak_pnl_pct > 0 else None,
         "bars_summary": adv.bars_summary,
         "recent_underlying_bars": recent_bars,
+        "chart_metrics": computed,
+        "session_context": session_ctx,
     }
     return (
-        "You are a risk-management copilot for a long-options paper bot. "
-        "A position has faded from its peak profit — you must recommend "
-        "'close', 'hold', or 'trim' and justify in 2 sentences max. "
-        "Rules: if the position was in profit and is now negative, ALWAYS "
-        "recommend 'close'. If the chart shows reversal (lower highs, "
-        "VWAP loss), recommend 'close' or 'trim'. If the fade is noise "
-        "inside a still-valid trend, 'hold' is acceptable.\n\n"
-        "Respond with STRICT JSON only:\n"
+        "You are a senior options-desk risk manager reviewing a FADING "
+        "position for a long-options paper bot. The position was in "
+        "profit and is retracing. Your job: recommend close / hold / "
+        "trim with SPECIFIC, EVIDENCE-BASED reasoning the operator can "
+        "review in Discord.\n\n"
+        "## Decision rules\n\n"
+        "1. If the position was in profit and is now NEGATIVE: always "
+        "recommend 'close', urgency='urgent'.\n"
+        "2. If give-back >= 50% and chart shows reversal (lower highs, "
+        "VWAP loss, volume against us): 'close', urgency='urgent'.\n"
+        "3. If give-back 25-50% and reversal signs are partial: 'trim' "
+        "50% at urgency='urgent' — lock half, let the rest trail.\n"
+        "4. If the fade is noise INSIDE a still-valid trend (higher "
+        "lows on the underlying, VWAP holding, volume flat): 'hold'.\n"
+        "5. For 0DTE positions: be EXTRA aggressive — theta accelerates "
+        "in final hours, no recovery window.\n\n"
+        "## What the rationale MUST include\n\n"
+        "- What SPECIFIC chart feature triggered your call (name it: "
+        "  'lower-high pattern on last 3 bars', 'VWAP break at X', "
+        "  'volume surge against position', etc.)\n"
+        "- The key price level to watch next\n"
+        "- Expected outcome if held vs closed\n\n"
+        "## Output schema — STRICT JSON, no other text\n\n"
         "{\n"
         '  "recommendation": "close|hold|trim",\n'
         '  "urgency": "urgent|normal|low",\n'
         '  "confidence": "low|medium|high",\n'
-        '  "rationale": "2-sentence explanation citing SNAPSHOT values",\n'
-        '  "key_levels": ["short level or trigger", "..."]\n'
+        '  "rationale": "3-4 sentences citing SNAPSHOT values BY NAME",\n'
+        '  "chart_signals": ["2-4 named chart features driving the call"],\n'
+        '  "key_levels": ["price + what it means", "..."],\n'
+        '  "risk_reward_remaining": "one sentence: what more can we gain vs lose if we hold",\n'
+        '  "alternative_actions": ["1-2 alternatives besides the primary rec"],\n'
+        '  "time_context": "DTE + minutes held + theta note"\n'
         "}\n\n"
-        f"SNAPSHOT:\n{json.dumps(snap, indent=2)}\n\n"
+        f"SNAPSHOT:\n{json.dumps(snap, indent=2, default=str)[:6000]}\n\n"
         "YOUR JSON:"
     )
+
+
+def _compute_chart_metrics(bars) -> Dict[str, Any]:
+    """Pre-compute signals the LLM can cite by name — saves tokens and
+    grounds the output in real numbers from the snapshot."""
+    if not bars or len(bars) < 5:
+        return {}
+    recent = bars[-15:]
+    highs = [b.high for b in recent]
+    lows = [b.low for b in recent]
+    closes = [b.close for b in recent]
+    volumes = [b.volume or 0 for b in recent]
+
+    # Lower-high / higher-low pattern detection
+    last3_highs = highs[-3:]
+    last3_lows = lows[-3:]
+    lower_highs = len(last3_highs) == 3 and last3_highs[0] > last3_highs[1] > last3_highs[2]
+    higher_lows = len(last3_lows) == 3 and last3_lows[0] < last3_lows[1] < last3_lows[2]
+
+    # VWAP (volume-weighted average) across the window
+    typical = [(h + l + c) / 3 for h, l, c in zip(highs, lows, closes)]
+    tpv = sum(t * v for t, v in zip(typical, volumes))
+    vsum = sum(volumes) or 1
+    vwap = tpv / vsum
+    last_close = closes[-1]
+    vwap_pos = ("above" if last_close > vwap * 1.001
+                else "below" if last_close < vwap * 0.999
+                else "at")
+
+    # Volume trend (recent 3 vs prior 10)
+    if len(volumes) >= 13:
+        recent_v = sum(volumes[-3:]) / 3
+        baseline_v = sum(volumes[-13:-3]) / 10
+        vol_ratio = recent_v / max(baseline_v, 1)
+    else:
+        vol_ratio = 1.0
+
+    # 15-bar range
+    rng_high = max(highs)
+    rng_low = min(lows)
+    pct_of_range = (
+        (last_close - rng_low) / max(rng_high - rng_low, 1e-9)
+    ) if rng_high > rng_low else 0.5
+
+    return {
+        "last_close": round(last_close, 2),
+        "vwap": round(vwap, 2),
+        "price_vs_vwap": vwap_pos,
+        "vwap_dist_pct": round((last_close - vwap) / max(vwap, 1e-9) * 100, 2),
+        "last_3_highs": [round(h, 2) for h in last3_highs],
+        "last_3_lows": [round(l, 2) for l in last3_lows],
+        "lower_high_pattern": lower_highs,
+        "higher_low_pattern": higher_lows,
+        "volume_ratio_recent_vs_baseline": round(vol_ratio, 2),
+        "15bar_range_high": round(rng_high, 2),
+        "15bar_range_low": round(rng_low, 2),
+        "pct_of_range": round(pct_of_range * 100, 1),
+        "net_15bar_pct": round(
+            (closes[-1] - closes[0]) / max(closes[0], 1e-9) * 100, 2
+        ),
+    }
+
+
+def _gather_session_context() -> Dict[str, Any]:
+    """Pull current regime + VIX + recent ensemble activity from the log
+    tail. Fail-open — missing pieces returned as None."""
+    out: Dict[str, Any] = {}
+    try:
+        from ..core.data_paths import data_path
+        from pathlib import Path as _P
+        log_path = _P(data_path("logs/tradebot.out"))
+        if not log_path.exists():
+            return out
+        size = log_path.stat().st_size
+        with log_path.open("rb") as f:
+            f.seek(max(0, size - 80_000))
+            if size > 80_000:
+                f.readline()
+            text = f.read().decode("utf-8", errors="replace")
+        import re as _re
+        # Strip ANSI before matching
+        text = _re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
+        regimes = _re.findall(r"regime=(\w+)", text)
+        if regimes:
+            out["regime"] = regimes[-1]
+        vixs = _re.findall(r"\bvix=([0-9.]+)", text)
+        if vixs:
+            try:
+                out["vix"] = float(vixs[-1])
+            except Exception:
+                pass
+        # Last 3 ensemble emits for trend context
+        emits = []
+        for line in reversed(text.splitlines()[-400:]):
+            if "ensemble_emit" in line:
+                emits.append(line[:180])
+                if len(emits) >= 3:
+                    break
+        if emits:
+            out["recent_ensemble_emits"] = list(reversed(emits))
+    except Exception:
+        pass
+    return out
 
 
 def _parse_llm(raw: str) -> Optional[Dict[str, Any]]:
