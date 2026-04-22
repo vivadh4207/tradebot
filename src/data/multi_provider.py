@@ -59,10 +59,12 @@ class MultiProvider:
         from .providers.polygon import PolygonProvider
         from .providers.tradier import TradierProvider
         from .providers.finnhub import FinnhubProvider
+        from .providers.yahoo import YahooProvider
         providers: List[MarketDataProvider] = [
             PolygonProvider(),
             TradierProvider(),
             FinnhubProvider(),
+            YahooProvider(),
         ]
         mp = cls(providers)
         _log.info(
