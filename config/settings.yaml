@@ -279,7 +279,11 @@ broker:
   # source of truth; the two books will drift over time since the
   # simulators differ. Requires ALPACA_API_KEY_ID + ALPACA_API_SECRET_KEY
   # in .env and L1+ options permission on the Alpaca paper account.
-  mirror_to_alpaca: true
+  # Operator: "tradier is way better/faster, ignore alpaca." Alpaca
+  # paper rejects SELL-to-close on options with "account not eligible
+  # for uncovered options contracts" which orphans mirror positions.
+  # Tradier sandbox handles options correctly — use it as primary.
+  mirror_to_alpaca: false
   slippage_bps: 2         # only used when cost_model=linear
   commission_per_option: 0.0
   commission_per_share: 0.0

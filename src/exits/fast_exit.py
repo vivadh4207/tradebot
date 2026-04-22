@@ -131,6 +131,14 @@ class FastExitConfig:
     zdte_exhaustion_enabled: bool = True
     zdte_exhaustion_min_profit: float = 0.01   # +1% (past fees/slippage)
 
+    # Exhaustion applied to ALL DTEs (not just 0DTE) — operator:
+    # "even for long positions, if in profit cut it immediately."
+    # DTE-aware min profit so swing trades get breathing room but
+    # still cut if no upside signals for N bars.
+    all_dte_exhaustion_enabled: bool = True
+    all_dte_exhaustion_short_min_profit: float = 0.02   # +2%
+    all_dte_exhaustion_swing_min_profit: float = 0.04   # +4%
+
     # Active-downside detector — stronger than exhaustion.
     # Operator: "if it shows downside, sell it asap and if you find
     # better entry later, go for it."
@@ -139,10 +147,13 @@ class FastExitConfig:
     # actively bullish (for long put), even if we're at minimal profit.
     # ANY single downside signal triggers close. DTE-aware thresholds.
     active_downside_enabled: bool = True
-    # Minimum pnl required to fire (below this, SL handles it):
-    active_downside_min_pnl_0dte: float = 0.0   # any profit, even 0
-    active_downside_min_pnl_short: float = 0.005
-    active_downside_min_pnl_swing: float = 0.015
+    # Minimum pnl required to fire (below this, SL handles it).
+    # Operator: "even for long positions, if in profit cut it
+    # immediately" — dropped from 0.5/1.5% to 0.2/0.5% so swing
+    # positions also cut on downside signals once in profit.
+    active_downside_min_pnl_0dte: float = 0.0     # any profit, even 0
+    active_downside_min_pnl_short: float = 0.002  # +0.2%
+    active_downside_min_pnl_swing: float = 0.005  # +0.5%
 
     # Chart-reversal detectors — fire while in profit when the
     # underlying's bar structure screams "trend changed":
@@ -440,15 +451,26 @@ class FastExitEvaluator:
                         layer=0,
                     )
 
-        # ---- 0DTE momentum-exhaustion exit ----
-        # Operator: "0dte should be sold as soon as we are green but
-        # other fundamentals doesn't show upside on options." For same-
-        # day expiry there's no recovery — if the underlying isn't
-        # actively pushing our direction, theta decay eats us.
-        if (self.cfg.zdte_exhaustion_enabled
-                and dte == 0
+        # ---- Momentum-exhaustion exit (DTE-aware) ----
+        # Operator: "even for long positions, if in profit cut it
+        # immediately" + "0DTE should be sold as soon as we are green
+        # but other fundamentals doesn't show upside."
+        #
+        # DTE-aware min profit so the rule applies to all positions:
+        #   0DTE: +1% min (theta killer)
+        #   short: +2% min
+        #   swing: +4% min (let thesis breathe a bit)
+        exhaustion_min = None
+        if dte == 0 and self.cfg.zdte_exhaustion_enabled:
+            exhaustion_min = self.cfg.zdte_exhaustion_min_profit
+        elif dte > 0 and self.cfg.all_dte_exhaustion_enabled:
+            if dte >= 14:
+                exhaustion_min = self.cfg.all_dte_exhaustion_swing_min_profit
+            else:
+                exhaustion_min = self.cfg.all_dte_exhaustion_short_min_profit
+        if (exhaustion_min is not None
                 and bars is not None and len(bars) >= 15
-                and pnl >= self.cfg.zdte_exhaustion_min_profit):
+                and pnl >= exhaustion_min):
             is_bullish = (pos.right == OptionRight.CALL)
             recent = bars[-15:]
             highs = [b.high for b in recent]
@@ -509,13 +531,15 @@ class FastExitEvaluator:
             ])
 
             if upside_signals_present == 0:
-                # No continuation signal while in profit on 0DTE = take it
+                # No continuation signal while in profit = take it
+                dte_tag = ("0dte" if dte == 0 else
+                             "swing" if dte >= 14 else "short")
                 return ExitDecision(
                     True,
-                    (f"zdte_exhaustion:pnl={pnl:+.2%}_no_upside_signal"
+                    (f"exhaustion_{dte_tag}:pnl={pnl:+.2%}_no_upside_signal"
                      f"_(new_hi={signal_a_new_extreme},"
                      f"vol_rising={signal_b_volume_rising},"
-                     f"vwap_exp={signal_c_vwap_expanding})"),
+                     f"vwap_exp={signal_c_vwap_expanding})_dte={dte}"),
                     layer=0,
                 )
 

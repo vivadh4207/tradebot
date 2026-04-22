@@ -1198,7 +1198,23 @@ class TradeBot:
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "KILL",
         )
+        # Heartbeat file — main_loop checks this and alerts if >90s
+        # stale. Catches the silent-stall scenario that caused the
+        # QQQ 654 call to sit unexited for 24 min (bot process alive,
+        # fast_loop thread wedged or blocked on a network call).
+        import time as _t
+        _hb_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "logs", "fast_loop_heartbeat.txt",
+        )
+        def _write_heartbeat():
+            try:
+                with open(_hb_path, "w") as f:
+                    f.write(str(_t.time()))
+            except Exception:
+                pass
         while not self._stop.is_set():
+            _write_heartbeat()
             # Cooperative kill check — needs to be here too, not just main_loop.
             # At a 5s cadence we react within ~5s even if main_loop is blocked.
             if os.path.exists(kill_file):

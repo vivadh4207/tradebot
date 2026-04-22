@@ -145,6 +145,7 @@ COMMAND_MAP: Dict[str, Tuple[str, bool]] = {
     "saves":          ("saves-report",    False),    # handled in-process; see _handle_saves
     "close":          ("manual-close",    False),    # handled in-process; see _handle_close
     "trim":           ("manual-trim",     False),    # handled in-process; see _handle_trim
+    "cleanup":        ("broker-cleanup",  False),    # handled in-process; see _handle_cleanup
     "reset-paper":   ("reset-paper",     True),       # requires DESTROY confirm
     "wipe":          ("wipe-journal",    True),       # requires DESTROY confirm
 }
@@ -346,6 +347,13 @@ class CommandRunner:
             if len(parts) >= 2 and parts[1].isdigit():
                 hours = max(1, min(720, int(parts[1])))
             return await self._handle_saves(hours)
+        if command == "cleanup":
+            # List orphaned positions across brokers (local vs tradier
+            # vs alpaca mismatches) + optional `--close` to wipe them.
+            parts = (raw_text or "").split()
+            do_close = any(p.lower() in ("--close", "close")
+                            for p in parts[1:])
+            return await self._handle_cleanup(do_close)
         if destroyed and subcmd == "reset-paper":
             # reset_paper.py supports --yes to skip its own interactive prompt
             extra_args = ["--yes"]
@@ -490,6 +498,95 @@ class CommandRunner:
             return f"✂️ **Trim intent queued** for `{symbol}` (50% close)."
         except Exception as e:
             return f"trim failed: {type(e).__name__}: {str(e)[:200]}"
+
+    async def _handle_cleanup(self, do_close: bool) -> str:
+        """List positions across local + Tradier + Alpaca, flag any
+        that exist on one side but not the other (orphans). With
+        --close, submit close orders on every orphan via Tradier
+        (since Alpaca paper rejects uncovered-options closes)."""
+        try:
+            import json as _json
+            from pathlib import Path as _P
+            from src.brokers.tradier_adapter import build_tradier_broker
+            from src.core.types import Order, Side
+            lines = ["**🧹 Broker cleanup — orphan position scan**", ""]
+
+            # Local state
+            snap = ROOT / "logs" / "broker_state.json"
+            local_syms = set()
+            if snap.exists():
+                data = _json.loads(snap.read_text())
+                local_syms = {p.get("symbol", "")
+                              for p in (data.get("positions") or [])}
+                lines.append(f"**Local (paper):** {len(local_syms)} positions")
+                for s in sorted(local_syms):
+                    lines.append(f"  · {s}")
+            else:
+                lines.append("**Local:** no snapshot")
+
+            # Tradier
+            tradier_syms = set()
+            tradier_positions = []
+            tb = build_tradier_broker()
+            if tb is not None:
+                try:
+                    tradier_positions = list(tb.positions())
+                    tradier_syms = {p.symbol for p in tradier_positions}
+                    lines.append("")
+                    lines.append(f"**Tradier:** {len(tradier_syms)} positions")
+                    for p in tradier_positions:
+                        lines.append(
+                            f"  · {p.symbol}  qty={p.qty}  "
+                            f"avg=${p.avg_price:.2f}"
+                        )
+                except Exception as e:
+                    lines.append(f"**Tradier:** error: {e}")
+            else:
+                lines.append("**Tradier:** not configured")
+
+            # Orphans
+            orphan_tradier = tradier_syms - local_syms
+            orphan_local = local_syms - tradier_syms
+
+            lines.append("")
+            if orphan_tradier:
+                lines.append(f"**🚨 Orphan on Tradier (not in local):** "
+                              f"{len(orphan_tradier)}")
+                for s in sorted(orphan_tradier):
+                    lines.append(f"  · {s}")
+            if orphan_local:
+                lines.append(f"**⚠️ Orphan local (not on Tradier):** "
+                              f"{len(orphan_local)}")
+                for s in sorted(orphan_local):
+                    lines.append(f"  · {s}")
+            if not orphan_tradier and not orphan_local:
+                lines.append("✅ All brokers in sync — no orphans.")
+
+            # Optional close
+            if do_close and orphan_tradier and tb is not None:
+                lines.append("")
+                lines.append("**🔨 Closing orphans on Tradier...**")
+                for pos in tradier_positions:
+                    if pos.symbol not in orphan_tradier:
+                        continue
+                    side = Side.SELL if pos.qty > 0 else Side.BUY
+                    o = Order(
+                        symbol=pos.symbol, side=side, qty=abs(pos.qty),
+                        is_option=pos.is_option,
+                        limit_price=max(0.01, pos.avg_price * 0.50),
+                        tif="DAY", tag="discord_cleanup",
+                    )
+                    try:
+                        tb.submit(o)
+                        lines.append(f"  ✅ closed {pos.symbol} "
+                                      f"qty={pos.qty}")
+                    except Exception as e:
+                        lines.append(f"  ❌ {pos.symbol} failed: "
+                                      f"{str(e)[:120]}")
+
+            return "\n".join(lines)[:1900]
+        except Exception as e:
+            return f"cleanup failed: {type(e).__name__}: {str(e)[:200]}"
 
     async def _handle_saves(self, hours: int) -> str:
         """On-demand saves report. Refreshes re-checks + returns the
