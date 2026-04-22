@@ -113,6 +113,37 @@ class FastExitConfig:
     support_break_enabled: bool = True
     support_break_min_profit: float = 0.08   # only fires if up 8%+
 
+    # 0DTE momentum-exhaustion exit — operator's rule:
+    #   "0dte should be sold as soon as we are green but other
+    #    fundamentals doesn't show upside on options."
+    #
+    # Triggers on 0DTE positions in profit >= zdte_exhaustion_min_profit
+    # when NONE of the upside-continuation signals are present. Any ONE
+    # continuation signal holds the trade; absence of all of them
+    # = exhaustion = take profit now.
+    #
+    # Continuation signals for a long call (mirror for put):
+    #   (a) last bar made a NEW HIGH vs prior 5 bars
+    #   (b) last 3-bar volume is RISING vs prior 10-bar baseline
+    #   (c) close is ABOVE VWAP with expanding distance
+    #
+    # If 0/3 signals present AND in profit → close immediately.
+    zdte_exhaustion_enabled: bool = True
+    zdte_exhaustion_min_profit: float = 0.01   # +1% (past fees/slippage)
+
+    # Active-downside detector — stronger than exhaustion.
+    # Operator: "if it shows downside, sell it asap and if you find
+    # better entry later, go for it."
+    #
+    # Fires when the chart is actively bearish (for long call) or
+    # actively bullish (for long put), even if we're at minimal profit.
+    # ANY single downside signal triggers close. DTE-aware thresholds.
+    active_downside_enabled: bool = True
+    # Minimum pnl required to fire (below this, SL handles it):
+    active_downside_min_pnl_0dte: float = 0.0   # any profit, even 0
+    active_downside_min_pnl_short: float = 0.005
+    active_downside_min_pnl_swing: float = 0.015
+
     # Chart-reversal detectors — fire while in profit when the
     # underlying's bar structure screams "trend changed":
     #
@@ -408,6 +439,187 @@ class FastExitEvaluator:
                         f"={prior_high:.2f}_pnl={pnl:+.2%}",
                         layer=0,
                     )
+
+        # ---- 0DTE momentum-exhaustion exit ----
+        # Operator: "0dte should be sold as soon as we are green but
+        # other fundamentals doesn't show upside on options." For same-
+        # day expiry there's no recovery — if the underlying isn't
+        # actively pushing our direction, theta decay eats us.
+        if (self.cfg.zdte_exhaustion_enabled
+                and dte == 0
+                and bars is not None and len(bars) >= 15
+                and pnl >= self.cfg.zdte_exhaustion_min_profit):
+            is_bullish = (pos.right == OptionRight.CALL)
+            recent = bars[-15:]
+            highs = [b.high for b in recent]
+            lows = [b.low for b in recent]
+            closes = [b.close for b in recent]
+            volumes = [b.volume or 0 for b in recent]
+            last_close = closes[-1]
+
+            # (a) New high/low on last bar vs prior 5?
+            if is_bullish:
+                signal_a_new_extreme = highs[-1] > max(highs[-6:-1])
+            else:
+                signal_a_new_extreme = lows[-1] < min(lows[-6:-1])
+
+            # (b) Recent 3-bar volume rising vs prior 10-bar baseline?
+            recent_vol = sum(volumes[-3:]) / 3
+            baseline_vol = sum(volumes[-13:-3]) / 10 if len(volumes) >= 13 else recent_vol
+            signal_b_volume_rising = (
+                baseline_vol > 0 and recent_vol > 1.15 * baseline_vol
+            )
+
+            # (c) Close above VWAP (for call) with expanding distance?
+            typical = [(h + l + c) / 3 for h, l, c in zip(highs, lows, closes)]
+            tpv = sum(t * v for t, v in zip(typical, volumes))
+            vsum = sum(volumes) or 1
+            vwap = tpv / vsum
+            if is_bullish:
+                cur_dist = last_close - vwap
+                prior_closes = closes[-4:-1]
+                prior_typical = typical[-4:-1]
+                prior_vwaps = []
+                for i in range(1, 4):
+                    sub_typical = typical[:-i]
+                    sub_vol = volumes[:-i]
+                    sub_vsum = sum(sub_vol) or 1
+                    prior_vwaps.append(
+                        sum(t * v for t, v in zip(sub_typical, sub_vol)) / sub_vsum
+                    )
+                prior_dists = [c - vw for c, vw in zip(prior_closes, prior_vwaps)]
+                avg_prior_dist = sum(prior_dists) / max(1, len(prior_dists))
+                signal_c_vwap_expanding = (
+                    cur_dist > 0 and cur_dist > avg_prior_dist
+                )
+            else:
+                cur_dist = vwap - last_close
+                # Simplified for puts: just check close < vwap with
+                # distance growing over last 3 bars
+                signal_c_vwap_expanding = (
+                    cur_dist > 0 and
+                    (closes[-1] < closes[-2] < closes[-3]
+                     if len(closes) >= 3 else False)
+                )
+
+            upside_signals_present = sum([
+                signal_a_new_extreme,
+                signal_b_volume_rising,
+                signal_c_vwap_expanding,
+            ])
+
+            if upside_signals_present == 0:
+                # No continuation signal while in profit on 0DTE = take it
+                return ExitDecision(
+                    True,
+                    (f"zdte_exhaustion:pnl={pnl:+.2%}_no_upside_signal"
+                     f"_(new_hi={signal_a_new_extreme},"
+                     f"vol_rising={signal_b_volume_rising},"
+                     f"vwap_exp={signal_c_vwap_expanding})"),
+                    layer=0,
+                )
+
+        # ---- Active-downside detector ----
+        # Operator: "if it shows downside, sell it asap and if you find
+        # better entry later, go for it."
+        #
+        # Any ONE of 3 downside signals (for long call — mirror for put)
+        # closes the position while in min profit:
+        #   (i)   Last close below VWAP AND distance growing
+        #   (ii)  2+ consecutive red bars with volume > 1.2× baseline
+        #   (iii) Most recent bar put in a lower high vs prior 3 bars
+        if (self.cfg.active_downside_enabled
+                and bars is not None and len(bars) >= 10):
+            # DTE-aware minimum profit
+            if dte == 0:
+                min_pnl = self.cfg.active_downside_min_pnl_0dte
+            elif dte >= 14:
+                min_pnl = self.cfg.active_downside_min_pnl_swing
+            else:
+                min_pnl = self.cfg.active_downside_min_pnl_short
+            if pnl >= min_pnl:
+                is_bullish = (pos.right == OptionRight.CALL)
+                recent = bars[-10:]
+                highs = [b.high for b in recent]
+                lows = [b.low for b in recent]
+                closes = [b.close for b in recent]
+                opens = [b.open for b in recent]
+                volumes = [b.volume or 0 for b in recent]
+
+                # VWAP + distance-growing
+                typical = [(h + l + c) / 3 for h, l, c in zip(highs, lows, closes)]
+                tpv = sum(t * v for t, v in zip(typical, volumes))
+                vsum = sum(volumes) or 1
+                vwap = tpv / vsum
+
+                # Baseline volume (first 7 bars)
+                base_vol = (sum(volumes[:7]) / 7) if len(volumes) >= 7 else 0
+
+                if is_bullish:
+                    # (i) Below VWAP with distance growing (more
+                    # negative than it was 2 bars ago)
+                    cur_gap = closes[-1] - vwap
+                    prior_gap = closes[-3] - vwap if len(closes) >= 3 else cur_gap
+                    sig_i_vwap_down = (
+                        cur_gap < 0 and cur_gap < prior_gap
+                    )
+                    # (ii) 2+ red bars with vol > 1.2x baseline
+                    recent_red_count = sum(
+                        1 for o, c in zip(opens[-3:], closes[-3:]) if c < o
+                    )
+                    recent_vol_surge = (
+                        base_vol > 0
+                        and sum(volumes[-3:]) / 3 > 1.2 * base_vol
+                    )
+                    sig_ii_red_volume = (
+                        recent_red_count >= 2 and recent_vol_surge
+                    )
+                    # (iii) Lower high (most recent high < max of prior 3)
+                    sig_iii_lower_high = (
+                        len(highs) >= 4 and highs[-1] < max(highs[-4:-1])
+                    )
+                    which = []
+                    if sig_i_vwap_down:  which.append("vwap_break_down")
+                    if sig_ii_red_volume: which.append("red_vol_surge")
+                    if sig_iii_lower_high: which.append("lower_high")
+                    if which:
+                        return ExitDecision(
+                            True,
+                            (f"active_downside:{','.join(which)}"
+                             f"_pnl={pnl:+.2%}_dte={dte}"),
+                            layer=0,
+                        )
+                else:
+                    # Long put — mirror logic
+                    cur_gap = vwap - closes[-1]
+                    prior_gap = vwap - closes[-3] if len(closes) >= 3 else cur_gap
+                    sig_i_vwap_up = (
+                        cur_gap < 0 and cur_gap < prior_gap
+                    )
+                    recent_green_count = sum(
+                        1 for o, c in zip(opens[-3:], closes[-3:]) if c > o
+                    )
+                    recent_vol_surge = (
+                        base_vol > 0
+                        and sum(volumes[-3:]) / 3 > 1.2 * base_vol
+                    )
+                    sig_ii_green_volume = (
+                        recent_green_count >= 2 and recent_vol_surge
+                    )
+                    sig_iii_higher_low = (
+                        len(lows) >= 4 and lows[-1] > min(lows[-4:-1])
+                    )
+                    which = []
+                    if sig_i_vwap_up:     which.append("vwap_break_up")
+                    if sig_ii_green_volume: which.append("green_vol_surge")
+                    if sig_iii_higher_low: which.append("higher_low")
+                    if which:
+                        return ExitDecision(
+                            True,
+                            (f"active_upside_vs_put:{','.join(which)}"
+                             f"_pnl={pnl:+.2%}_dte={dte}"),
+                            layer=0,
+                        )
 
         # ---- Chart-reversal detectors ----
         # Operator: "the algo needs to be intelligent enough monitoring

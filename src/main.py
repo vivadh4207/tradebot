@@ -1443,9 +1443,12 @@ class TradeBot:
                             "profit_lock_swing": "Swing profit-lock — loose threshold let it breathe, then locked",
                             "llm_urgent_close": "LLM chart review said URGENT CLOSE — auto-executed without waiting for operator",
                             "llm_urgent_trim": "LLM said urgent trim — closed 50%, trailing the rest",
-                            "absolute_drawdown_0dte": "0DTE down >5% from entry — hard cut (no peak memory needed)",
-                            "absolute_drawdown_short": "Short-dated down >8% from entry — hard cut",
-                            "absolute_drawdown_swing": "Swing down >12% from entry — hard cut",
+                            "absolute_drawdown_0dte": "0DTE down >3% from entry — hard cut (no peak memory needed)",
+                            "absolute_drawdown_short": "Short-dated down >4% from entry — hard cut",
+                            "absolute_drawdown_swing": "Swing down >5% from entry — hard cut",
+                            "zdte_exhaustion": "0DTE in profit but chart shows NO upside signal — took the gain before theta ate it (no new high, flat volume, VWAP not expanding)",
+                            "active_downside": "Chart is ACTIVELY going against us (VWAP break / red volume surge / lower high) — cut and look for a better re-entry",
+                            "active_upside_vs_put": "Long put but chart is going UP — thesis invalidated, cut and reassess direction",
                         }
                         prefix = reason_raw.split(":")[0]
                         why = reason_human.get(prefix, reason_raw)
