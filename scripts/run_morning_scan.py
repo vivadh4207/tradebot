@@ -72,15 +72,30 @@ class TickerScore:
 
 def _screen_ticker(mp: MultiProvider, symbol: str,
                     news_counter: Dict[str, int]) -> Optional[TickerScore]:
+    # Defense-in-depth: reject obviously-bad symbols before hitting the
+    # network. Must be 2-5 uppercase letters, not in the blocklist.
+    from src.intelligence.symbol_scanner import (
+        _VALID_SYMBOL_RE, _BLOCKED_SYMBOLS,
+    )
+    if (not symbol or len(symbol) < 2 or len(symbol) > 5
+            or not _VALID_SYMBOL_RE.match(symbol)
+            or symbol in _BLOCKED_SYMBOLS):
+        return None
     ts = TickerScore(symbol=symbol)
     # 1. Live quote + day change
     q = mp.latest_quote(symbol)
     if q is None:
         return None
+    if q.mid is None or q.mid <= 0:
+        return None
     ts.spot = q.mid
-    # yfinance has fast day-change
+    # yfinance has fast day-change. Silence its "possibly delisted"
+    # stderr spam for symbols that aren't tickers — the ticker got
+    # through the blocklist somehow; we just want to drop it quietly.
     try:
+        import logging as _lg
         import yfinance as yf
+        _lg.getLogger("yfinance").setLevel(_lg.ERROR)
         t = yf.Ticker(symbol)
         fi = getattr(t, "fast_info", None)
         if fi is not None:
@@ -154,18 +169,25 @@ def _screen_ticker(mp: MultiProvider, symbol: str,
 
 
 def _count_news_mentions(mp: MultiProvider) -> Dict[str, int]:
-    """Pool market-wide news across providers, extract ticker mentions."""
-    import re as _re
+    """Pool market-wide news across providers, extract ticker mentions.
+
+    Uses the canonical extractor in symbol_scanner._extract_tickers_from_text
+    which respects _BLOCKED_SYMBOLS — otherwise headlines like
+    "US markets fell on EU concerns" produce fake tickers "US" and "EU".
+    """
+    from src.intelligence.symbol_scanner import _extract_tickers_from_text
     counter: Dict[str, int] = {}
     items = mp.news(None, limit=60) or []
     for item in items:
         text = f"{item.headline} {item.summary}"
-        # $TICKER or standalone uppercase tokens (with blocklist in scanner)
-        for m in _re.finditer(r"\$?([A-Z]{1,5})\b", text):
-            sym = m.group(1)
+        for sym in _extract_tickers_from_text(text):
             counter[sym] = counter.get(sym, 0) + 1
+        # Provider-native tickers (Finnhub, Polygon emit these) — more
+        # trustworthy than regex-extracted ones, so weight them 2x.
         for t in (item.tickers or []):
-            t = t.upper()
+            t = t.upper().strip()
+            if not t or len(t) < 2 or not t.isalpha():
+                continue
             counter[t] = counter.get(t, 0) + 2
     return counter
 

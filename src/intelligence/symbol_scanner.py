@@ -42,6 +42,25 @@ _BLOCKED_SYMBOLS = {
     "IT", "AI", "ML", "API", "NYSE", "NASDAQ", "SPX", "DOW",
     "AM", "PM", "EST", "ET", "UTC", "GMT",
     "I", "A", "AN", "THE", "OR", "AND",
+    # Geographic / political abbreviations that are NOT US tickers
+    "US", "EU", "UK", "UN", "NATO", "WHO", "G7", "G20", "OPEC",
+    # Economic indicators / policy bodies
+    "GDP", "CPI", "PPI", "FOMC", "ECB", "BOE", "BOJ", "PBOC",
+    "FX", "USD", "EUR", "GBP", "JPY", "CNY",
+    "SEC", "FTC", "EPA", "IRS", "DOJ", "FDA", "FAA", "FBI", "CIA",
+    "ZEW", "IFO", "NFP", "ADP",
+    # Common single-letter noise (markets rarely use 1-letter tickers
+    # in news headlines — "A" is the only US 1-letter and it's rare)
+    "S", "P", "U", "E", "V", "M", "N", "O", "B", "W", "Y", "Z",
+    # Two-letter geography / state abbreviations that aren't tickers
+    "UT", "NY", "CA", "TX", "FL", "NJ", "VA", "AZ", "CO", "WA",
+    "IL", "OH", "PA", "MA", "GA", "MI", "NC", "TN", "MO", "MN",
+    # Common English words / noise
+    "BUY", "SELL", "HOLD", "TOP", "LOW", "HIGH", "NEW", "OLD",
+    "OPEN", "CLOSE", "DAY", "WEEK", "YEAR", "NOW", "ETC",
+    "BIG", "MOST", "LESS", "MORE", "ALL", "NONE", "YES", "NO",
+    "OF", "TO", "IN", "ON", "AT", "BY", "FOR", "VS",
+    "GLP",     # not a US ticker (GLP-1 refs from pharma news)
 }
 
 
