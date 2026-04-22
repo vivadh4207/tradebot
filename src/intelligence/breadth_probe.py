@@ -244,6 +244,12 @@ class BreadthProbe:
     def is_risk_off(self) -> bool:
         return self.snapshot().is_risk_off
 
+    # Backward-compat alias — main.py + signal runners import this name.
+    # Without it those callers hit AttributeError silently and the
+    # breadth score appears as None in every market_state_snapshot log.
+    def latest_snapshot(self) -> BreadthSnapshot:
+        return self.snapshot()
+
     # ------------ error reporting ------------
 
     def _report(self, scope: str, exc: Exception) -> None:

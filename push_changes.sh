@@ -50,6 +50,7 @@ git add \
   src/exits/fast_exit.py \
   src/intelligence/groq_client.py \
   src/intelligence/ollama_client.py \
+  src/intelligence/breadth_probe.py \
   src/intelligence/options_research.py \
   src/intelligence/position_advisor.py \
   src/intelligence/saves_tracker.py \

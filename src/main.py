@@ -1849,10 +1849,16 @@ class TradeBot:
                 breadth_val = None
                 if hasattr(self, "breadth_probe") and self.breadth_probe:
                     try:
-                        breadth_val = self.breadth_probe.latest_snapshot()
-                        if isinstance(breadth_val, dict):
-                            breadth_val = breadth_val.get("score")
-                    except Exception:
+                        snap = self.breadth_probe.latest_snapshot()
+                        # Handle both BreadthSnapshot dataclass + dict shape
+                        if hasattr(snap, "score"):
+                            breadth_val = snap.score
+                        elif isinstance(snap, dict):
+                            breadth_val = snap.get("score")
+                        elif isinstance(snap, (int, float)):
+                            breadth_val = float(snap)
+                    except Exception as _be:                  # noqa: BLE001
+                        log.info("breadth_snapshot_err", err=str(_be)[:120])
                         breadth_val = None
                 log.info(
                     "market_state_snapshot",
