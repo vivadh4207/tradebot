@@ -242,8 +242,16 @@ def build_llm_client_for(role: str):
     if role in ("research", "audit", "macro", "catalyst", "chat_70b"):
         g = build_groq_client()
         if g is not None:
-            model = (_os.getenv("LLM_AUDITOR_MODEL", "").strip()
-                     or "llama-3.3-70b-versatile")
+            # Env override ONLY honored if it's already a Groq-native
+            # model tag. Ollama-style tags like "llama3.1:8b" are legacy
+            # from the 16GB Mac era and would be misleading in logs/UI
+            # (Groq doesn't host 8B; we'd actually run 70B but the UI
+            # would say 8B). Use the Groq default unless the override
+            # is a legit Groq tag.
+            override = (_os.getenv("LLM_AUDITOR_MODEL", "").strip()
+                        or _os.getenv("LLM_GROQ_MODEL", "").strip())
+            groq_native = override and not (":" in override)
+            model = override if groq_native else "llama-3.3-70b-versatile"
             return g, model
     # Fall through to Ollama
     try:
