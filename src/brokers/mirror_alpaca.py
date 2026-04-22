@@ -74,6 +74,7 @@ class MirrorAlpacaBroker(PaperBroker):
     """PaperBroker + best-effort mirror of every submit to Alpaca paper."""
 
     def __init__(self, *args, alpaca_broker=None,
+                  tradier_broker=None,
                   mirror_queue_size: int = 256,
                   retry_queue_path: str = "logs/alpaca_mirror_retry.jsonl",
                   max_retries_per_order: int = 6,
@@ -81,9 +82,13 @@ class MirrorAlpacaBroker(PaperBroker):
                   **kwargs):
         super().__init__(*args, **kwargs)
         self._alpaca = alpaca_broker
+        self._tradier = tradier_broker
         self._mirror_stop = threading.Event()
         self._mirror_queue: "queue.Queue[Order]" = queue.Queue(maxsize=mirror_queue_size)
+        # Second queue for Tradier (independent retry / backoff).
+        self._tradier_queue: "queue.Queue[Order]" = queue.Queue(maxsize=mirror_queue_size)
         self._mirror_first_ok_logged = False
+        self._tradier_first_ok_logged = False
         # Persistent retry queue. Orders that fail to submit are
         # appended here and replayed by the worker until success or
         # max_retries. Prevents trades from being silently dropped
@@ -111,6 +116,18 @@ class MirrorAlpacaBroker(PaperBroker):
             self._mirror_thread = t
         else:
             self._mirror_thread = None
+        # Independent Tradier mirror worker. Runs in parallel with
+        # Alpaca — each failure doesn't affect the other.
+        if self._tradier is not None:
+            tt = threading.Thread(
+                target=self._tradier_worker,
+                name="tradier-mirror",
+                daemon=True,
+            )
+            tt.start()
+            self._tradier_thread = tt
+        else:
+            self._tradier_thread = None
 
     def submit(self, order: Order, *,
                 contract: Optional[OptionContract] = None,
@@ -125,25 +142,31 @@ class MirrorAlpacaBroker(PaperBroker):
             auto_stop_loss=auto_stop_loss,
         )
         # Mirror: only if paper actually filled (no point mirroring a
-        # rejected-order path) AND the mirror is configured.
-        if fill is not None and self._alpaca is not None:
-            try:
-                self._mirror_queue.put_nowait(order)
-            except queue.Full:
-                # Drop oldest, add newest — preserves recency during
-                # sustained Alpaca outages.
-                try:
-                    self._mirror_queue.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
-                    self._mirror_queue.put_nowait(order)
-                except queue.Full:
-                    _log.warning(
-                        "alpaca_mirror_queue_full dropping symbol=%s qty=%d",
-                        order.symbol, order.qty,
-                    )
+        # rejected-order path) AND at least one mirror is configured.
+        if fill is not None:
+            self._tee_to_queue(order, self._mirror_queue, "alpaca") \
+                if self._alpaca is not None else None
+            self._tee_to_queue(order, self._tradier_queue, "tradier") \
+                if self._tradier is not None else None
         return fill
+
+    def _tee_to_queue(self, order: Order, q: "queue.Queue[Order]",
+                       label: str) -> None:
+        """Non-blocking queue put with drop-oldest on overflow."""
+        try:
+            q.put_nowait(order)
+        except queue.Full:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                q.put_nowait(order)
+            except queue.Full:
+                _log.warning(
+                    "%s_mirror_queue_full dropping symbol=%s qty=%d",
+                    label, order.symbol, order.qty,
+                )
 
     def close(self) -> None:
         """Shut down the mirror worker cleanly. Called on bot shutdown."""
@@ -376,6 +399,34 @@ class MirrorAlpacaBroker(PaperBroker):
                     except Exception:
                         pass
                     self._backlog_alerted = True
+
+    def _tradier_worker(self) -> None:
+        """Independent worker for Tradier mirroring. Simpler than the
+        Alpaca worker (no persistent retry file yet — sandbox failures
+        are rare). Logs first-success banner, warns on each failure
+        with rate-limited alerts."""
+        import time as _time
+        while not self._mirror_stop.is_set():
+            try:
+                order = self._tradier_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                self._tradier.submit(order)
+                if not self._tradier_first_ok_logged:
+                    _log.info("tradier_mirror_ok first_post symbol=%s qty=%d",
+                              order.symbol, order.qty)
+                    self._tradier_first_ok_logged = True
+                else:
+                    _log.info(
+                        "tradier_mirror_submitted symbol=%s qty=%d side=%s",
+                        order.symbol, order.qty, order.side.value,
+                    )
+            except Exception as e:                      # noqa: BLE001
+                _log.warning(
+                    "tradier_mirror_failed symbol=%s err=%s",
+                    order.symbol, e,
+                )
 
     # --- persistent retry queue helpers ---
     def _persist_retry(self, order: Order, retry_count: int) -> None:

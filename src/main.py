@@ -273,6 +273,22 @@ class TradeBot:
                 log.warning("alpaca_mirror_init_failed", err=str(e))
                 alpaca_mirror_broker = None
 
+        # Optional Tradier mirror — orders also fire into a Tradier
+        # sandbox account for dual-broker paper validation. Activated
+        # when TRADIER_TOKEN (or alias) is set; no settings.yaml flag
+        # required. Silently no-op on auth failure.
+        tradier_mirror_broker = None
+        if bool(settings.get("broker.mirror_to_tradier", True)):
+            try:
+                from .brokers.tradier_adapter import build_tradier_broker
+                tradier_mirror_broker = build_tradier_broker()
+                if tradier_mirror_broker is not None:
+                    log.info("tradier_mirror_initialized",
+                             account=tradier_mirror_broker._account[:6] + "...")
+            except Exception as e:                      # noqa: BLE001
+                log.info("tradier_mirror_init_skipped", err=str(e))
+                tradier_mirror_broker = None
+
         if alpaca_mirror_broker is not None:
             from .brokers.mirror_alpaca import MirrorAlpacaBroker
             self.broker = MirrorAlpacaBroker(
@@ -282,13 +298,17 @@ class TradeBot:
                 snapshot_path=snap_path,
                 slippage_model=slip_model,
                 alpaca_broker=alpaca_mirror_broker,
+                tradier_broker=tradier_mirror_broker,
             )
             # Inject a quote callback so reconcile can fetch live option
             # bid/ask before sending close orders. Prevents blind $0.01
             # closes that either don't fill or dump positions at garbage
             # prices.
             self.broker._close_quote_fn = self._option_quote_for_close
-            log.info("broker", kind="paper+alpaca_mirror")
+            kind = "paper+alpaca_mirror"
+            if tradier_mirror_broker is not None:
+                kind += "+tradier_mirror"
+            log.info("broker", kind=kind)
         else:
             self.broker = PaperBroker(
                 starting_equity=settings.paper_equity,
