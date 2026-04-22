@@ -391,6 +391,10 @@ class ExecutionChain:
 
         Skip gracefully when we don't have enough bars.
         """
+        import os as _os
+        if _os.getenv("TRADEBOT_F19_DISABLE", "").strip() in ("1", "true", "yes"):
+            return FilterResult(True, "price_action_disabled_env",
+                                advisory=True)
         pa_cfg = (self._s.get("price_action", {}) or {})
         if not pa_cfg.get("enabled", True):
             return FilterResult(True, "price_action_disabled")

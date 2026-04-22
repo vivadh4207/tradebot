@@ -103,7 +103,7 @@ execution:
   # are rare but liquidity is still ample). Stocks need the surge for
   # momentum confirmation.
   min_volume_confirmation: 1.2        # legacy single-value (fallback)
-  min_volume_confirmation_etf: 0.40   # SPY, QQQ, IWM, XLF, etc. — loosened
+  min_volume_confirmation_etf: 0.25   # SPY, QQQ, IWM, XLF, etc. — loosened
                                         # after operator noted 0.55 still blocked
                                         # trades during active-but-thin sessions
   min_volume_confirmation_stock: 1.20 # individual stocks
@@ -384,8 +384,8 @@ signals:
 price_action:
   enabled: true
   window: 20                          # bars to measure
-  atr_floor_pct: 0.0010              # 0.10% ATR/spot floor for SPY/QQQ
-  range_floor_pct: 0.0025            # 0.25% range/mid floor
+  atr_floor_pct: 0.00015              # 0.10% ATR/spot floor for SPY/QQQ
+  range_floor_pct: 0.0010            # 0.25% range/mid floor
 
 breadth:
   enabled: true                    # composite risk-on/off probe
