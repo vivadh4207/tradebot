@@ -1112,8 +1112,16 @@ class TradeBot:
                             "fast_hard_cap": "Hit hard profit cap (+150%) — full close",
                             "fast_trailing_stop": "Retraced >10% from peak — locking the remaining gain",
                             "fast_0dte_scalp_timeout": "0DTE held past scalp window — theta was going to eat it",
-                            "momentum_reversal": "Underlying put in 3 consecutive bars against us — trend died",
+                            "momentum_reversal": "Underlying put in consecutive bars against us — trend died",
                             "volume_dry_up": "Volume fell below 50% baseline with no new high — interest faded",
+                            "profit_lock": "Profit-lock trailing — retraced past adaptive give-back from peak, took the gain",
+                            "profit_floor": "Hit the ratcheting floor — big peak, locked the tier minimum",
+                            "support_break": "Underlying closed below 5-bar support — thesis cracked, took profit",
+                            "resistance_break": "Underlying closed above 5-bar resistance — bearish thesis invalidated, took profit",
+                            "chart_lower_highs": "Chart made consecutive lower highs — trend rolling over, took profit",
+                            "chart_higher_lows": "Chart made consecutive higher lows — downtrend broken, took profit",
+                            "vwap_break": "Underlying lost VWAP — institutional value line gone, took profit",
+                            "vwap_break_up": "Underlying reclaimed VWAP — bearish thesis invalid, took profit",
                         }
                         prefix = reason_raw.split(":")[0]
                         why = reason_human.get(prefix, reason_raw)
@@ -1662,12 +1670,52 @@ class TradeBot:
         else:
             right = OptionRight.CALL
 
-        _dte_pool = self.s.get("execution.target_dte_pool", None) or []
-        if _dte_pool:
-            import random as _random
-            target_dte = int(_random.choice(_dte_pool))
+        # Weighted strategy-bucket allocation. Operator requested:
+        # "I like the long strategy but also experiment with 0DTE, swing
+        # so we have data." Each entry gets tagged with its bucket so
+        # the nightly report can compare P&L per strategy.
+        #
+        # Default allocation (overridable via execution.strategy_buckets):
+        #   0dte    -> DTE in [0, 1]         — same-day / overnight lottery
+        #   short   -> DTE in [2, 5, 7]      — directional swing
+        #   swing   -> DTE in [14, 21, 30]   — thesis has time to play out
+        #
+        # Runtime override honored via runtime_overrides.json key
+        # 'strategy_bucket_weights' = {"0dte": 30, "short": 30, "swing": 40}.
+        import random as _random
+        buckets_cfg = (self.s.get("execution.strategy_buckets", None) or {
+            "0dte":  {"dtes": [0, 1],          "weight": 20},
+            "short": {"dtes": [2, 5, 7],       "weight": 30},
+            "swing": {"dtes": [14, 21, 30],    "weight": 50},
+        })
+        try:
+            from .core.runtime_overrides import get_override
+            live_weights = get_override("strategy_bucket_weights", None)
+        except Exception:
+            live_weights = None
+        if isinstance(live_weights, dict):
+            for name, w in live_weights.items():
+                if name in buckets_cfg:
+                    buckets_cfg[name]["weight"] = int(w)
+        # Weighted roll
+        names = list(buckets_cfg.keys())
+        weights = [max(0, int(buckets_cfg[n].get("weight", 0))) for n in names]
+        if sum(weights) > 0:
+            strategy_bucket = _random.choices(names, weights=weights, k=1)[0]
+            dtes = buckets_cfg[strategy_bucket].get("dtes", [7])
+            target_dte = int(_random.choice(dtes))
         else:
-            target_dte = int(self.s.get("execution.target_dte", 7))
+            # Fallback to legacy target_dte_pool / target_dte if buckets
+            # are misconfigured (all weights 0).
+            _dte_pool = self.s.get("execution.target_dte_pool", None) or []
+            if _dte_pool:
+                target_dte = int(_random.choice(_dte_pool))
+            else:
+                target_dte = int(self.s.get("execution.target_dte", 7))
+            strategy_bucket = (
+                "0dte" if target_dte == 0 else
+                "short" if target_dte <= 7 else "swing"
+            )
         chain = self.chain_provider.chain(sig.symbol, spot, target_dte=target_dte)
         min_oi = int(self.s.get("execution.min_open_interest", 100))
         min_tv = int(self.s.get("execution.min_today_option_volume", 50))
@@ -1882,6 +1930,7 @@ class TradeBot:
             f"|spot={spot:.2f}|vwap={vwap:.2f}"
             f"|bid={contract.bid:.2f}|ask={contract.ask:.2f}"
             f"|qty_policy={qty_reason}|limit={limit:.2f}"
+            f"|strategy={strategy_bucket}"
         )
         order = Order(symbol=contract.symbol, side=Side.BUY, qty=n,
                       is_option=True, limit_price=limit,

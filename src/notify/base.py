@@ -154,6 +154,8 @@ _TITLE_TO_CHANNEL = {
     "scan_premarket": {"scan_premarket", "premarket_scan", "premarket"},
     # Post-market recap (16:30 ET weekdays — what moved + tomorrow).
     "scan_postmarket": {"scan_postmarket", "postmarket_scan", "postmarket"},
+    # Strategy-bucket P&L comparison (0DTE vs short vs swing).
+    "strategy_report": {"strategy_report", "strategy", "bucket_report"},
 }
 
 

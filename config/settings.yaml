@@ -128,6 +128,25 @@ execution:
   # time to play out (2-5%/day theta) without capital tied up forever.
   target_dte: 14
   target_dte_pool: [0, 1, 7, 14, 30]
+  # ---- Strategy-bucket allocation (operator experiment) ----
+  # Each entry is randomly assigned to a bucket weighted by `weight`.
+  # Entries are tagged with their bucket in the order `tag` field
+  # (|strategy=<bucket>) so nightly P&L reports can compare them.
+  #
+  # Default mix: 50% swing (time for thesis to work), 30% short (2-7d
+  # directional bets), 20% 0DTE (same-day lottery — keep small while
+  # learning). Adjust weights to re-tilt the mix. Runtime override
+  # key: 'strategy_bucket_weights' (Discord buttons can flip live).
+  strategy_buckets:
+    "0dte":
+      dtes: [0, 1]
+      weight: 20
+    "short":
+      dtes: [2, 5, 7]
+      weight: 30
+    "swing":
+      dtes: [14, 21, 30]
+      weight: 50
   # Entry spread aggressiveness. 0.00 = pay bid (won't fill), 1.00 =
   # pay ask. 0.15 = bid + 15% of spread — we sit close to the bid
   # and let market makers come to us. If we don't fill in

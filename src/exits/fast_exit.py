@@ -64,17 +64,23 @@ class FastExitConfig:
 
     # ---- Intelligent profit protection (operator-requested) ----
     # "If we're in profit and price moves the other way we can lose
-    #  even if SL didn't hit. Need smarter detection."
+    #  even if SL didn't hit. Need smarter detection. +75% went back
+    #  to +1% — we need to detect trend reversal from charts."
     #
     # Profit-lock trailing: activates at `profit_lock_arm_pct`, closes
-    # when pnl retraces to `profit_lock_give_back_pct`. Works for
-    # single-contract positions (doesn't require scale-out to arm).
+    # when pnl retraces past the adaptive give-back threshold. Works
+    # for single-contract positions (doesn't require scale-out to arm).
+    # Bigger peaks get tighter give-backs so massive winners don't
+    # evaporate.
     profit_lock_enabled: bool = True
-    profit_lock_arm_pct: float = 0.15        # arm once we've been +15%
-    profit_lock_give_back_pct: float = 0.30  # close if we give back 30% of peak gain
-    # Example: peak = +40%, give_back = 30% → close at +28% (40 * 0.70).
-    # Example: peak = +20%, give_back = 30% → close at +14%.
-    # Never lets a +20%+ winner turn into a loser.
+    profit_lock_arm_pct: float = 0.10        # arm once we've been +10% (was 0.15)
+    profit_lock_give_back_pct: float = 0.30  # base give-back (adaptive below)
+    # Adaptive give-back by peak tier:
+    #   peak >= +100% → 15% give-back (lock in big winners hard)
+    #   peak >= +50%  → 20% give-back
+    #   peak >= +25%  → 25% give-back
+    #   peak >= +10%  → 35% give-back (still learning the setup)
+    profit_lock_tiers_enabled: bool = True
 
     # Ratcheting profit floor: once we've been above these thresholds,
     # SL tightens up. Ensures we don't give back big gains.
@@ -89,6 +95,26 @@ class FastExitConfig:
     # lower highs / higher lows against us.
     support_break_enabled: bool = True
     support_break_min_profit: float = 0.08   # only fires if up 8%+
+
+    # Chart-reversal detectors — fire while in profit when the
+    # underlying's bar structure screams "trend changed":
+    #
+    #   a. Lower-high pattern (for long calls): the most recent bar's
+    #      high is lower than the prior bar's high which was lower
+    #      than the bar before that. Classic trend-break signature.
+    #      For long puts: higher-low mirror.
+    #   b. VWAP break: underlying closes below its session VWAP (for
+    #      long calls). Institutional "value" line is lost — most
+    #      day-traders close here.
+    chart_reversal_enabled: bool = True
+    chart_reversal_min_profit: float = 0.05    # only fires +5%+
+    # Lower-high pattern: 2 consecutive lower highs = trend weakening,
+    # 3 = trend reversing. Conservative default = 2 (faster protect).
+    lower_high_bars: int = 2
+    # VWAP break: close crosses below session VWAP by this margin (in
+    # percent of price) before we declare thesis broken. Tiny margin
+    # avoids thrashing on sideways chop at VWAP.
+    vwap_break_margin_pct: float = 0.001      # 0.1% (e.g. $0.50 on $500)
 
 
 class FastExitEvaluator:
@@ -246,13 +272,25 @@ class FastExitEvaluator:
         if (self.cfg.profit_lock_enabled
                 and peak_pnl_attr is not None
                 and peak_pnl_attr >= self.cfg.profit_lock_arm_pct):
-            give_back = self.cfg.profit_lock_give_back_pct
+            # Adaptive give-back: bigger winners get tighter protection.
+            # Operator: "+75% went back to +1% — can't let that happen."
+            if self.cfg.profit_lock_tiers_enabled:
+                if peak_pnl_attr >= 1.00:
+                    give_back = 0.15    # +100%+ peak → lock hard
+                elif peak_pnl_attr >= 0.50:
+                    give_back = 0.20
+                elif peak_pnl_attr >= 0.25:
+                    give_back = 0.25
+                else:
+                    give_back = 0.35    # +10-25% peak, still learning
+            else:
+                give_back = self.cfg.profit_lock_give_back_pct
             close_threshold = peak_pnl_attr * (1.0 - give_back)
             if pnl <= close_threshold and pnl > 0:
                 return ExitDecision(
                     True,
                     f"profit_lock:peak={peak_pnl_attr:+.2%}_now={pnl:+.2%}"
-                    f"_gave_back_{give_back:.0%}",
+                    f"_gave_back_{give_back:.0%}_floor={close_threshold:+.2%}",
                     layer=0,
                 )
 
@@ -311,6 +349,72 @@ class FastExitEvaluator:
                         f"={prior_high:.2f}_pnl={pnl:+.2%}",
                         layer=0,
                     )
+
+        # ---- Chart-reversal detectors ----
+        # Operator: "the algo needs to be intelligent enough monitoring
+        # charts that it's heading to another way — close and get
+        # profit." Two new layers:
+        #   (1) Lower-high / higher-low sequence — trend change
+        #   (2) VWAP break — institutional value line lost
+        if (self.cfg.chart_reversal_enabled
+                and bars is not None
+                and len(bars) >= max(self.cfg.lower_high_bars + 1, 10)
+                and pnl >= self.cfg.chart_reversal_min_profit):
+            is_bullish = (pos.right == OptionRight.CALL)
+            lh_n = int(self.cfg.lower_high_bars)
+            tail = bars[-(lh_n + 1):]        # need lh_n+1 bars to compare
+            # (1) Lower-high pattern for long calls
+            if is_bullish:
+                highs_seq = [b.high for b in tail]
+                # Strictly decreasing high sequence = lower-high pattern
+                if all(highs_seq[i] > highs_seq[i + 1]
+                        for i in range(len(highs_seq) - 1)):
+                    return ExitDecision(
+                        True,
+                        f"chart_lower_highs:{lh_n}_consec_lower_highs"
+                        f"_pnl={pnl:+.2%}_take_profit",
+                        layer=0,
+                    )
+            else:
+                # Higher-low pattern for long puts = uptrend resuming
+                lows_seq = [b.low for b in tail]
+                if all(lows_seq[i] < lows_seq[i + 1]
+                        for i in range(len(lows_seq) - 1)):
+                    return ExitDecision(
+                        True,
+                        f"chart_higher_lows:{lh_n}_consec_higher_lows"
+                        f"_pnl={pnl:+.2%}_take_profit",
+                        layer=0,
+                    )
+            # (2) VWAP break — compute rolling VWAP on the supplied bars
+            # (approximates session VWAP well over 30+ bars). If the
+            # last close crosses below VWAP for a long call (above VWAP
+            # for a long put) by more than vwap_break_margin_pct,
+            # institutional value line is lost → take profit.
+            try:
+                typical = [(b.high + b.low + b.close) / 3 for b in bars]
+                vols = [max(1.0, b.volume or 0) for b in bars]
+                tp_vol_sum = sum(t * v for t, v in zip(typical, vols))
+                vol_sum = sum(vols) or 1.0
+                vwap = tp_vol_sum / vol_sum
+                last_close = bars[-1].close
+                margin = self.cfg.vwap_break_margin_pct * max(vwap, 1e-9)
+                if is_bullish and last_close < (vwap - margin):
+                    return ExitDecision(
+                        True,
+                        f"vwap_break:close={last_close:.2f}<vwap={vwap:.2f}"
+                        f"_pnl={pnl:+.2%}_take_profit",
+                        layer=0,
+                    )
+                if (not is_bullish) and last_close > (vwap + margin):
+                    return ExitDecision(
+                        True,
+                        f"vwap_break_up:close={last_close:.2f}>vwap={vwap:.2f}"
+                        f"_pnl={pnl:+.2%}_take_profit",
+                        layer=0,
+                    )
+            except Exception:
+                pass
 
         # Scale-out at first PT hit: close half, flag pos.scaled_out,
         # let the remainder trail the high. Requires at least 2 contracts
