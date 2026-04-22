@@ -36,6 +36,11 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--symbols", default="SPY,QQQ",
                      help="Comma-separated underlyings (default: SPY,QQQ)")
+    ap.add_argument("--dynamic", action="store_true",
+                     help="Also scan news + movers for additional tickers "
+                          "via SymbolScanner, append top-N to --symbols.")
+    ap.add_argument("--max-dynamic", type=int, default=4,
+                     help="Max extra symbols from dynamic scan (default 4).")
     ap.add_argument("--model", default=None,
                      help="Override LLM model tag for this run.")
     ap.add_argument("--max-tokens", type=int, default=700)
@@ -50,6 +55,18 @@ def main() -> int:
         return 2
 
     mp = MultiProvider.from_env()
+
+    # Dynamic scan — append top-N trending tickers to the base list.
+    if args.dynamic:
+        try:
+            from src.intelligence.symbol_scanner import SymbolScanner
+            scanner = SymbolScanner(mp, base_universe=underlyings,
+                                      max_dynamic=int(args.max_dynamic))
+            underlyings = scanner.scan()
+            print(f"[dynamic] scanning underlyings: {underlyings}")
+        except Exception as e:
+            print(f"[dynamic] scan failed, using static list: {e}")
+
     agent = OptionsResearchAgent(
         mp,
         model_name=args.model,

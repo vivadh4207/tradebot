@@ -37,6 +37,12 @@ _QUEUE_PATH = "logs/llm_autotrade_queue.jsonl"
 _CONSUMED_PATH = "logs/llm_autotrade_consumed.json"
 _KILL_SWITCH_PATH = "logs/llm_autotrade.kill"
 _COUNTER_PATH = "logs/llm_autotrade_daily_counter.json"
+_CAP_OVERRIDE_PATH = "logs/llm_autotrade_cap_override.json"
+
+# Hard safety ceiling the operator cannot exceed even via override.
+# Paper mode means no capital at risk, but unbounded autotrade would
+# still burn API rate limits + distort backtest interpretation.
+_MAX_DAILY_CAP_HARD_LIMIT = 50
 
 
 # Whole-dollar strikes only for these symbols — rejects LLM hallucinations
@@ -144,6 +150,10 @@ class LLMAutotradeQueue:
     def counter_path(self) -> Path:
         return _resolve_path(_COUNTER_PATH, self._data_root)
 
+    @property
+    def cap_override_path(self) -> Path:
+        return _resolve_path(_CAP_OVERRIDE_PATH, self._data_root)
+
     # ---------- gating ----------
 
     def is_killed(self) -> bool:
@@ -172,6 +182,43 @@ class LLMAutotradeQueue:
             return int(d.get("count", 0))
         except Exception:
             return 0
+
+    def current_cap(self) -> int:
+        """Return the ACTIVE daily cap. Override file wins over the
+        config default; capped at _MAX_DAILY_CAP_HARD_LIMIT."""
+        p = self.cap_override_path
+        if not p.exists():
+            return self._max_per_day
+        try:
+            d = json.loads(p.read_text())
+            v = int(d.get("cap", self._max_per_day))
+            return max(1, min(_MAX_DAILY_CAP_HARD_LIMIT, v))
+        except Exception:
+            return self._max_per_day
+
+    def set_cap_override(self, new_cap: Optional[int]) -> int:
+        """Persist an override cap for today and beyond. Pass None to
+        clear override (go back to config default). Returns the
+        effective cap that will apply."""
+        p = self.cap_override_path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if new_cap is None:
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+            return self._max_per_day
+        new_cap = max(1, min(_MAX_DAILY_CAP_HARD_LIMIT, int(new_cap)))
+        p.write_text(json.dumps({"cap": new_cap}))
+        return new_cap
+
+    def reset_daily_counter(self) -> None:
+        """Zero today's trade counter. Useful when operator bumps the
+        cap and wants the new quota to reflect immediately."""
+        try:
+            self.counter_path.unlink()
+        except FileNotFoundError:
+            pass
 
     def _bump_counter(self) -> int:
         p = self.counter_path
@@ -247,7 +294,7 @@ class LLMAutotradeQueue:
         re-pick the same idea."""
         if self.is_killed():
             return None
-        if self.daily_counter() >= self._max_per_day:
+        if self.daily_counter() >= self.current_cap():
             return None
         with self._lock:
             self._maybe_refresh()
@@ -275,7 +322,9 @@ class LLMAutotradeQueue:
         return {
             "killed": self.is_killed(),
             "daily_count": self.daily_counter(),
-            "daily_cap": self._max_per_day,
+            "daily_cap": self.current_cap(),
+            "daily_cap_default": self._max_per_day,
+            "cap_override_active": self.current_cap() != self._max_per_day,
             "queue_fresh": len(fresh),
             "queue_total": len(self._cached_rows),
             "consumed": len(self._consumed),

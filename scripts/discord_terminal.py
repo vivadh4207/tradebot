@@ -705,6 +705,94 @@ def _build_app():
 
     # ------------------------- button panels -------------------------
 
+    class QuickQuestionsView(discord.ui.View):
+        """Six quick-question buttons for #8b-llm / #70b-llm / #tradebot-chat.
+
+        Clicking a button sends a pre-baked question through the SAME
+        LLM chat pipeline (including live options chain + news
+        enrichment when relevant). The channel's 70B/8B routing rules
+        apply — you get the right model per channel."""
+        def __init__(self):
+            super().__init__(timeout=None)
+
+        async def _ask(self, interaction, question: str):
+            await interaction.response.defer(thinking=True)
+            try:
+                if chat is None or not chat.cfg.enabled:
+                    await interaction.followup.send(
+                        "_chat is disabled — set `LLM_CHAT_ENABLED=1` in .env._",
+                        ephemeral=True,
+                    )
+                    return
+                model_override = _pick_chat_model_for_channel(interaction.channel.id)
+                is_70b = model_override is not None
+                ctx = _build_chat_context()
+                try:
+                    from src.intelligence.llm_chat import question_wants_options_context
+                    if question_wants_options_context(question):
+                        _enrich_context_with_options(ctx, question)
+                except Exception:
+                    pass
+                loop = asyncio.get_event_loop()
+                answer = await loop.run_in_executor(
+                    None,
+                    lambda: chat.answer(
+                        question, ctx,
+                        user_id=interaction.user.id,
+                        model_override=model_override,
+                        max_tokens_override=(CHAT_70B_MAX_TOKENS if is_70b else None),
+                    ),
+                )
+                tag = f" · model={model_override}" if model_override else ""
+                await interaction.followup.send(_truncate(answer) + tag)
+            except Exception as e:                      # noqa: BLE001
+                await interaction.followup.send(
+                    f"_chat failed — {type(e).__name__}: {str(e)[:150]}_",
+                    ephemeral=True,
+                )
+
+        @discord.ui.button(label="📊 Market read",
+                            style=discord.ButtonStyle.primary,
+                            custom_id="qq:market_read", row=0)
+        async def btn_market_read(self, interaction, _):
+            await self._ask(interaction,
+                "Give a concise market read right now — regime, VIX, breadth, what SPY and QQQ are doing.")
+
+        @discord.ui.button(label="🔍 Whats SPY doing?",
+                            style=discord.ButtonStyle.primary,
+                            custom_id="qq:spy", row=0)
+        async def btn_spy(self, interaction, _):
+            await self._ask(interaction,
+                "What is SPY doing right now? Price, trend, key levels, any setup forming?")
+
+        @discord.ui.button(label="🔍 Whats QQQ doing?",
+                            style=discord.ButtonStyle.primary,
+                            custom_id="qq:qqq", row=0)
+        async def btn_qqq(self, interaction, _):
+            await self._ask(interaction,
+                "What is QQQ doing right now? Price, trend, key levels, any setup forming?")
+
+        @discord.ui.button(label="💡 Top trade idea",
+                            style=discord.ButtonStyle.success,
+                            custom_id="qq:top_idea", row=1)
+        async def btn_top_idea(self, interaction, _):
+            await self._ask(interaction,
+                "Given current conditions, what is the single best options trade idea right now? Specific strike, expiry, direction, and reason.")
+
+        @discord.ui.button(label="📰 News pulse",
+                            style=discord.ButtonStyle.secondary,
+                            custom_id="qq:news", row=1)
+        async def btn_news(self, interaction, _):
+            await self._ask(interaction,
+                "What market news in the last 24h is most relevant to SPY / QQQ right now?")
+
+        @discord.ui.button(label="🧠 Bot health",
+                            style=discord.ButtonStyle.secondary,
+                            custom_id="qq:health", row=1)
+        async def btn_health(self, interaction, _):
+            await self._ask(interaction,
+                "How is the trading bot doing? Positions, recent signals, any issues, last audit.")
+
     class AutotradePanel(discord.ui.View):
         """Persistent autotrade control panel. One per channel; user
         runs `!autopanel` in the channel they want to control from.
@@ -867,6 +955,89 @@ def _build_app():
                     f"refresh failed: {e}", ephemeral=True,
                 )
 
+        @discord.ui.button(label="⬆ Cap +1", style=discord.ButtonStyle.secondary,
+                            custom_id="ta:cap_up", row=2)
+        async def btn_cap_up(self, interaction, _):
+            if not await self._authorized(interaction):
+                return
+            try:
+                from src.intelligence.llm_autotrade_queue import LLMAutotradeQueue
+                q = LLMAutotradeQueue()
+                new_cap = q.current_cap() + 1
+                applied = q.set_cap_override(new_cap)
+                _audit({"kind": "autopanel_cap_up", "user": interaction.user.id,
+                        "new_cap": applied})
+                await interaction.response.send_message(
+                    f"⬆ Cap raised to **{applied}** trades/day. "
+                    f"(Counter {q.daily_counter()}/{applied})", ephemeral=True,
+                )
+            except Exception as e:
+                await interaction.response.send_message(
+                    f"cap up failed: {e}", ephemeral=True,
+                )
+
+        @discord.ui.button(label="⬆⬆ Cap +5", style=discord.ButtonStyle.secondary,
+                            custom_id="ta:cap_up5", row=2)
+        async def btn_cap_up5(self, interaction, _):
+            if not await self._authorized(interaction):
+                return
+            try:
+                from src.intelligence.llm_autotrade_queue import LLMAutotradeQueue
+                q = LLMAutotradeQueue()
+                new_cap = q.current_cap() + 5
+                applied = q.set_cap_override(new_cap)
+                _audit({"kind": "autopanel_cap_up5", "user": interaction.user.id,
+                        "new_cap": applied})
+                await interaction.response.send_message(
+                    f"⬆⬆ Cap raised to **{applied}** trades/day.",
+                    ephemeral=True,
+                )
+            except Exception as e:
+                await interaction.response.send_message(
+                    f"cap up+5 failed: {e}", ephemeral=True,
+                )
+
+        @discord.ui.button(label="⬇ Reset Cap", style=discord.ButtonStyle.secondary,
+                            custom_id="ta:cap_reset", row=2)
+        async def btn_cap_reset(self, interaction, _):
+            if not await self._authorized(interaction):
+                return
+            try:
+                from src.intelligence.llm_autotrade_queue import LLMAutotradeQueue
+                q = LLMAutotradeQueue()
+                applied = q.set_cap_override(None)
+                _audit({"kind": "autopanel_cap_reset", "user": interaction.user.id,
+                        "new_cap": applied})
+                await interaction.response.send_message(
+                    f"⬇ Cap reset to config default: **{applied}** trades/day.",
+                    ephemeral=True,
+                )
+            except Exception as e:
+                await interaction.response.send_message(
+                    f"cap reset failed: {e}", ephemeral=True,
+                )
+
+        @discord.ui.button(label="♻ Reset Daily Counter",
+                            style=discord.ButtonStyle.danger,
+                            custom_id="ta:counter_reset", row=2)
+        async def btn_counter_reset(self, interaction, _):
+            if not await self._authorized(interaction):
+                return
+            try:
+                from src.intelligence.llm_autotrade_queue import LLMAutotradeQueue
+                q = LLMAutotradeQueue()
+                q.reset_daily_counter()
+                _audit({"kind": "autopanel_counter_reset",
+                        "user": interaction.user.id})
+                await interaction.response.send_message(
+                    "♻ Daily trade counter reset to 0.",
+                    ephemeral=True,
+                )
+            except Exception as e:
+                await interaction.response.send_message(
+                    f"counter reset failed: {e}", ephemeral=True,
+                )
+
     class ControlPanel(discord.ui.View):
         """Persistent button panel. `custom_id`s survive bot restart
         when we call client.add_view(ControlPanel()) on_ready."""
@@ -986,20 +1157,21 @@ def _build_app():
         # on every reconnect.
         client.add_view(ControlPanel())
         client.add_view(AutotradePanel())
+        client.add_view(QuickQuestionsView())
 
         if _hello_state["sent"]:
             _log.info("discord_terminal_hello_skipped reason=already_sent_this_process")
             return
 
-        # Startup hello — posts one line per configured channel so the
-        # operator can visually confirm every channel is wired up and
-        # which model is answering there. Only runs on the FIRST
-        # on_ready within this process; reconnects don't re-spam it.
+        # Channel-aware hellos. Instead of posting the same one-liner
+        # to every configured channel, we inspect each channel's name
+        # and post the panel + quick-question view that fits its
+        # purpose. A control-panel-named channel gets AutotradePanel +
+        # ControlPanel. An llm-named channel gets QuickQuestionsView.
+        # Other channels just get a minimal banner.
         ctx = _build_chat_context()
-        if chat is not None and ctx is not None:
-            base_hello = chat.hello(ctx)
-        else:
-            base_hello = "**tradebot online** · chat disabled"
+        base_hello = chat.hello(ctx) if (chat is not None and ctx is not None) \
+            else "**tradebot online**"
         sent_any = False
         for cid in sorted(CHANNEL_IDS):
             try:
@@ -1007,17 +1179,67 @@ def _build_app():
                 if ch is None:
                     _log.warning("discord_terminal_channel_missing id=%s", cid)
                     continue
+                name = (ch.name or "").lower() if hasattr(ch, "name") else ""
+                is_70b_chat = cid in CHAT_70B_CHANNEL_IDS
                 chat_suffix = ""
                 if chat is not None and chat.cfg.enabled:
-                    if cid in CHAT_70B_CHANNEL_IDS:
+                    if is_70b_chat:
                         chat_suffix = (f" · chat=ON ({CHAT_70B_MODEL}, 70B "
                                         "for detailed answers)")
                     else:
                         chat_suffix = f" · chat=ON ({chat.cfg.model_name})"
                 else:
                     chat_suffix = " · chat=OFF"
-                await ch.send(base_hello + chat_suffix
-                               + " — ask me anything")
+                header = base_hello + chat_suffix
+
+                # Route to an appropriate greeting based on channel
+                # name. Fall through to a minimal hello for unknown
+                # channels.
+                posted = False
+
+                # Control / admin channels get the button panels.
+                if any(k in name for k in ("control-panel", "sagarbot",
+                                             "dashboard-control")):
+                    await ch.send(header + "\n\n**Control panel** — click any button:",
+                                   view=ControlPanel())
+                    await ch.send("**LLM autotrade panel** — Enable/Disable/Research:",
+                                   view=AutotradePanel())
+                    posted = True
+
+                # Chat / LLM channels get QuickQuestionsView.
+                elif any(k in name for k in ("8b-llm", "70b-llm", "tradebot-chat",
+                                               "tradebot-market")):
+                    prompt = (
+                        f"{header}\n\n"
+                        "**Ask me anything** — free-form message or click a quick button below.\n"
+                        "Examples: `what looks good on SPY?`, `why did we skip that entry?`, "
+                        "`summarize today's signals`"
+                    )
+                    await ch.send(prompt, view=QuickQuestionsView())
+                    posted = True
+
+                # Terminal-style channels: banner + `!help` prompt.
+                elif any(k in name for k in ("terminal-access", "terminal")):
+                    await ch.send(
+                        header + "\n\n"
+                        "**Command terminal.** Type `!help` to see commands. "
+                        "Run `!autopanel` here to post an LLM-autotrade control panel."
+                    )
+                    posted = True
+
+                # Reason-for-entry / market-analysis channels — quiet
+                # banner since traffic is automated.
+                elif any(k in name for k in ("reasonforentry", "tradebot-reason")):
+                    await ch.send(
+                        header + " · *This channel receives automated signal "
+                        "rationales. Use `!summary` for a quick digest.*"
+                    )
+                    posted = True
+
+                # Catalyst / alerts / default — minimal one-liner.
+                if not posted:
+                    await ch.send(header + " — ask me anything")
+
                 sent_any = True
             except Exception as e:
                 _log.warning("discord_terminal_hello_failed cid=%s err=%s",
