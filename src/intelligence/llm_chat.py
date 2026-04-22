@@ -256,9 +256,36 @@ class LLMChat:
             raw = self._infer(prompt, model_override=model_override,
                               max_tokens_override=max_tokens_override)
         except Exception as e:
-            _log.warning("llm_chat_infer_failed err=%s", e)
-            return "_LLM call failed — check logs._"
-        return _sanitize(raw) or "_LLM returned empty response._"
+            _log.warning("llm_chat_infer_failed err=%s err_type=%s",
+                          e, type(e).__name__, exc_info=True)
+            raw = ""
+
+        # 70B fallback: if the requested model (70B) returned empty or
+        # failed, retry with 8B and tag the reply so the operator sees
+        # what happened. Better a quick 8B answer than silent failure.
+        if (not raw or not raw.strip()) and model_override and model_override != self.cfg.model_name:
+            _log.info("llm_chat_fallback_to_default model=%s -> %s",
+                      model_override, self.cfg.model_name)
+            try:
+                raw = self._infer(prompt, model_override=None,
+                                  max_tokens_override=None)
+                if raw and raw.strip():
+                    return _sanitize(raw) + (
+                        f"\n_⚠️ 70B ({model_override}) unavailable — "
+                        f"replied via {self.cfg.model_name} instead._"
+                    )
+            except Exception as e:
+                _log.warning("llm_chat_fallback_also_failed err=%s", e)
+
+        answer = _sanitize(raw) if raw else ""
+        if not answer:
+            return (
+                f"_LLM returned empty response "
+                f"(model={model_override or self.cfg.model_name}). "
+                f"Ollama may be loading the model — try again in 60s, "
+                f"or press **Warm LLMs** in the panel._"
+            )
+        return answer
 
     def hello(self, ctx: ChatContext) -> str:
         """One-line greeting for the Discord startup hello message."""

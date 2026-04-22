@@ -525,6 +525,38 @@ def _build_chat_context():
     except Exception:
         pass
 
+    # Actively pull LIVE quotes from the multi-provider stack. This is
+    # the critical fix: without this the LLM sees an empty spot_prices
+    # object and answers "I don't have prices." Cached at the provider
+    # layer so repeated chat messages don't hammer APIs.
+    try:
+        from src.data.multi_provider import MultiProvider
+        mp = MultiProvider.from_env()
+        if mp.active_providers():
+            live_spots: Dict[str, float] = {}
+            for sym in (ctx.universe or ["SPY", "QQQ"])[:4]:
+                q = mp.latest_quote(sym)
+                if q and q.mid > 0:
+                    live_spots[sym] = round(float(q.mid), 2)
+            if live_spots:
+                # Merge with anything we already scraped from the log
+                # (live overrides stale).
+                merged = dict(ctx.spot_by_symbol or {})
+                merged.update(live_spots)
+                ctx.spot_by_symbol = merged
+            # Also pull sentiment for the universe so "what's the read
+            # on SPY?" questions get weighted correctly.
+            for sym in (ctx.universe or ["SPY", "QQQ"])[:2]:
+                s = mp.news_sentiment(sym)
+                if s is not None:
+                    # Stuff sentiment into recent_signals as a tagged
+                    # short string the LLM can reference.
+                    ctx.recent_signals.append(
+                        f"sentiment[{sym}]={s:+.2f}"
+                    )
+    except Exception as _e:
+        _log.info("live_quote_enrich_failed err=%s", _e)
+
     # tradebot.out grep for the most recent regime, VIX, breadth, spot
     # prices, and a few recent signal events. Lets the LLM see live
     # state without a database query or locking the journal.
