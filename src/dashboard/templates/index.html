@@ -209,12 +209,18 @@ canvas { max-height: 260px; }
 .chat-log { flex: 1; overflow-y: auto; padding: 14px; display: flex;
             flex-direction: column; gap: 10px; }
 .chat-msg { padding: 10px 14px; border-radius: 10px; max-width: 82%;
-            font-size: 13px; line-height: 1.5; word-wrap: break-word; }
-.chat-msg.user { background: var(--info); color: white; align-self: flex-end; }
+            font-size: 13px; line-height: 1.55; word-wrap: break-word; }
+.chat-msg.user { background: var(--card-accent); color: var(--fg);
+                  align-self: flex-end; border: 1px solid var(--border); }
 .chat-msg.ai { background: var(--muted); color: var(--fg); align-self: flex-start;
                border: 1px solid var(--border-soft); }
 .chat-msg.ai .meta { font-size: 10px; color: var(--fg-subtle); margin-top: 6px;
-                      font-family: var(--font-mono); }
+                      font-family: var(--font-mono); letter-spacing: 0.02em; }
+.chat-msg p { margin: 0 0 6px; }
+.chat-msg p:last-child { margin-bottom: 0; }
+.chat-msg strong { color: var(--accent); font-weight: 600; }
+.chat-msg ul, .chat-msg ol { margin: 4px 0 4px 20px; padding: 0; }
+.chat-msg li { margin: 2px 0; }
 .chat-msg pre { background: var(--bg); padding: 8px; border-radius: 6px;
                  font-size: 11px; overflow-x: auto; font-family: var(--font-mono); }
 .chat-msg code { background: var(--bg); padding: 1px 4px; border-radius: 3px;
@@ -568,10 +574,8 @@ canvas { max-height: 260px; }
       <div class="chat-main">
         <div class="chat-log" id="chat-log">
           <div class="chat-msg ai">
-            <div>Hi — I'm your tradebot copilot. Ask me anything about the bot's state,
-            recent trades, open positions, market regime, or how a specific exit fired.
-            I cite real numbers from the bot's live context.</div>
-            <div class="meta">model: llama-3.3-70b-versatile (Groq)</div>
+            <div>Hey — ask me anything about the bot. Trades, positions, why something exited, what's blocking signals, current regime, you name it. I pull live context so answers cite real numbers.</div>
+            <div class="meta">✨ 70B · Groq</div>
           </div>
         </div>
         <div class="chat-input-bar">
@@ -1230,7 +1234,14 @@ async function sendChat() {
     aiBubble.innerHTML = `<em style="color:var(--loss)">Error: ${d.error}</em>`;
   } else {
     const html = marked.parse(d.response || '(empty)');
-    aiBubble.innerHTML = html + `<div class="meta">model: ${d.model || 'unknown'}</div>`;
+    const m = d.model || '';
+    // Casual model tag: "✨ 70B · Groq" / "🦙 8B · Ollama"
+    let tag = '';
+    if (/70b|llama-3/.test(m)) tag = '✨ 70B · Groq';
+    else if (/8b/.test(m))     tag = '🦙 8B · Ollama';
+    else if (m)                 tag = `· ${m}`;
+    const intent = d.intent ? ` · ${d.intent.replace('_',' ')}` : '';
+    aiBubble.innerHTML = html + `<div class="meta">${tag}${intent}</div>`;
   }
   log.scrollTop = log.scrollHeight;
 }

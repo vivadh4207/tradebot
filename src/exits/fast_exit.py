@@ -131,6 +131,19 @@ class FastExitConfig:
     zdte_exhaustion_enabled: bool = True
     zdte_exhaustion_min_profit: float = 0.01   # +1% (past fees/slippage)
 
+    # 0DTE snap-take — aggressive profit grabs that DON'T wait for
+    # a fade signal. Operator: "swing ones are doing good because we
+    # executed but didn't sell when 0dte was up." 0DTE profits
+    # evaporate fast; snap them.
+    #
+    #   pnl >= +15%  → trim 50%
+    #   pnl >= +25%  → full close
+    #   pnl >= +40%  → full close (absolute ceiling — "take the gift")
+    zdte_snap_take_enabled: bool = True
+    zdte_snap_trim_pct: float = 0.15      # trim half at +15%
+    zdte_snap_close_pct: float = 0.25     # full at +25%
+    zdte_snap_absolute_cap_pct: float = 0.40  # mandatory at +40%
+
     # Exhaustion applied to ALL DTEs (not just 0DTE) — operator:
     # "even for long positions, if in profit cut it immediately."
     # DTE-aware min profit so swing trades get breathing room but
@@ -450,6 +463,42 @@ class FastExitEvaluator:
                         f"={prior_high:.2f}_pnl={pnl:+.2%}",
                         layer=0,
                     )
+
+        # ---- 0DTE SNAP-TAKE — grab profit, don't wait for fade ----
+        # Operator: "swing trades are working, but 0dte went up and we
+        # didn't sell." Theta eats 0DTE profit fast. These 3 tiers
+        # grab it opportunistically without needing any reversal.
+        if (self.cfg.zdte_snap_take_enabled
+                and dte == 0
+                and pnl > 0):
+            # Absolute ceiling — take it no matter what
+            if pnl >= self.cfg.zdte_snap_absolute_cap_pct:
+                return ExitDecision(
+                    True,
+                    f"zdte_snap_absolute:pnl={pnl:+.2%}"
+                    f"_>={self.cfg.zdte_snap_absolute_cap_pct:+.0%}",
+                    layer=0,
+                )
+            # Full close at +25%
+            if pnl >= self.cfg.zdte_snap_close_pct:
+                return ExitDecision(
+                    True,
+                    f"zdte_snap_close:pnl={pnl:+.2%}"
+                    f"_>={self.cfg.zdte_snap_close_pct:+.0%}",
+                    layer=0,
+                )
+            # Scale-out at +15%
+            if (pnl >= self.cfg.zdte_snap_trim_pct
+                    and not pos.scaled_out
+                    and abs(pos.qty) >= 2):
+                half = max(1, int(round(abs(pos.qty) * 0.5)))
+                return ExitDecision(
+                    True,
+                    f"zdte_snap_trim:pnl={pnl:+.2%}"
+                    f"_>={self.cfg.zdte_snap_trim_pct:+.0%}_closing_{half}of{abs(pos.qty)}",
+                    layer=0,
+                    close_qty=half,
+                )
 
         # ---- Momentum-exhaustion exit (DTE-aware) ----
         # Operator: "even for long positions, if in profit cut it

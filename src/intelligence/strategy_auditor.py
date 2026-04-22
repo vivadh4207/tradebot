@@ -241,26 +241,46 @@ class StrategyAuditor:
         started = _time.time()
         prompt = _build_prompt(snapshot)
 
-        # Dispatch on backend: ollama (HTTP, preferred on Jetson) or
-        # llama_cpp (direct GGUF load).
+        # Dispatch — prefer Groq 70B (cloud) via the role-aware factory,
+        # fall back to Ollama on the 'audit' role. Previously called
+        # Ollama directly with LLM_AUDITOR_MODEL — that locked auditor
+        # to 8B even with Groq configured. Now it's: Groq first, Ollama
+        # only when Groq isn't set.
         if self.cfg.backend == "ollama":
-            from .ollama_client import build_ollama_client
-            client = build_ollama_client()
-            if not client.ping():
-                _log.warning("strategy_auditor_ollama_unreachable base_url=%s",
-                              client.cfg.base_url)
+            try:
+                from .groq_client import build_llm_client_for
+                client, model_used = build_llm_client_for("audit")
+            except Exception:
+                client, model_used = None, None
+            if client is None:
+                _log.warning("strategy_auditor_no_client role=audit")
                 return None
             try:
+                if hasattr(client, "cfg") and hasattr(client.cfg, "timeout_sec"):
+                    # Long-running call — give it room
+                    client.cfg.timeout_sec = 300.0
+            except Exception:
+                pass
+            try:
+                if hasattr(client, "ping") and not client.ping():
+                    _log.warning("strategy_auditor_llm_unreachable")
+                    return None
+            except Exception:
+                pass
+            try:
                 raw = client.generate(
-                    model=self.cfg.model_name,
+                    model=model_used,
                     prompt=prompt,
                     temperature=self.cfg.temperature,
                     max_tokens=self.cfg.max_tokens,
                     num_ctx=self.cfg.n_ctx,
                     stop=["\n\n\n"],
                 )
+                # Stamp the actually-used model so to_markdown reports
+                # Groq vs Ollama correctly.
+                self.cfg.model_name = model_used
             except Exception as e:
-                _log.warning("strategy_auditor_ollama_infer_failed err=%s", e)
+                _log.warning("strategy_auditor_infer_failed err=%s", e)
                 return None
         else:
             # llama_cpp path — loads GGUF from model_path

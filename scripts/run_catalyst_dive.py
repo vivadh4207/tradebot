@@ -285,30 +285,39 @@ def _format_discord(report: Dict[str, Any], *, model: str,
 def _call_llm(prompt: str, *, model_name: Optional[str] = None,
                timeout_sec: float = 300.0, max_tokens: int = 800
                ) -> tuple:
-    client = build_ollama_client()
-    client.cfg.timeout_sec = float(timeout_sec)
-    if not client.ping():
+    """Route through build_llm_client_for('catalyst') — prefers Groq
+    70B (cloud, free tier) and falls back to local Ollama only if
+    Groq isn't configured. Previously called Ollama directly which
+    meant catalyst dive always ran on 8B even with Groq key set."""
+    try:
+        from src.intelligence.groq_client import build_llm_client_for
+        client, model = build_llm_client_for("catalyst")
+    except Exception:
+        client, model = None, None
+    if client is None:
         return "", ""
-    import os as _os
-    candidates: List[str] = []
     if model_name:
-        candidates.append(model_name)
-    else:
-        candidates = [
-            (_os.getenv("LLM_AUDITOR_MODEL", "").strip() or "llama3.1:70b"),
-            (_os.getenv("LLM_BRAIN_MODEL", "").strip() or "llama3.1:8b"),
-        ]
-    for m in candidates:
-        try:
-            raw = client.generate(
-                model=m, prompt=prompt,
-                temperature=0.2, max_tokens=max_tokens, num_ctx=8192,
-                stop=["\n\nSNAPSHOT:", "\n\nYOUR JSON:"],
-            )
-            if raw and raw.strip():
-                return raw, m
-        except Exception:
-            continue
+        model = model_name
+    try:
+        if hasattr(client, "cfg") and hasattr(client.cfg, "timeout_sec"):
+            client.cfg.timeout_sec = float(timeout_sec)
+    except Exception:
+        pass
+    try:
+        if hasattr(client, "ping") and not client.ping():
+            return "", ""
+    except Exception:
+        pass
+    try:
+        raw = client.generate(
+            model=model, prompt=prompt,
+            temperature=0.2, max_tokens=max_tokens, num_ctx=8192,
+            stop=["\n\nSNAPSHOT:", "\n\nYOUR JSON:"],
+        )
+        if raw and raw.strip():
+            return raw, model
+    except Exception:
+        pass
     return "", ""
 
 

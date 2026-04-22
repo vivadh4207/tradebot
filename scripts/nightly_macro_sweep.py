@@ -161,17 +161,33 @@ def _build_snapshot(settings) -> Dict[str, Any]:
     return snap
 
 
-def _call_70b(prompt: str, *, model_name: str,
-               max_tokens: int, timeout_sec: float) -> Optional[str]:
-    """One 70B call via Ollama. Returns None on any failure."""
-    client = build_ollama_client()
-    # Override client timeout for this long-running call.
-    client.cfg.timeout_sec = float(timeout_sec)
-    if not client.ping():
+def _call_70b(prompt: str, *, model_name: Optional[str] = None,
+               max_tokens: int = 600, timeout_sec: float = 600.0
+               ) -> Optional[str]:
+    """One 70B call via Groq (preferred) or Ollama fallback.
+    Previously only used Ollama — ignored Groq even when configured."""
+    try:
+        from src.intelligence.groq_client import build_llm_client_for
+        client, model = build_llm_client_for("macro")
+    except Exception:
+        client, model = None, None
+    if client is None:
         return None
+    if model_name:
+        model = model_name
+    try:
+        if hasattr(client, "cfg") and hasattr(client.cfg, "timeout_sec"):
+            client.cfg.timeout_sec = float(timeout_sec)
+    except Exception:
+        pass
+    try:
+        if hasattr(client, "ping") and not client.ping():
+            return None
+    except Exception:
+        pass
     try:
         return client.generate(
-            model=model_name,
+            model=model,
             prompt=prompt,
             temperature=0.2,
             max_tokens=max_tokens,

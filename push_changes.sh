@@ -37,6 +37,8 @@ git add \
   push_changes.sh \
   scripts/backfill_saves.py \
   scripts/discord_terminal.py \
+  scripts/nightly_macro_sweep.py \
+  scripts/run_catalyst_dive.py \
   scripts/run_morning_scan.py \
   scripts/run_saves_report.py \
   scripts/run_strategy_report.py \
@@ -56,6 +58,7 @@ git add \
   src/intelligence/options_research.py \
   src/intelligence/position_advisor.py \
   src/intelligence/saves_tracker.py \
+  src/intelligence/strategy_auditor.py \
   src/intelligence/symbol_scanner.py \
   src/main.py \
   src/notify/base.py \
