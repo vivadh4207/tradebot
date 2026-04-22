@@ -91,13 +91,78 @@ class YahooProvider:
             return None
 
     # ------------------------------------------------ options chain
-    # yfinance has an options API but Yahoo's chain is flaky — strikes
-    # are sometimes stale, greeks are never provided, OI lags a day.
-    # We decline and let Polygon/Tradier cover chain data.
+    # yfinance has an options API that is flaky — greeks aren't
+    # provided, OI can lag a day, strikes are sometimes stale. But in
+    # the absence of Polygon/Tradier it's the only free options source,
+    # so we enable it with a YAHOO_CHAIN_ENABLED=1 opt-in. Good enough
+    # for after-hours research when the market is closed anyway.
 
     def option_chain(self, underlying: str, expiry: Optional[str] = None
                      ) -> Optional[List[ProviderOptionRow]]:
-        return None
+        if not self.is_enabled():
+            return None
+        if os.getenv("YAHOO_CHAIN_ENABLED", "1").strip().lower() in (
+            "0", "false", "no",
+        ):
+            return None
+        try:
+            t = self._yf.Ticker(underlying.upper())
+            exps = list(getattr(t, "options", []) or [])
+            if not exps:
+                return None
+            pick_exp = expiry if (expiry and expiry in exps) else exps[0]
+            oc = t.option_chain(pick_exp)
+            rows: List[ProviderOptionRow] = []
+            for df, right in ((oc.calls, "call"), (oc.puts, "put")):
+                if df is None or df.empty:
+                    continue
+                for _, r in df.iterrows():
+                    try:
+                        rows.append(ProviderOptionRow(
+                            symbol=str(r.get("contractSymbol", "")),
+                            underlying=underlying.upper(),
+                            strike=float(r.get("strike", 0)),
+                            expiry=pick_exp,
+                            right=right,
+                            bid=float(r.get("bid", 0)) or None,
+                            ask=float(r.get("ask", 0)) or None,
+                            last=float(r.get("lastPrice", 0)) or None,
+                            volume=int(r.get("volume", 0)) or None,
+                            open_interest=int(r.get("openInterest", 0)) or None,
+                            implied_vol=float(r.get("impliedVolatility", 0)) or None,
+                            delta=None, gamma=None, vega=None, theta=None,
+                            source=self.name,
+                        ))
+                    except Exception:
+                        continue
+            return rows or None
+        except Exception as e:                          # noqa: BLE001
+            _log.info("yahoo_chain_failed sym=%s err=%s", underlying, e)
+            return None
+
+    # ------------------------------------------------ VIX snapshot
+    # Convenience so callers can fetch the live volatility index
+    # without special-casing the "^VIX" Yahoo ticker.
+
+    def latest_vix(self) -> Optional[float]:
+        """Return current VIX index value, or None on failure."""
+        if not self.is_enabled():
+            return None
+        try:
+            t = self._yf.Ticker("^VIX")
+            fi = getattr(t, "fast_info", None)
+            v = None
+            if fi is not None:
+                v = (getattr(fi, "last_price", None)
+                     or getattr(fi, "regular_market_price", None))
+            if v is None:
+                hist = t.history(period="1d", interval="1m")
+                if not hist.empty:
+                    v = float(hist["Close"].iloc[-1])
+            return float(v) if v else None
+        except Exception as e:                          # noqa: BLE001
+            _log.info("yahoo_vix_failed err=%s", e)
+            return None
 
     # ------------------------------------------------ news
 

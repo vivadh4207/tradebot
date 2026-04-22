@@ -549,11 +549,24 @@ def _build_chat_context():
             for sym in (ctx.universe or ["SPY", "QQQ"])[:2]:
                 s = mp.news_sentiment(sym)
                 if s is not None:
-                    # Stuff sentiment into recent_signals as a tagged
-                    # short string the LLM can reference.
                     ctx.recent_signals.append(
                         f"sentiment[{sym}]={s:+.2f}"
                     )
+            # Live VIX — when market is closed the paper-bot tick loop
+            # hasn't logged a regime_snapshot yet, so ctx.vix is None.
+            # Grab it directly from Yahoo's ^VIX ticker as a fallback.
+            if ctx.vix is None:
+                try:
+                    for p in getattr(mp, "_providers", []):
+                        fn = getattr(p, "latest_vix", None)
+                        if fn is None:
+                            continue
+                        v = fn()
+                        if v is not None and v > 0:
+                            ctx.vix = float(v)
+                            break
+                except Exception:
+                    pass
     except Exception as _e:
         _log.info("live_quote_enrich_failed err=%s", _e)
 
