@@ -1624,6 +1624,39 @@ setInterval(refreshBrainTail, 15000);
 """
 
 
+_TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
+_TEMPLATE_CACHE: Dict[str, str] = {}
+
+
+def _render_template(name: str) -> str:
+    """Load an HTML template from disk. Cached after first read unless
+    TRADEBOT_DASHBOARD_DEBUG=1 is set (which reads every request for
+    rapid redesign iteration)."""
+    debug = os.getenv("TRADEBOT_DASHBOARD_DEBUG", "").strip() in ("1", "true", "yes")
+    if not debug and name in _TEMPLATE_CACHE:
+        return _TEMPLATE_CACHE[name]
+    path = _TEMPLATE_DIR / name
+    try:
+        html = path.read_text(encoding="utf-8")
+    except Exception as e:
+        return (f"<!doctype html><html><body><h1>template load failed</h1>"
+                f"<pre>{name}: {e}</pre></body></html>")
+    if not debug:
+        _TEMPLATE_CACHE[name] = html
+    return html
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
+    """New data-dense financial dashboard. Source: templates/index.html.
+    Design system derived from UI/UX Pro Max skill — dark financial
+    palette, JetBrains Mono for numbers, Inter for labels, 12-col
+    grid with 8px gap. See templates/index.html for styling."""
+    return HTMLResponse(_render_template("index.html"))
+
+
+@app.get("/legacy", response_class=HTMLResponse)
+def index_legacy():
+    """Previous dashboard, kept for reference. Bookmark this path if
+    you need the old view while we validate the new design."""
     return HTMLResponse(_INDEX_HTML)

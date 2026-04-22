@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>tradebot · dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0"></script>
+<style>
+/* =============================================================
+   Design system — Financial Dashboard (UI/UX Pro Max reco)
+   Colors:   bg #020617 · card #0E1223 · surface #0F172A
+             profit #22C55E · loss #EF4444 · muted #94A3B8
+   Typography: JetBrains Mono (numbers) + Inter (labels)
+   Layout:   12-col grid, 8px gap, 12px card padding
+   ============================================================= */
+:root {
+  --bg:          #020617;
+  --surface:     #0F172A;
+  --card:        #0E1223;
+  --card-hover:  #141A33;
+  --card-accent: #1E293B;
+  --muted:       #1A1E2F;
+  --border:      #334155;
+  --border-soft: #1E2540;
+  --fg:          #F8FAFC;
+  --fg-muted:    #94A3B8;
+  --fg-subtle:   #64748B;
+  --profit:      #22C55E;
+  --profit-soft: #14291E;
+  --loss:        #EF4444;
+  --loss-soft:   #2A1A1F;
+  --warning:     #F59E0B;
+  --info:        #3B82F6;
+  --accent:      #22C55E;
+  --radius:      8px;
+  --radius-lg:   12px;
+  --gap:         8px;
+  --pad:         12px;
+  --font-sans:   'Inter', -apple-system, system-ui, sans-serif;
+  --font-mono:   'JetBrains Mono', ui-monospace, 'SF Mono', Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg);
+             font-family: var(--font-sans); font-size: 13px; line-height: 1.45;
+             -webkit-font-smoothing: antialiased; }
+
+/* --- top bar ------------------------------------------------- */
+.topbar { display: flex; align-items: center; gap: 24px; padding: 10px 18px;
+          background: var(--surface); border-bottom: 1px solid var(--border);
+          position: sticky; top: 0; z-index: 100; }
+.topbar .brand { font-weight: 700; font-size: 14px; letter-spacing: -0.01em;
+                 color: var(--fg); display: flex; align-items: center; gap: 8px; }
+.topbar .brand .dot { width: 8px; height: 8px; border-radius: 50%;
+                       background: var(--profit); box-shadow: 0 0 8px var(--profit);
+                       animation: pulse 2s infinite; }
+.topbar .brand .dot.warn  { background: var(--warning); box-shadow: 0 0 8px var(--warning); }
+.topbar .brand .dot.down  { background: var(--loss);    box-shadow: 0 0 8px var(--loss);
+                             animation: none; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+.topbar .stat { display: flex; flex-direction: column; font-family: var(--font-mono); }
+.topbar .stat .k { font-size: 10px; color: var(--fg-subtle); text-transform: uppercase;
+                    letter-spacing: 0.06em; font-family: var(--font-sans); font-weight: 500; }
+.topbar .stat .v { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
+.topbar .spacer { flex: 1; }
+
+/* --- range control (replaces old .ctl-row) ------------------ */
+.range-ctl { display: inline-flex; align-items: center; gap: 2px; background: var(--card);
+             border: 1px solid var(--border); border-radius: var(--radius); padding: 2px; }
+.range-ctl button { background: transparent; color: var(--fg-muted); border: 0;
+                     padding: 4px 10px; font-size: 11px; font-family: var(--font-mono);
+                     border-radius: 6px; cursor: pointer; transition: all 0.15s; }
+.range-ctl button:hover { color: var(--fg); }
+.range-ctl button.active { background: var(--card-accent); color: var(--fg); }
+
+/* --- main layout -------------------------------------------- */
+.shell { padding: 12px; max-width: 1600px; margin: 0 auto; }
+
+.grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: var(--gap); }
+.col-6 { grid-column: span 6; } .col-4 { grid-column: span 4; }
+.col-3 { grid-column: span 3; } .col-8 { grid-column: span 8; }
+.col-12 { grid-column: span 12; }
+@media (max-width: 1100px) {
+  .col-3, .col-4, .col-6, .col-8 { grid-column: span 12; }
+}
+
+.card { background: var(--card); border: 1px solid var(--border-soft);
+        border-radius: var(--radius-lg); padding: var(--pad); overflow: hidden;
+        transition: border-color 0.15s; }
+.card:hover { border-color: var(--border); }
+.card .head { display: flex; align-items: center; justify-content: space-between;
+              margin-bottom: 10px; }
+.card .head .title { font-size: 11px; text-transform: uppercase;
+                      letter-spacing: 0.08em; color: var(--fg-muted);
+                      font-weight: 600; }
+.card .head .sub { font-size: 11px; color: var(--fg-subtle); font-family: var(--font-mono); }
+
+/* KPI card — data-dense, number-forward */
+.kpi { display: flex; flex-direction: column; justify-content: space-between; min-height: 92px; }
+.kpi .v { font-family: var(--font-mono); font-size: 24px; font-weight: 600;
+          letter-spacing: -0.02em; line-height: 1.1; transition: color 0.3s; }
+.kpi .sub { font-size: 11px; color: var(--fg-muted); font-family: var(--font-mono);
+            margin-top: 2px; }
+.kpi.pos .v { color: var(--profit); } .kpi.neg .v { color: var(--loss); }
+
+/* --- tables ------------------------------------------------- */
+table { width: 100%; border-collapse: collapse; font-size: 12px; font-family: var(--font-mono); }
+th { color: var(--fg-muted); font-weight: 500; font-size: 10px;
+     text-transform: uppercase; letter-spacing: 0.08em; font-family: var(--font-sans);
+     text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border-soft);
+     background: var(--card); position: sticky; top: 0; }
+td { padding: 6px 10px; border-bottom: 1px solid var(--border-soft);
+     white-space: nowrap; }
+tbody tr { transition: background 0.1s; }
+tbody tr:hover { background: var(--card-hover); }
+tbody tr:last-child td { border-bottom: 0; }
+
+.table-wrap { max-height: 360px; overflow: auto; margin: 0 -12px -12px;
+              padding: 0 12px 4px; }
+.table-wrap::-webkit-scrollbar { width: 8px; height: 8px; }
+.table-wrap::-webkit-scrollbar-track { background: var(--card); }
+.table-wrap::-webkit-scrollbar-thumb { background: var(--border-soft); border-radius: 4px; }
+
+/* --- pills + chips ------------------------------------------ */
+.pill { display: inline-block; padding: 1px 7px; border-radius: 10px;
+        font-size: 10px; font-weight: 500; font-family: var(--font-sans); letter-spacing: 0.02em; }
+.pill.win  { background: var(--profit-soft); color: var(--profit); }
+.pill.loss { background: var(--loss-soft);   color: var(--loss); }
+.pill.info { background: rgba(59,130,246,0.12); color: var(--info); }
+.pill.warn { background: rgba(245,158,11,0.12); color: var(--warning); }
+.pill.mut  { background: var(--muted); color: var(--fg-muted); }
+
+.pos { color: var(--profit); } .neg { color: var(--loss); } .mut { color: var(--fg-muted); }
+
+.chip { display: inline-flex; align-items: center; gap: 4px; background: var(--muted);
+        color: var(--fg-muted); border-radius: 4px; padding: 2px 7px; font-size: 11px;
+        margin-right: 4px; font-family: var(--font-mono); }
+
+/* --- control bar (bottom) ----------------------------------- */
+.controls { display: flex; gap: 10px; align-items: center; padding: 14px 16px;
+            background: var(--card); border: 1px solid var(--border-soft);
+            border-radius: var(--radius-lg); flex-wrap: wrap; margin-top: 8px; }
+.controls .lbl { color: var(--fg-muted); font-size: 11px; text-transform: uppercase;
+                 letter-spacing: 0.08em; font-weight: 600; margin-right: 8px; }
+.btn { background: var(--card-accent); color: var(--fg); border: 1px solid var(--border);
+       padding: 7px 16px; border-radius: var(--radius); cursor: pointer; font-size: 12px;
+       font-family: var(--font-sans); font-weight: 500; transition: all 0.15s;
+       display: inline-flex; align-items: center; gap: 6px; }
+.btn:hover { background: var(--card-hover); border-color: var(--fg-subtle); }
+.btn.primary { background: var(--profit); color: var(--bg); border-color: var(--profit); }
+.btn.primary:hover { filter: brightness(1.1); }
+.btn.danger { background: var(--loss-soft); color: var(--loss); border-color: rgba(239,68,68,0.3); }
+.btn.danger:hover { background: var(--loss); color: var(--fg); }
+.btn.ghost { background: transparent; }
+
+/* --- misc --------------------------------------------------- */
+.tabs { display: flex; gap: 2px; background: var(--muted); border-radius: var(--radius);
+        padding: 2px; }
+.tab  { padding: 4px 10px; font-size: 11px; color: var(--fg-muted); cursor: pointer;
+        border-radius: 6px; font-family: var(--font-sans); font-weight: 500; }
+.tab.active { background: var(--card-accent); color: var(--fg); }
+
+canvas { max-height: 260px; }
+.hidden { display: none !important; }
+.num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.loading { color: var(--fg-subtle); font-style: italic; font-size: 12px; padding: 24px;
+           text-align: center; }
+.empty { color: var(--fg-subtle); padding: 14px; text-align: center; font-size: 12px; }
+
+/* --- log panel ---------------------------------------------- */
+.log-panel { font-family: var(--font-mono); font-size: 11px; max-height: 300px;
+             overflow: auto; background: var(--bg); border-radius: var(--radius);
+             padding: 8px; margin: 0 -4px -4px; }
+.log-line  { padding: 2px 4px; border-left: 2px solid transparent; white-space: nowrap;
+             overflow: hidden; text-overflow: ellipsis; }
+.log-line.info  { border-left-color: var(--info); }
+.log-line.warn  { border-left-color: var(--warning); }
+.log-line.error { border-left-color: var(--loss); }
+
+/* Count-up animation helper */
+.v.count { transition: color 0.3s; }
+.v.flash-pos { animation: flash-green 0.8s ease; }
+.v.flash-neg { animation: flash-red   0.8s ease; }
+@keyframes flash-green { 0% { color: var(--profit); } 100% { color: var(--fg); } }
+@keyframes flash-red   { 0% { color: var(--loss);   } 100% { color: var(--fg); } }
+
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="brand">
+    <span class="dot" id="status-dot"></span>
+    <span>tradebot</span>
+    <span class="pill mut" id="mode-pill">paper</span>
+  </div>
+  <div class="stat">
+    <span class="k">equity</span>
+    <span class="v" id="stat-equity">—</span>
+  </div>
+  <div class="stat">
+    <span class="k">day p&amp;l</span>
+    <span class="v count" id="stat-day-pnl">—</span>
+  </div>
+  <div class="stat">
+    <span class="k">cash</span>
+    <span class="v" id="stat-cash">—</span>
+  </div>
+  <div class="stat">
+    <span class="k">open</span>
+    <span class="v" id="stat-open">—</span>
+  </div>
+  <div class="stat">
+    <span class="k">regime</span>
+    <span class="v" id="stat-regime" style="font-size:13px">—</span>
+  </div>
+  <div class="stat">
+    <span class="k">vix</span>
+    <span class="v" id="stat-vix">—</span>
+  </div>
+  <div class="stat">
+    <span class="k">breadth</span>
+    <span class="v" id="stat-breadth">—</span>
+  </div>
+  <div class="spacer"></div>
+  <div class="range-ctl" id="range-ctl">
+    <button data-days="1">1D</button>
+    <button data-days="7">7D</button>
+    <button data-days="30" class="active">30D</button>
+    <button data-days="90">90D</button>
+  </div>
+</div>
+
+<div class="shell">
+
+  <!-- KPI row ----------------------------------------------- -->
+  <div class="grid" style="margin-bottom: var(--gap)">
+    <div class="col-3 card kpi" id="kpi-pnl">
+      <div class="head"><span class="title">P&amp;L (window)</span></div>
+      <div>
+        <div class="v" id="kpi-pnl-val">—</div>
+        <div class="sub" id="kpi-pnl-sub">—</div>
+      </div>
+    </div>
+    <div class="col-3 card kpi">
+      <div class="head"><span class="title">win rate</span></div>
+      <div>
+        <div class="v" id="kpi-wr-val">—</div>
+        <div class="sub" id="kpi-wr-sub">—</div>
+      </div>
+    </div>
+    <div class="col-3 card kpi">
+      <div class="head"><span class="title">avg win / loss</span></div>
+      <div>
+        <div class="v num" id="kpi-avg-val">—</div>
+        <div class="sub" id="kpi-avg-sub">—</div>
+      </div>
+    </div>
+    <div class="col-3 card kpi">
+      <div class="head"><span class="title">sharpe (daily)</span></div>
+      <div>
+        <div class="v" id="kpi-sharpe-val">—</div>
+        <div class="sub" id="kpi-sharpe-sub">—</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Equity curve + Recent trades split -------------------- -->
+  <div class="grid" style="margin-bottom: var(--gap)">
+    <div class="col-8 card" style="min-height: 320px">
+      <div class="head">
+        <span class="title">equity curve</span>
+        <span class="sub" id="equity-sub">—</span>
+      </div>
+      <canvas id="equity-chart"></canvas>
+    </div>
+    <div class="col-4 card" style="min-height: 320px">
+      <div class="head">
+        <span class="title">open positions</span>
+        <span class="sub" id="pos-count-sub">—</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>Symbol</th><th style="text-align:right">Qty</th>
+            <th style="text-align:right">Entry</th>
+            <th style="text-align:right">Mark</th>
+            <th style="text-align:right">P&amp;L</th>
+          </tr></thead>
+          <tbody id="positions-tbody"><tr><td colspan="5" class="empty">loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Closed trades + Regime / ensemble --------------------- -->
+  <div class="grid" style="margin-bottom: var(--gap)">
+    <div class="col-8 card" style="min-height: 320px">
+      <div class="head">
+        <span class="title">recent closed trades</span>
+        <span class="sub" id="trades-sub">—</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>Time</th><th>Symbol</th>
+            <th style="text-align:right">Qty</th>
+            <th style="text-align:right">Entry</th>
+            <th style="text-align:right">Exit</th>
+            <th style="text-align:right">P&amp;L</th>
+            <th>Exit reason</th>
+          </tr></thead>
+          <tbody id="trades-tbody"><tr><td colspan="7" class="empty">loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="col-4 card" style="min-height: 320px">
+      <div class="head">
+        <span class="title">ensemble activity</span>
+        <span class="sub" id="ensemble-sub">—</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>Time</th><th>Sym</th><th>Dir</th>
+            <th style="text-align:right">Score</th>
+          </tr></thead>
+          <tbody id="ensemble-tbody"><tr><td colspan="4" class="empty">loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Logs + Catalysts --------------------------------------- -->
+  <div class="grid" style="margin-bottom: var(--gap)">
+    <div class="col-8 card">
+      <div class="head">
+        <span class="title">live logs</span>
+        <span class="sub">auto-refresh · 10s</span>
+      </div>
+      <div class="log-panel" id="log-panel"><div class="loading">loading…</div></div>
+    </div>
+    <div class="col-4 card">
+      <div class="head">
+        <span class="title">upcoming catalysts</span>
+        <span class="sub" id="cat-sub">—</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>When</th><th>Sym</th><th>Type</th></tr></thead>
+          <tbody id="cat-tbody"><tr><td colspan="3" class="empty">none</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Controls --------------------------------------------- -->
+  <div class="controls">
+    <span class="lbl">Bot control</span>
+    <button class="btn primary" onclick="postAction('/api/bot/start')">▶ Start</button>
+    <button class="btn"         onclick="postAction('/api/bot/stop')">⏹ Stop</button>
+    <button class="btn"         onclick="postAction('/api/bot/restart')">↻ Restart</button>
+    <span style="flex:1"></span>
+    <button class="btn ghost"  onclick="postAction('/api/bot/strategy_audit')">📋 Audit</button>
+    <button class="btn ghost"  onclick="postAction('/api/bot/walkforward')">🔬 Walkforward</button>
+    <button class="btn danger" onclick="if(confirm('Reset paper account?')) postAction('/api/bot/reset_paper')">⚠ Reset paper</button>
+  </div>
+
+</div>
+
+<script>
+/* =============================================================
+   Dashboard logic — polls every 5s, keeps UI coherent
+   ============================================================= */
+let windowDays = 30;
+let equityChart = null;
+const fmtUsd = v => v == null ? '—' : (v >= 0 ? '+$' : '−$') + Math.abs(v).toFixed(2);
+const fmtPct = v => v == null ? '—' : (v >= 0 ? '+' : '') + (v * 100).toFixed(1) + '%';
+const fmtNum = (v, d=2) => v == null ? '—' : v.toFixed(d);
+const fmtTime = iso => {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'});
+};
+const fmtDate = iso => {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  const today = new Date();
+  if (d.toDateString() === today.toDateString()) return fmtTime(iso);
+  return d.toLocaleDateString([], {month: 'short', day: 'numeric'}) + ' ' + fmtTime(iso);
+};
+const signCls = v => v > 0 ? 'pos' : (v < 0 ? 'neg' : '');
+
+// Day-pnl flash on update
+let _lastDayPnl = null;
+function updateDayPnl(val) {
+  const el = document.getElementById('stat-day-pnl');
+  if (val == null) { el.textContent = '—'; return; }
+  el.textContent = fmtUsd(val);
+  el.className = 'v count ' + signCls(val);
+  if (_lastDayPnl !== null && val !== _lastDayPnl) {
+    el.classList.add(val > _lastDayPnl ? 'flash-pos' : 'flash-neg');
+    setTimeout(() => el.classList.remove('flash-pos', 'flash-neg'), 800);
+  }
+  _lastDayPnl = val;
+}
+
+// -------- data loaders ----------
+async function loadHealth() {
+  try {
+    const r = await fetch('/api/health');
+    const d = await r.json();
+    const dot = document.getElementById('status-dot');
+    if (d.ok) { dot.className = 'dot'; }
+    else      { dot.className = 'dot warn'; }
+    document.getElementById('stat-equity').textContent =
+      d.equity != null ? '$' + d.equity.toFixed(0) : '—';
+    document.getElementById('stat-cash').textContent =
+      d.cash != null ? '$' + d.cash.toFixed(0) : '—';
+    updateDayPnl(d.day_pnl);
+    document.getElementById('stat-open').textContent = d.open_positions ?? '—';
+    document.getElementById('mode-pill').textContent = d.mode || 'paper';
+  } catch (e) {
+    document.getElementById('status-dot').className = 'dot down';
+  }
+}
+
+async function loadRegime() {
+  try {
+    const r = await fetch('/api/regime_now');
+    const d = await r.json();
+    document.getElementById('stat-regime').textContent = d.regime || '—';
+    document.getElementById('stat-vix').textContent = d.vix != null ? d.vix.toFixed(2) : '—';
+    const b = d.breadth_score;
+    const bEl = document.getElementById('stat-breadth');
+    if (b == null) { bEl.textContent = '—'; bEl.className = 'v'; }
+    else {
+      bEl.textContent = (b >= 0 ? '+' : '') + b.toFixed(2);
+      bEl.className = 'v ' + signCls(b);
+    }
+  } catch (e) { /* swallow */ }
+}
+
+async function loadMetrics() {
+  try {
+    const r = await fetch(`/api/metrics?days=${windowDays}`);
+    const d = await r.json();
+    document.getElementById('kpi-pnl-val').textContent = fmtUsd(d.total_pnl);
+    document.getElementById('kpi-pnl-val').className = 'v ' + signCls(d.total_pnl);
+    document.getElementById('kpi-pnl-sub').textContent =
+      `${d.n_trades || 0} trades · ${windowDays}d`;
+    document.getElementById('kpi-pnl').className =
+      'col-3 card kpi ' + (d.total_pnl > 0 ? 'pos' : d.total_pnl < 0 ? 'neg' : '');
+
+    const wr = d.win_rate != null ? d.win_rate : null;
+    document.getElementById('kpi-wr-val').textContent =
+      wr != null ? (wr * 100).toFixed(0) + '%' : '—';
+    document.getElementById('kpi-wr-sub').textContent =
+      d.n_wins != null ? `${d.n_wins}W / ${d.n_losses}L` : '—';
+
+    const aw = d.avg_win, al = d.avg_loss;
+    document.getElementById('kpi-avg-val').textContent =
+      (aw != null ? `+$${aw.toFixed(0)}` : '—') + ' / ' +
+      (al != null ? `−$${Math.abs(al).toFixed(0)}` : '—');
+    document.getElementById('kpi-avg-sub').textContent =
+      d.profit_factor != null ? `PF ${d.profit_factor.toFixed(2)}` : '—';
+
+    document.getElementById('kpi-sharpe-val').textContent =
+      d.sharpe_daily != null ? d.sharpe_daily.toFixed(2) : '—';
+    document.getElementById('kpi-sharpe-val').className =
+      'v ' + (d.sharpe_daily > 1 ? 'pos' : d.sharpe_daily < 0 ? 'neg' : '');
+    document.getElementById('kpi-sharpe-sub').textContent =
+      d.max_drawdown != null ? `DD $${Math.abs(d.max_drawdown).toFixed(0)}` : '—';
+  } catch (e) {}
+}
+
+async function loadEquity() {
+  try {
+    const r = await fetch(`/api/equity?days=${windowDays}`);
+    const d = await r.json();
+    const pts = (d.points || []).map(p => ({x: p.ts, y: p.equity}));
+    document.getElementById('equity-sub').textContent =
+      pts.length ? `${pts.length} pts` : 'no data';
+    if (equityChart) equityChart.destroy();
+    const ctx = document.getElementById('equity-chart').getContext('2d');
+    equityChart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        datasets: [{
+          label: 'Equity',
+          data: pts,
+          borderColor: '#22C55E',
+          backgroundColor: 'rgba(34,197,94,0.08)',
+          fill: true, tension: 0.2, borderWidth: 2,
+          pointRadius: 0, pointHoverRadius: 3,
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        interaction: { intersect: false, mode: 'index' },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            backgroundColor: '#0E1223',
+            titleColor: '#F8FAFC', bodyColor: '#94A3B8',
+            borderColor: '#334155', borderWidth: 1,
+            callbacks: { label: c => '$' + c.parsed.y.toFixed(2) }
+          }
+        },
+        scales: {
+          x: { type: 'time',
+               ticks: { color: '#94A3B8', font: { family: 'JetBrains Mono', size: 10 } },
+               grid: { color: '#1E2540' } },
+          y: { ticks: { color: '#94A3B8', font: { family: 'JetBrains Mono', size: 10 },
+                         callback: v => '$' + v },
+               grid: { color: '#1E2540' } }
+        }
+      }
+    });
+  } catch (e) {}
+}
+
+async function loadPositions() {
+  try {
+    const r = await fetch('/api/positions_open');
+    const d = await r.json();
+    const tb = document.getElementById('positions-tbody');
+    const rows = d.positions || [];
+    document.getElementById('pos-count-sub').textContent = `${rows.length} open`;
+    if (!rows.length) { tb.innerHTML = '<tr><td colspan="5" class="empty">no open positions</td></tr>'; return; }
+    tb.innerHTML = rows.slice(0, 20).map(p => {
+      const pnl = p.unrealized_pnl || 0;
+      const cls = signCls(pnl);
+      const sym = p.symbol.length > 20 ? p.symbol.slice(0,20) + '…' : p.symbol;
+      return `<tr>
+        <td title="${p.symbol}">${sym}</td>
+        <td style="text-align:right">${p.qty}</td>
+        <td style="text-align:right">$${(p.avg_price||0).toFixed(2)}</td>
+        <td style="text-align:right">${p.mark != null ? '$'+p.mark.toFixed(2) : '—'}</td>
+        <td style="text-align:right" class="${cls}">${fmtUsd(pnl)}</td>
+      </tr>`;
+    }).join('');
+  } catch (e) {}
+}
+
+async function loadTrades() {
+  try {
+    const r = await fetch(`/api/trades?days=${windowDays}&limit=30`);
+    const d = await r.json();
+    const tb = document.getElementById('trades-tbody');
+    const rows = (d.trades || []).slice().reverse();
+    document.getElementById('trades-sub').textContent = `${rows.length} in window`;
+    if (!rows.length) { tb.innerHTML = '<tr><td colspan="7" class="empty">no closed trades</td></tr>'; return; }
+    tb.innerHTML = rows.map(t => {
+      const pnl = t.pnl || 0;
+      const cls = signCls(pnl);
+      const sym = (t.symbol||'').length > 18 ? t.symbol.slice(0,18)+'…' : (t.symbol||'');
+      const reason = (t.exit_reason||'').split(':')[0] || '—';
+      return `<tr>
+        <td>${fmtDate(t.closed_at)}</td>
+        <td title="${t.symbol||''}">${sym}</td>
+        <td style="text-align:right">${t.qty||0}</td>
+        <td style="text-align:right">$${(t.entry_price||0).toFixed(2)}</td>
+        <td style="text-align:right">${t.exit_price != null ? '$'+t.exit_price.toFixed(2) : '—'}</td>
+        <td style="text-align:right" class="${cls}">${fmtUsd(pnl)}</td>
+        <td><span class="chip">${reason}</span></td>
+      </tr>`;
+    }).join('');
+  } catch (e) {}
+}
+
+async function loadEnsemble() {
+  try {
+    const r = await fetch('/api/ensemble?limit=30');
+    const d = await r.json();
+    const tb = document.getElementById('ensemble-tbody');
+    const rows = d.events || [];
+    document.getElementById('ensemble-sub').textContent = `${rows.length} events`;
+    if (!rows.length) { tb.innerHTML = '<tr><td colspan="4" class="empty">no recent emits</td></tr>'; return; }
+    tb.innerHTML = rows.slice(0, 30).map(e => {
+      const isBlock = e.kind === 'skip' || e.kind === 'block';
+      const dirCls = e.direction === 'bullish' ? 'pos' : (e.direction === 'bearish' ? 'neg' : 'mut');
+      const pill = isBlock
+        ? `<span class="pill loss">${e.direction || 'skip'}</span>`
+        : `<span class="pill win">${e.direction || 'emit'}</span>`;
+      return `<tr>
+        <td class="mut">${fmtTime(e.ts)}</td>
+        <td>${e.symbol || '—'}</td>
+        <td>${pill}</td>
+        <td style="text-align:right" class="${dirCls}">${e.score != null ? e.score.toFixed(2) : '—'}</td>
+      </tr>`;
+    }).join('');
+  } catch (e) {}
+}
+
+async function loadLogs() {
+  try {
+    const r = await fetch('/api/logs_tail?lines=30');
+    const d = await r.json();
+    const panel = document.getElementById('log-panel');
+    const lines = (d.lines || []).slice().reverse();
+    if (!lines.length) { panel.innerHTML = '<div class="loading">empty</div>'; return; }
+    panel.innerHTML = lines.map(l => {
+      const level = (l.level || '').toLowerCase();
+      const cls = level.includes('error') ? 'error' :
+                   level.includes('warn')  ? 'warn'  : 'info';
+      const text = (l.raw || JSON.stringify(l)).replace(/</g,'&lt;');
+      return `<div class="log-line ${cls}">${text}</div>`;
+    }).join('');
+  } catch (e) {}
+}
+
+async function loadCatalysts() {
+  try {
+    const r = await fetch('/api/catalysts_upcoming');
+    const d = await r.json();
+    const tb = document.getElementById('cat-tbody');
+    const rows = d.catalysts || [];
+    document.getElementById('cat-sub').textContent = rows.length ? `${rows.length} upcoming` : 'none';
+    if (!rows.length) { tb.innerHTML = '<tr><td colspan="3" class="empty">none scheduled</td></tr>'; return; }
+    tb.innerHTML = rows.slice(0, 10).map(c => `<tr>
+      <td class="mut">${c.when || '—'}</td>
+      <td>${c.symbol || '—'}</td>
+      <td><span class="chip">${c.type || 'event'}</span></td>
+    </tr>`).join('');
+  } catch (e) {}
+}
+
+async function postAction(url) {
+  try {
+    const r = await fetch(url, { method: 'POST' });
+    const d = await r.json();
+    alert((d.ok ? '✓ ' : '✗ ') + (d.message || JSON.stringify(d)));
+    refreshFast();
+  } catch (e) { alert('request failed: ' + e.message); }
+}
+
+// -------- refresh scheduling ----------
+function refreshFast() { loadHealth(); loadRegime(); loadPositions(); loadEnsemble(); loadLogs(); }
+function refreshSlow() { loadMetrics(); loadEquity(); loadTrades(); loadCatalysts(); }
+
+// Range picker
+document.querySelectorAll('.range-ctl button').forEach(b => {
+  b.addEventListener('click', () => {
+    document.querySelectorAll('.range-ctl button').forEach(x => x.classList.remove('active'));
+    b.classList.add('active');
+    windowDays = parseInt(b.dataset.days, 10);
+    refreshSlow();
+  });
+});
+
+// Boot + intervals
+refreshFast(); refreshSlow();
+setInterval(refreshFast, 5000);    // 5s — health, positions, ensemble, logs
+setInterval(refreshSlow, 30000);   // 30s — metrics, equity, trades, catalysts
+</script>
+</body>
+</html>

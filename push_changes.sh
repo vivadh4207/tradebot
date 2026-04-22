@@ -42,6 +42,8 @@ git add \
   scripts/run_strategy_report.py \
   src/brokers/mirror_alpaca.py \
   src/brokers/tradier_adapter.py \
+  src/dashboard/app.py \
+  src/dashboard/templates/index.html \
   src/core/types.py \
   src/reports/log_digest.py \
   src/storage/position_snapshot.py \
