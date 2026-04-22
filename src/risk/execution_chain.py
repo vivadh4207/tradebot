@@ -178,10 +178,27 @@ class ExecutionChain:
             return FilterResult(True, "oi_na_no_contract", advisory=True)
         min_oi = self._s["execution"]["min_open_interest"]
         min_vol = self._s["execution"]["min_today_option_volume"]
-        if c.open_interest < min_oi:
+        # Data-availability vs actually-illiquid distinction.
+        # Many providers (Alpaca snapshot, Yahoo intraday) return 0 for
+        # open_interest when they simply didn't populate it — NOT when
+        # interest is truly zero. Same for today_volume during first
+        # 30 min of session. Treat an explicit 0 as "data missing" and
+        # pass, but block when OI is positive-but-below-threshold
+        # (actually illiquid) or when the contract has no bid/ask
+        # (truly untradeable).
+        has_real_bid_ask = (getattr(c, "bid", 0) or 0) > 0 and \
+                            (getattr(c, "ask", 0) or 0) > 0
+        if c.open_interest == 0 and c.today_volume == 0 and has_real_bid_ask:
+            return FilterResult(True,
+                "oi_data_missing_but_quoted (pass on tradeable quote)",
+                advisory=True)
+        if c.open_interest > 0 and c.open_interest < min_oi:
             return FilterResult(False, f"oi_too_low: {c.open_interest}<{min_oi}")
-        if c.today_volume < min_vol:
+        if c.today_volume > 0 and c.today_volume < min_vol:
             return FilterResult(False, f"vol_today_too_low: {c.today_volume}<{min_vol}")
+        if c.open_interest == 0 and c.today_volume == 0 and not has_real_bid_ask:
+            return FilterResult(False,
+                "oi_zero_and_no_quote (truly untradeable)")
         return FilterResult(True, "ok")
 
     def f13_0dte_cap(self, ctx: ExecutionContext) -> FilterResult:
