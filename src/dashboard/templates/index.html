@@ -296,11 +296,21 @@ canvas { max-height: 260px; }
     <div class="qs-item"><span class="k">breadth</span><span class="v" id="qs-breadth">—</span></div>
   </div>
   <div class="top-actions">
-    <button class="btn primary sm" onclick="postAction('/api/bot/start', {})">▶ Start</button>
-    <button class="btn sm" onclick="postAction('/api/bot/stop', {})">⏹ Stop</button>
-    <button class="btn sm" onclick="postAction('/api/bot/restart', {})">↻ Restart</button>
+    <button class="btn primary sm" onclick="botControl('start')">▶ Start</button>
+    <button class="btn sm" onclick="botControl('stop')">⏹ Stop</button>
+    <button class="btn sm" onclick="botControl('restart')">↻ Restart</button>
     <button class="btn danger sm" onclick="if(confirm('Reset paper?')) postAction('/api/bot/reset_paper', {})">⚠ Reset</button>
   </div>
+</div>
+
+<!-- ============ SYNC BANNER (hidden unless desync detected) ============ -->
+<div id="sync-banner" class="hidden" style="
+  background: var(--warning); color: #1a1000;
+  padding: 8px 18px; display: flex; gap: 14px; align-items: center;
+  font-weight: 600; font-size: 13px; border-bottom: 2px solid #b4740a;">
+  <span style="font-size:16px">⚠️</span>
+  <span id="sync-msg" style="flex:1">Local paper and Tradier positions are out of sync.</span>
+  <button class="btn sm danger" onclick="document.querySelector('.tab[data-view=actions]').click()">🧹 Clean up</button>
 </div>
 
 <!-- ============ TABS ============ -->
@@ -532,6 +542,19 @@ canvas { max-height: 260px; }
            compare live performance vs backtest expectations.</p>
         <button class="btn" onclick="postAction('/api/bot/walkforward', {})">Run walk-forward</button>
       </div>
+      <div class="action-card">
+        <h3>🩺 Diagnostics</h3>
+        <p>Runs end-to-end checks on every subsystem: bot process,
+           heartbeat, Tradier, Groq, Ollama, data providers, journal,
+           advisories, saves tracker. Shows PASS/FAIL + detail per check.</p>
+        <button class="btn" onclick="runDiagnostics()">Run diagnostics</button>
+      </div>
+      <div class="action-card">
+        <h3>🔎 LLM routing</h3>
+        <p>Which LLM is being used for each role (research, chat, audit,
+           brain). If Groq isn't loading, this tells you why.</p>
+        <button class="btn" onclick="runLlmHealth()">Check LLM routing</button>
+      </div>
     </div>
     <div class="card" style="margin-top:var(--gap);min-height:200px">
       <div class="head"><span class="title">action result</span></div>
@@ -729,7 +752,31 @@ async function loadPositions() {
   const d = await api('/api/positions_open');
   const tb = document.getElementById('positions-tbody');
   const rows = d.positions || [];
-  document.getElementById('pos-count-sub').textContent = `${rows.length} open`;
+
+  // ==== Sync banner =====================================
+  // Tradier is source of truth. Show warning if local disagrees.
+  const sync = d.sync || {};
+  const banner = document.getElementById('sync-banner');
+  const msg = document.getElementById('sync-msg');
+  if (sync.status === 'in_sync') {
+    banner.classList.add('hidden');
+  } else if (sync.status === 'tradier_unreachable') {
+    banner.classList.remove('hidden');
+    msg.textContent = '⚠️ Tradier unreachable — showing LOCAL state only, which may be stale. ' + (sync.tradier_error || '');
+  } else if (sync.status === 'desynced') {
+    banner.classList.remove('hidden');
+    const bits = [];
+    if (sync.tradier_only?.length) bits.push(`${sync.tradier_only.length} on Tradier but NOT local (${sync.tradier_only.slice(0,3).join(', ')}${sync.tradier_only.length>3?'…':''})`);
+    if (sync.local_only?.length)   bits.push(`${sync.local_only.length} local but NOT on Tradier`);
+    msg.textContent = `🚨 POSITIONS DESYNCED — ${bits.join(' · ')}. Click "Clean up" to reconcile via Tradier. This is what caused the earlier losses.`;
+  }
+  // Update qs-open to the AUTHORITATIVE Tradier count
+  if (d.source === 'tradier' || sync.tradier_n > 0) {
+    document.getElementById('qs-open').textContent = sync.tradier_n || 0;
+  }
+
+  document.getElementById('pos-count-sub').textContent =
+    `${rows.length} on Tradier · ${d.source}`;
   if (!rows.length) { tb.innerHTML = '<tr><td colspan="6" class="empty">none</td></tr>'; return; }
   tb.innerHTML = rows.slice(0, 20).map(p => {
     const pnl = p.unrealized_pnl || 0;
@@ -968,6 +1015,83 @@ document.addEventListener('click', (ev) => {
 /* =========================================================
    ACTIONS TAB
    ========================================================= */
+async function botControl(action) {
+  const out = document.getElementById('action-output');
+  if (out) out.textContent = `running: ${action}…`;
+  toast(`running ${action}…`);
+  const d = await api('/api/action/bot_control', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action }),
+  });
+  toast(d.message || (d.ok ? '✓' : '✗'), !d.ok);
+  if (out) {
+    out.textContent = [
+      d.message || '',
+      '',
+      '--- stdout ---',
+      d.stdout || '(none)',
+      d.stderr ? '\n--- stderr ---\n' + d.stderr : '',
+    ].join('\n');
+  }
+  // Switch to actions tab so user sees output
+  if (document.querySelector('.tab[data-view="actions"]')) {
+    document.querySelector('.tab[data-view="actions"]').click();
+  }
+  refreshTopBar();
+}
+
+async function runDiagnostics() {
+  const out = document.getElementById('action-output');
+  out.textContent = 'running diagnostics…';
+  const d = await api('/api/diagnostics');
+  if (d.error) { out.textContent = '❌ ' + d.error; return; }
+  const lines = [`🩺 Diagnostics · ${d.ok_count}/${d.total} checks passing`, ''];
+  (d.checks || []).forEach(c => {
+    const mark = c.ok ? '✅' : '❌';
+    lines.push(`${mark}  ${c.name.padEnd(28)}${c.detail || ''}`);
+  });
+  out.textContent = lines.join('\n');
+}
+
+async function runLlmHealth() {
+  const out = document.getElementById('action-output');
+  out.textContent = 'checking LLM routing…';
+  const d = await api('/api/llm_health');
+  if (d.error) { out.textContent = '❌ ' + d.error; return; }
+  const lines = [];
+  lines.push(`🔎 LLM health check`);
+  lines.push('');
+  lines.push(`Groq key:       ${d.groq_key_present ? '✅ present (' + d.groq_key_length + ' chars)' : '❌ missing'}`);
+  lines.push(`Groq reachable: ${d.groq_reachable ? '✅' : '❌ ' + (d.groq_error || '(unreachable)')}`);
+  lines.push(`Ollama:         ${d.ollama_reachable ? '✅ reachable' : '❌ not running'}`);
+  lines.push('');
+  lines.push('Env overrides:');
+  Object.entries(d.env_overrides || {}).forEach(([k, v]) => {
+    lines.push(`  ${k} = ${v || '(unset)'}`);
+  });
+  lines.push('');
+  lines.push('Role → backend:');
+  Object.entries(d.role_routing || {}).forEach(([role, info]) => {
+    const mark = info.backend === 'groq' ? '✨'
+               : info.backend === 'ollama' ? '🦙'
+               : '⚠️';
+    lines.push(`  ${mark}  ${role.padEnd(10)}${info.backend.padEnd(8)} ${info.model || ''}`);
+  });
+  if (!d.groq_reachable && d.groq_key_present) {
+    lines.push('');
+    lines.push('⚠ Groq key is set but not reachable. Restart the bot so');
+    lines.push('  the key loads into process env: bash scripts/tradebotctl.sh restart');
+  }
+  if (!d.groq_key_present) {
+    lines.push('');
+    lines.push('⚠ GROQ_API_KEY is not in the running process env.');
+    lines.push('  Check your .env then RESTART: bash scripts/tradebotctl.sh restart');
+    lines.push('  (dotenv only loads at bot startup — changes to .env need a restart)');
+  }
+  out.textContent = lines.join('\n');
+}
+
 async function runResearch() {
   const syms = document.getElementById('research-symbols').value
     .split(',').map(s => s.trim().toUpperCase()).filter(Boolean);

@@ -1975,8 +1975,12 @@ def exit_reasons_api(days: int = Query(7, ge=1, le=365)):
 
 @app.post("/api/chat", response_class=JSONResponse)
 async def chat_api(request: Request):
-    """LLM chat. Body: {message: str, model?: '70b'|'8b'}."""
-    import json as _json
+    """LLM chat with INTENT-AWARE context. Classifies the question then
+    pulls ONLY the relevant data so the LLM doesn't recycle the same
+    4 data points for every question.
+
+    Body: {message: str, model?: '70b'|'8b'}.
+    """
     try:
         body = await request.json()
     except Exception:
@@ -1991,45 +1995,390 @@ async def chat_api(request: Request):
         client, model = build_llm_client_for(role)
         if client is None:
             return {"error": "no LLM configured (set GROQ_API_KEY)"}
-        # Add brief bot-context so the model isn't answering in a vacuum
-        ctx = _chat_context_snippet()
+
+        intent = _classify_chat_intent(msg)
+        context, system_hint = _build_intent_context(intent, msg)
         prompt = (
-            "You are the operator's copilot for a long-options paper "
-            "trading bot. Answer concisely (max 6 sentences) citing "
-            "specific numbers from the CONTEXT when relevant. If the "
-            "question is about trading mechanics, be technical + "
-            "precise. If about bot status, use the CONTEXT.\n\n"
-            f"CONTEXT:\n{ctx}\n\n"
+            f"{system_hint}\n\n"
+            f"CONTEXT ({intent}):\n{context}\n\n"
             f"OPERATOR: {msg}\n\nCOPILOT:"
         )
         resp = client.generate(
             model=model, prompt=prompt,
-            temperature=0.3, max_tokens=400,
+            temperature=0.35, max_tokens=500,
         )
-        return {"response": (resp or "").strip(), "model": model}
+        return {"response": (resp or "").strip(), "model": model,
+                "intent": intent}
     except Exception as e:                                  # noqa: BLE001
         return {"error": str(e)[:200]}
 
 
-def _chat_context_snippet() -> str:
-    """One-paragraph bot-state snippet to give the chat LLM grounding."""
+def _classify_chat_intent(msg: str) -> str:
+    """Classify the operator's question into a context bucket so we
+    pull the RIGHT data for the LLM.
+
+    Order matters — more specific intents checked first.
+    """
+    m = msg.lower()
+    # Exit tuning (check BEFORE strategy because "0dte exit" contains "0dte")
+    if any(w in m for w in ("tighten", "loosen", "threshold",
+                              "exit rule", "exit tun", "exit thresh",
+                              "give back", "give-back", "profit lock",
+                              "trailing stop")):
+        return "exit_tuning"
+    # Filter blocks
+    if any(w in m for w in ("not entering", "not trading", "no trade",
+                              "blocked", "filter", "skip", "reject",
+                              "blocking signal")):
+        return "filter_blocks"
+    # Trade review
+    if any(w in m for w in ("last trade", "why did", "why exit",
+                              "why close", "explain the", "review the",
+                              "what went wrong", "what happened",
+                              "recent trade")):
+        return "trade_review"
+    # Market regime
+    if any(w in m for w in ("regime", "breadth", "vix",
+                              "market state", "volatility")):
+        return "market_regime"
+    # Advisor
+    if any(w in m for w in ("advisor", "fade advisory",
+                              "should i hold", "should i close")):
+        return "advisor"
+    # Strategy buckets (check after exit_tuning)
+    if any(w in m for w in ("bucket", "0dte vs", "swing vs",
+                              "carrying", "per-strategy", "strategy perform",
+                              "compare 0dte")):
+        return "strategy"
+    # P&L summary (counts as trade_review with slightly different prompt)
+    if any(w in m for w in ("summarize", "summary", "today p&l",
+                              "today pnl", "best trade", "worst trade")):
+        return "trade_review"
+    # Bot status
+    if any(w in m for w in ("doing right now", "status", "health",
+                              "is bot", "is the bot", "what's the bot",
+                              "running", "alive")):
+        return "bot_status"
+    return "general"
+
+
+def _build_intent_context(intent: str, msg: str) -> tuple:
+    """Return (context_text, system_hint) tailored to the intent.
+    Each intent pulls DIFFERENT data — that's why answers stop looking
+    the same for every question."""
     import re as _re
     import json as _json
     from pathlib import Path as _P
-    parts: List[str] = []
-    # Broker state
+    from datetime import datetime, timedelta, timezone
+
+    # Always include minimal heartbeat so LLM knows bot is alive
+    base: List[str] = []
     try:
         snap = _P(__file__).resolve().parents[2] / "logs" / "broker_state.json"
         if snap.exists():
             d = _json.loads(snap.read_text())
-            parts.append(
-                f"cash=${d.get('cash', 0):.2f} "
-                f"day_pnl=${d.get('day_pnl', 0):+.2f} "
-                f"open_positions={len(d.get('positions') or [])}"
+            base.append(
+                f"bot_state: cash=${d.get('cash', 0):.2f}, "
+                f"day_pnl=${d.get('day_pnl', 0):+.2f}, "
+                f"local_positions={len(d.get('positions') or [])}"
             )
     except Exception:
         pass
-    # Regime + vix from log tail
+
+    # --------- intent dispatch ---------
+    if intent == "trade_review":
+        parts = list(base)
+        parts.append("### Recent closed trades (most recent last):")
+        try:
+            j = _load_journal()
+            try:
+                since = datetime.now(tz=timezone.utc) - timedelta(days=7)
+                trades = j.closed_trades(since=since)[-8:]
+            finally:
+                j.close()
+            for t in trades:
+                closed = (t.closed_at.strftime("%H:%M")
+                          if t.closed_at else "?")
+                tag_sym = ""
+                if t.entry_tag:
+                    sm = _re.search(r"\|sym=([A-Z]{1,6})", t.entry_tag)
+                    if sm:
+                        tag_sym = sm.group(1)
+                    strat_m = _re.search(r"\|strategy=(\w+)",
+                                           t.entry_tag or "")
+                    strat = strat_m.group(1) if strat_m else ""
+                    dte_m = _re.search(r"\|dte=(\d+)", t.entry_tag or "")
+                    dte = dte_m.group(1) if dte_m else "?"
+                else:
+                    strat, dte = "", "?"
+                parts.append(
+                    f"  - {closed} {tag_sym or t.symbol[:20]} "
+                    f"dte={dte} strategy={strat} "
+                    f"entry=${t.entry_price:.2f} exit=${t.exit_price or 0:.2f} "
+                    f"pnl=${t.pnl or 0:+.2f} ({(t.pnl_pct or 0)*100:+.1f}%) "
+                    f"reason={t.exit_reason or 'n/a'}"
+                )
+        except Exception as e:                          # noqa: BLE001
+            parts.append(f"(journal read failed: {e})")
+        hint = (
+            "You are the operator's trading copilot. Answer SPECIFICALLY "
+            "about the trades in the CONTEXT — cite real symbols, P&L, "
+            "exit reasons, times. Explain the WHY (what reason fired, "
+            "was it the right call, what would you tune). 3-5 sentences."
+        )
+        return "\n".join(parts), hint
+
+    if intent == "strategy":
+        parts = list(base)
+        parts.append("### Per-bucket strategy performance (last 7d):")
+        try:
+            j = _load_journal()
+            try:
+                since = datetime.now(tz=timezone.utc) - timedelta(days=7)
+                trades = j.closed_trades(since=since)
+            finally:
+                j.close()
+            from collections import defaultdict as _dd
+            b = _dd(lambda: {"n": 0, "w": 0, "l": 0,
+                              "pnl": 0.0, "pnls": []})
+            for t in trades:
+                tag = t.entry_tag or ""
+                m = _re.search(r"\|strategy=(\w+)", tag)
+                if m:
+                    name = m.group(1)
+                else:
+                    dm = _re.search(r"\|dte=(\d+)", tag)
+                    dte = int(dm.group(1)) if dm else 7
+                    name = ("0dte" if dte == 0 else
+                             "swing" if dte >= 14 else "short")
+                bs = b[name]
+                bs["n"] += 1
+                bs["pnl"] += t.pnl or 0
+                bs["pnls"].append(t.pnl_pct or 0)
+                if (t.pnl or 0) > 0:
+                    bs["w"] += 1
+                elif (t.pnl or 0) < 0:
+                    bs["l"] += 1
+            for name, bs in sorted(b.items(),
+                                     key=lambda kv: -kv[1]["pnl"]):
+                wr = bs["w"] / max(bs["n"], 1) * 100
+                avg_p = sum(bs["pnls"]) / max(len(bs["pnls"]), 1) * 100
+                parts.append(
+                    f"  - {name}: {bs['n']} trades, {bs['w']}W/{bs['l']}L "
+                    f"(winrate {wr:.0f}%), avg pnl {avg_p:+.1f}%, "
+                    f"total ${bs['pnl']:+.2f}"
+                )
+        except Exception as e:                          # noqa: BLE001
+            parts.append(f"(journal read failed: {e})")
+        hint = (
+            "You are the copilot. Compare the strategy buckets in "
+            "CONTEXT — which is carrying P&L, which is losing. "
+            "Recommend reallocation if one is clearly better. Cite "
+            "real numbers. 4-6 sentences."
+        )
+        return "\n".join(parts), hint
+
+    if intent == "filter_blocks":
+        parts = list(base)
+        parts.append("### Why signals are being blocked (last ~400 log lines):")
+        try:
+            log = _P(__file__).resolve().parents[2] / "logs" / "tradebot.out"
+            if log.exists():
+                size = log.stat().st_size
+                with log.open("rb") as f:
+                    f.seek(max(0, size - 300_000))
+                    if size > 300_000:
+                        f.readline()
+                    text = f.read().decode("utf-8", errors="replace")
+                text = _re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
+                from collections import Counter as _C
+                emits = _re.findall(r"ensemble_emit.*?direction=(\w+)"
+                                      r".*?symbol=(\w+).*?score=([\d.]+)", text)
+                skips = _re.findall(r"ensemble_skip.*?reason=(\S+)", text)
+                blocks = _re.findall(r"exec_chain_block.*?filter=(\w+)"
+                                       r".*?reason=['\"]?([^'\"]+?)['\"]?(?=\s|$)",
+                                       text)
+                parts.append(
+                    f"  emits: {len(emits)} in window "
+                    f"(last few: {emits[-3:]})"
+                )
+                skip_c = _C(s.split(':')[0] for s in skips)
+                parts.append(
+                    "  ensemble_skip reasons: " +
+                    ", ".join(f"{k}×{v}" for k, v in skip_c.most_common(5))
+                )
+                block_c = _C((f, r.split(':')[0]) for f, r in blocks)
+                parts.append(
+                    "  exec_chain_block top filters: " +
+                    ", ".join(f"{f}:{r}×{c}"
+                              for (f, r), c in block_c.most_common(6))
+                )
+                regimes = _re.findall(r"regime=(\w+)", text)
+                if regimes:
+                    parts.append(f"  current regime: {regimes[-1]}")
+        except Exception as e:                          # noqa: BLE001
+            parts.append(f"(log read failed: {e})")
+        hint = (
+            "You are the copilot. Identify the TOP 2-3 filters causing "
+            "the most blocks from CONTEXT. Name them specifically (f11, "
+            "f12, f19, etc.) and explain what they check. Recommend a "
+            "tunable that would unblock signals without breaking risk "
+            "discipline. Cite real counts. 4-6 sentences."
+        )
+        return "\n".join(parts), hint
+
+    if intent == "exit_tuning":
+        parts = list(base)
+        parts.append("### Saves tracker + exit reasons (last 48h):")
+        try:
+            from ..intelligence.saves_tracker import summary
+            s = summary(since_hours=48)
+            parts.append(
+                f"  net saves: ${s.get('saved_usd_30m', 0):+.2f} · "
+                f"{s.get('n_wins_30m', 0)} saves / "
+                f"{s.get('n_regrets_30m', 0)} regrets · "
+                f"{s.get('n_exits', 0)} defensive exits total"
+            )
+            by_r = s.get("by_reason", {})
+            parts.append("  by exit reason:")
+            for r, d in list(by_r.items())[:6]:
+                parts.append(f"    - {r}: {d['count']}× · "
+                             f"${d['saved_usd_30m']:+.2f}")
+            by_d = s.get("by_dte_bucket", {})
+            parts.append("  by DTE bucket:")
+            for k, v in by_d.items():
+                if v.get("count", 0) > 0:
+                    parts.append(
+                        f"    - {k.upper()}: {v['count']}× · "
+                        f"${v['saved_usd_30m']:+.2f}"
+                    )
+        except Exception as e:                          # noqa: BLE001
+            parts.append(f"(saves read failed: {e})")
+        hint = (
+            "You are the copilot. Use the saves data to recommend "
+            "whether to TIGHTEN or LOOSEN exit thresholds. Rule: "
+            "many regrets → thresholds too tight (loosen). Many saves → "
+            "tight is working (keep). Analyze per DTE bucket. Be "
+            "concrete — name the config knob. 4-6 sentences."
+        )
+        return "\n".join(parts), hint
+
+    if intent == "market_regime":
+        parts = list(base)
+        try:
+            log = _P(__file__).resolve().parents[2] / "logs" / "tradebot.out"
+            if log.exists():
+                size = log.stat().st_size
+                with log.open("rb") as f:
+                    f.seek(max(0, size - 120_000))
+                    if size > 120_000:
+                        f.readline()
+                    text = f.read().decode("utf-8", errors="replace")
+                text = _re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
+                snapshots = _re.findall(
+                    r"market_state_snapshot.*?regime=(\w+).*?vix=([\d.]+)"
+                    r"(?:.*?breadth_score=(-?[\d.]+|None))?", text
+                )
+                if snapshots:
+                    last = snapshots[-1]
+                    parts.append(
+                        f"  current: regime={last[0]} vix={last[1]} "
+                        f"breadth_score={last[2] or 'None'}"
+                    )
+                    # Trend
+                    if len(snapshots) >= 5:
+                        vix_trend = [float(s[1]) for s in snapshots[-5:]]
+                        parts.append(
+                            f"  vix last 5 samples: "
+                            f"{'→'.join(f'{v:.2f}' for v in vix_trend)}"
+                        )
+                emits = _re.findall(
+                    r"ensemble_emit.*?direction=(\w+)"
+                    r".*?symbol=(\w+).*?score=([\d.]+)",
+                    text
+                )[-5:]
+                parts.append(f"  last 5 ensemble emits: {emits}")
+        except Exception as e:                          # noqa: BLE001
+            parts.append(f"(log read failed: {e})")
+        hint = (
+            "You are the copilot. Explain the current market regime in "
+            "operator-friendly English. What does 'closing regime' mean? "
+            "Is the VIX trending up or down? Is breadth risk-on or "
+            "risk-off? How does this affect what the bot should do. "
+            "Cite real numbers. 4-6 sentences."
+        )
+        return "\n".join(parts), hint
+
+    if intent == "advisor":
+        parts = list(base)
+        try:
+            from ..intelligence.position_advisor import _store_path
+            import time as _t
+            import json as _json2
+            p = _P(str(_store_path()))
+            if p.exists():
+                d = _json2.loads(p.read_text() or "{}")
+                cutoff = _t.time() - 6 * 3600
+                active = [v for v in d.values()
+                           if float(v.get("ts", 0)) > cutoff]
+                parts.append(f"  active advisories: {len(active)}")
+                for a in active[:4]:
+                    parts.append(
+                        f"    - {a.get('symbol')} "
+                        f"peak={a.get('peak_pnl_pct', 0)*100:+.1f}% "
+                        f"now={a.get('current_pnl_pct', 0)*100:+.1f}% "
+                        f"rec={a.get('recommendation')} "
+                        f"({a.get('rationale', '')[:100]})"
+                    )
+            else:
+                parts.append("  no advisory file yet")
+        except Exception as e:                          # noqa: BLE001
+            parts.append(f"(advisor read failed: {e})")
+        hint = (
+            "You are the copilot. Walk through each active advisory, "
+            "state whether you agree with the rec (close/trim/hold), "
+            "and explain what a smart operator should do. If there are "
+            "no advisories, say that plainly. 3-6 sentences."
+        )
+        return "\n".join(parts), hint
+
+    if intent == "bot_status":
+        parts = list(base)
+        # Recent activity pulse
+        try:
+            log = _P(__file__).resolve().parents[2] / "logs" / "tradebot.out"
+            if log.exists():
+                size = log.stat().st_size
+                with log.open("rb") as f:
+                    f.seek(max(0, size - 60_000))
+                    if size > 60_000:
+                        f.readline()
+                    text = f.read().decode("utf-8", errors="replace")
+                text = _re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
+                fills = len(_re.findall(r"\[info.*?\]\s*fill\s", text))
+                exits = len(_re.findall(r"fast_exit", text))
+                emits = len(_re.findall(r"ensemble_emit", text))
+                skips = len(_re.findall(r"ensemble_skip", text))
+                parts.append(
+                    f"  recent activity (~60KB tail): "
+                    f"{fills} fills, {exits} exits, "
+                    f"{emits} emits, {skips} skips"
+                )
+                regimes = _re.findall(r"regime=(\w+)", text)
+                if regimes:
+                    parts.append(f"  regime: {regimes[-1]}")
+        except Exception:
+            pass
+        hint = (
+            "You are the copilot. Summarize in plain English what the "
+            "bot is doing right now based on CONTEXT. Are signals "
+            "firing, is it trading, are we in a good state. 3-5 "
+            "sentences."
+        )
+        return "\n".join(parts), hint
+
+    # --- general fallback: mixed snapshot ---
+    parts = list(base)
     try:
         log = _P(__file__).resolve().parents[2] / "logs" / "tradebot.out"
         if log.exists():
@@ -2043,12 +2392,16 @@ def _chat_context_snippet() -> str:
             regimes = _re.findall(r"regime=(\w+)", text)
             vixs = _re.findall(r"\bvix=([0-9.]+)", text)
             if regimes:
-                parts.append(f"regime={regimes[-1]}")
+                parts.append(f"regime: {regimes[-1]}")
             if vixs:
-                parts.append(f"vix={vixs[-1]}")
+                parts.append(f"vix: {vixs[-1]}")
     except Exception:
         pass
-    return " · ".join(parts) if parts else "(no state available)"
+    hint = (
+        "You are the operator's trading copilot. Answer specifically. "
+        "Cite numbers from CONTEXT when relevant. 3-5 sentences."
+    )
+    return "\n".join(parts), hint
 
 
 @app.post("/api/action/research", response_class=JSONResponse)
@@ -2121,6 +2474,247 @@ async def action_close(request: Request):
                 "message": f"close intent queued for {symbol} ({kind})"}
     except Exception as e:                                  # noqa: BLE001
         return {"ok": False, "error": str(e)[:200]}
+
+
+@app.get("/api/llm_health", response_class=JSONResponse)
+def llm_health_api():
+    """Which LLM will each role use? Diagnostic — shows if Groq key is
+    loaded, if Ollama is reachable, and what each role routes to."""
+    try:
+        from ..intelligence.groq_client import llm_health
+        return llm_health()
+    except Exception as e:                                  # noqa: BLE001
+        return {"error": str(e)[:300]}
+
+
+@app.post("/api/action/bot_control", response_class=JSONResponse)
+async def bot_control_with_verify(request: Request):
+    """Start/stop/restart with BEFORE/AFTER status verification.
+    Body: {action: 'start'|'stop'|'restart'}.
+    Returns rich status so the dashboard can show what actually changed.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    action = str(body.get("action", "")).strip()
+    if action not in ("start", "stop", "restart"):
+        return {"ok": False, "error": f"bad action: {action}"}
+
+    before = _run_ctl("status", timeout=5.0)
+    before_running = (before.get("ok") and
+                       "running" in (before.get("stdout") or "").lower()
+                       and "not running" not in (before.get("stdout") or "").lower())
+
+    t_to = 45.0 if action == "restart" else (25.0 if action == "start" else 15.0)
+    result = _run_ctl(action, timeout=t_to)
+
+    import time as _t
+    _t.sleep(1.5)   # give launchd a moment to reflect
+    after = _run_ctl("status", timeout=5.0)
+    after_running = (after.get("ok") and
+                      "running" in (after.get("stdout") or "").lower()
+                      and "not running" not in (after.get("stdout") or "").lower())
+
+    # Build human message
+    changed = before_running != after_running
+    msg_bits = [f"action: {action}"]
+    msg_bits.append(
+        f"before: {'running' if before_running else 'stopped'}"
+    )
+    msg_bits.append(
+        f"after: {'running' if after_running else 'stopped'}"
+    )
+    if action == "restart" and before_running and after_running:
+        msg_bits.append("bot restarted cleanly")
+        changed = True
+    elif action == "start" and after_running:
+        msg_bits.append("bot started")
+    elif action == "stop" and not after_running:
+        msg_bits.append("bot stopped")
+    elif action == "start" and before_running:
+        msg_bits.append("(already was running — no change)")
+    elif action == "stop" and not before_running:
+        msg_bits.append("(already was stopped — no change)")
+    else:
+        msg_bits.append("⚠️ state didn't change as expected")
+
+    return {
+        "ok": bool(result.get("ok")) and (changed or action == "restart"),
+        "message": " · ".join(msg_bits),
+        "action": action,
+        "before_running": before_running,
+        "after_running": after_running,
+        "stdout": result.get("stdout", "")[:800],
+        "stderr": result.get("stderr", "")[:400],
+        "rc": result.get("rc"),
+    }
+
+
+@app.get("/api/diagnostics", response_class=JSONResponse)
+def diagnostics_api():
+    """Full end-to-end diagnostic — tests each subsystem the dashboard
+    depends on. Result: {checks: [{name, ok, detail}, ...]}.
+    Answers 'does this actually work?' for every button on the dashboard."""
+    import time as _t
+    checks: List[Dict[str, Any]] = []
+
+    # 1. Bot running?
+    try:
+        st = _run_ctl("status", timeout=5.0)
+        is_up = "running" in (st.get("stdout") or "").lower() and \
+                "not running" not in (st.get("stdout") or "").lower()
+        checks.append({
+            "name": "paper bot process",
+            "ok": bool(is_up),
+            "detail": (st.get("stdout") or "").strip()[:200],
+        })
+    except Exception as e:
+        checks.append({"name": "paper bot process", "ok": False,
+                        "detail": str(e)[:200]})
+
+    # 2. Heartbeat
+    try:
+        from pathlib import Path as _P
+        hb = _P(__file__).resolve().parents[2] / "logs" / "heartbeat.txt"
+        if hb.exists():
+            age = _t.time() - hb.stat().st_mtime
+            checks.append({
+                "name": "main_loop heartbeat",
+                "ok": age < 300,
+                "detail": f"{age:.0f}s ago (fresh if < 300s)",
+            })
+        else:
+            checks.append({"name": "main_loop heartbeat", "ok": False,
+                            "detail": "no heartbeat.txt"})
+    except Exception as e:
+        checks.append({"name": "main_loop heartbeat", "ok": False,
+                        "detail": str(e)[:200]})
+
+    # 3. Tradier
+    try:
+        from ..brokers.tradier_adapter import build_tradier_broker
+        tb = build_tradier_broker()
+        if tb is None:
+            checks.append({"name": "Tradier broker", "ok": False,
+                            "detail": "not configured (TRADIER_TOKEN missing)"})
+        else:
+            positions = list(tb.positions())
+            checks.append({
+                "name": "Tradier broker",
+                "ok": True,
+                "detail": f"{len(positions)} positions",
+            })
+    except Exception as e:
+        checks.append({"name": "Tradier broker", "ok": False,
+                        "detail": str(e)[:200]})
+
+    # 4. Groq
+    try:
+        from ..intelligence.groq_client import build_groq_client
+        g = build_groq_client()
+        if g is None:
+            checks.append({"name": "Groq 70B",
+                            "ok": False,
+                            "detail": "GROQ_API_KEY not loaded — "
+                                      "restart bot after adding to .env"})
+        else:
+            reachable = g.ping()
+            checks.append({"name": "Groq 70B",
+                            "ok": bool(reachable),
+                            "detail": "reachable" if reachable
+                                      else "key set but ping failed"})
+    except Exception as e:
+        checks.append({"name": "Groq 70B", "ok": False,
+                        "detail": str(e)[:200]})
+
+    # 5. Ollama
+    try:
+        from ..intelligence.ollama_client import build_ollama_client
+        oc = build_ollama_client()
+        if oc is None:
+            checks.append({"name": "Ollama 8B",
+                            "ok": False,
+                            "detail": "not configured"})
+        else:
+            checks.append({"name": "Ollama 8B",
+                            "ok": bool(oc.ping()),
+                            "detail": "reachable" if oc.ping()
+                                      else "not running"})
+    except Exception as e:
+        checks.append({"name": "Ollama 8B", "ok": False,
+                        "detail": str(e)[:200]})
+
+    # 6. Data provider (Multi)
+    try:
+        from ..data.multi_provider import MultiProvider
+        mp = MultiProvider.from_env()
+        active = mp.active_providers()
+        q = None
+        try:
+            q = mp.latest_quote("SPY")
+        except Exception:
+            pass
+        ok = bool(active) and (q is not None and getattr(q, "mid", 0) > 0)
+        checks.append({
+            "name": "Data providers",
+            "ok": ok,
+            "detail": (f"active={active}; "
+                       f"SPY quote mid="
+                       f"{getattr(q, 'mid', None) if q else None}"),
+        })
+    except Exception as e:
+        checks.append({"name": "Data providers", "ok": False,
+                        "detail": str(e)[:200]})
+
+    # 7. Journal
+    try:
+        j = _load_journal()
+        try:
+            n = len(j.closed_trades())
+        finally:
+            j.close()
+        checks.append({"name": "Trade journal",
+                        "ok": True,
+                        "detail": f"{n} closed trades"})
+    except Exception as e:
+        checks.append({"name": "Trade journal", "ok": False,
+                        "detail": str(e)[:200]})
+
+    # 8. Advisory file
+    try:
+        from ..intelligence.position_advisor import _store_path
+        from pathlib import Path as _P
+        import json as _json
+        p = _P(str(_store_path()))
+        if p.exists():
+            d = _json.loads(p.read_text() or "{}")
+            checks.append({"name": "Position advisories",
+                            "ok": True,
+                            "detail": f"{len(d)} advisory records"})
+        else:
+            checks.append({"name": "Position advisories",
+                            "ok": True,
+                            "detail": "no file yet (no advisories fired)"})
+    except Exception as e:
+        checks.append({"name": "Position advisories", "ok": False,
+                        "detail": str(e)[:200]})
+
+    # 9. Saves tracker
+    try:
+        from ..intelligence.saves_tracker import summary
+        s = summary(since_hours=24)
+        checks.append({"name": "Saves tracker",
+                        "ok": True,
+                        "detail": f"{s.get('n_exits', 0)} exits tracked, "
+                                  f"${s.get('saved_usd_30m', 0):+.2f} net"})
+    except Exception as e:
+        checks.append({"name": "Saves tracker", "ok": False,
+                        "detail": str(e)[:200]})
+
+    return {"checks": checks,
+             "ok_count": sum(1 for c in checks if c["ok"]),
+             "total": len(checks)}
 
 
 @app.post("/api/action/cleanup", response_class=JSONResponse)

@@ -152,15 +152,67 @@ def _resolve_model(requested: str, default: str) -> str:
 
 
 def build_groq_client() -> Optional[GroqClient]:
-    """Factory. Returns None when GROQ_API_KEY isn't set."""
+    """Factory. Returns None when GROQ_API_KEY isn't set.
+    Emits WARNING-level log so the operator can see why Groq was
+    skipped (previously silent → user thought Ollama 8B was Groq)."""
     key = (os.getenv("GROQ_API_KEY") or "").strip()
     if not key:
+        _log.warning("groq_build_skip: GROQ_API_KEY not set "
+                      "(bot process hasn't loaded the key — restart required)")
         return None
     try:
-        return GroqClient(GroqConfig(api_key=key))
+        client = GroqClient(GroqConfig(api_key=key))
+        _log.info("groq_build_ok: key_len=%d", len(key))
+        return client
     except Exception as e:                              # noqa: BLE001
-        _log.info("groq_build_failed err=%s", e)
+        _log.warning("groq_build_failed err=%s", e)
         return None
+
+
+def llm_health() -> dict:
+    """Diagnostic — shows exactly what build_llm_client_for() would
+    return for each role. Used by the dashboard /api/llm_health.
+    Does NOT send any real prompts; just tests client builds + ping."""
+    import os as _os
+    result = {
+        "groq_key_present": bool((_os.getenv("GROQ_API_KEY") or "").strip()),
+        "groq_key_length": len((_os.getenv("GROQ_API_KEY") or "").strip()),
+        "env_overrides": {
+            "LLM_AUDITOR_MODEL": _os.getenv("LLM_AUDITOR_MODEL", ""),
+            "LLM_BRAIN_MODEL": _os.getenv("LLM_BRAIN_MODEL", ""),
+            "LLM_CHAT_MODEL": _os.getenv("LLM_CHAT_MODEL", ""),
+        },
+        "groq_reachable": False,
+        "groq_error": None,
+        "ollama_reachable": False,
+    }
+    try:
+        g = build_groq_client()
+        if g is not None:
+            result["groq_reachable"] = bool(g.ping())
+    except Exception as e:
+        result["groq_error"] = str(e)[:200]
+    try:
+        from .ollama_client import build_ollama_client
+        oc = build_ollama_client()
+        if oc is not None:
+            result["ollama_reachable"] = bool(oc.ping())
+    except Exception as e:
+        result["ollama_error"] = str(e)[:200]
+
+    # What would each role route to?
+    routes = {}
+    for role in ("research", "audit", "macro", "catalyst",
+                  "chat_70b", "chat", "brain"):
+        try:
+            client, model = build_llm_client_for(role)
+            backend = "groq" if (client.__class__.__name__ == "GroqClient") \
+                       else ("ollama" if client is not None else "none")
+            routes[role] = {"backend": backend, "model": model}
+        except Exception as e:
+            routes[role] = {"backend": "error", "error": str(e)[:100]}
+    result["role_routing"] = routes
+    return result
 
 
 # ----------------------------------------------------------- role-based factory
