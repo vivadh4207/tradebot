@@ -148,30 +148,40 @@ class FastExitConfig:
     zdte_snap_close_pct: float = 0.25     # full at +25%
     zdte_snap_absolute_cap_pct: float = 0.40  # mandatory at +40%
 
-    # ---- TIERED PROFIT SCALE-OUT (safety-net for winners) ----
-    # Operator: "we need safety net to have money come in and not lose
-    # here." Progressive profit-taking so cash is in hand at each
-    # milestone while some contracts still ride for bigger gains.
+    # ---- TIERED PROFIT SCALE-OUT + RUNNER (safety-net + upside) ----
+    # Operator: "we need safety net to have money come in and not lose"
+    # AND "what if it rides more than 18% how do we plan on taking care
+    # of that?" Answer: scale out progressively to secure cash, then
+    # keep ONE "runner" contract that rides indefinitely with adaptive
+    # trailing stops that TIGHTEN as peak pnl climbs higher.
     #
     # For a 3-contract entry:
-    #   +8%  pnl → sell 1 contract (1/3 locked in)
-    #   +15% pnl → sell 1 more (2/3 locked)
-    #   +25% pnl → sell last one (full close)
-    # For 6+ contracts: two contracts per tier.
-    # For 2 contracts:  one per tier.
-    # For 1 contract:   no scale-out, relies on profit-lock + snap-take.
+    #   +8%  → sell 1 (1/3 in cash, 2 left)
+    #   +15% → sell 1 (2/3 in cash, 1 "runner" left)
+    #   +25% → DON'T close — activate runner-mode with 15% give-back
+    #   +40% → tighten runner trail to 10% give-back
+    #   +60% → tighten to 8%
+    #   +100%+ → tighten to 5% (lock 95% of peak)
+    # If peak hits +200%, a 5% retrace = still +190% net.
+    # No hard ceiling → big moves captured fully.
     #
-    # After each scale-out, the REMAINING contracts ride with profit-lock
-    # trailing → worst case they retrace back to peak×(1-give_back), but
-    # the locked profit is ALREADY in cash so the trade can't go net negative.
+    # This replaces the old "close all at +25%" with "keep 1 riding."
     tiered_scale_out_enabled: bool = True
-    tier1_pnl_pct: float = 0.08           # first take at +8%
-    tier2_pnl_pct: float = 0.15           # second take at +15%
-    tier3_pnl_pct: float = 0.25           # full close at +25%
-    # DTE-specific tightening for 0DTE (take profit much earlier):
-    tier1_pnl_0dte: float = 0.05          # first take at +5% for 0DTE
+    tier1_pnl_pct: float = 0.08
+    tier2_pnl_pct: float = 0.15
+    runner_activate_pct: float = 0.25     # past this, enter runner-mode
+    # DTE-specific tighter tiers for 0DTE (theta kills fast):
+    tier1_pnl_0dte: float = 0.05
     tier2_pnl_0dte: float = 0.10
-    tier3_pnl_0dte: float = 0.18
+    runner_activate_0dte: float = 0.18
+    # Runner trail tightening schedule — as peak pnl climbs, give-back
+    # shrinks. Format: [(peak_threshold, give_back_pct), ...]
+    runner_trail_schedule: tuple = (
+        (1.00, 0.05),    # peak ≥ +100% → trail 5% from peak
+        (0.60, 0.08),    # peak ≥ +60%  → trail 8%
+        (0.40, 0.10),    # peak ≥ +40%  → trail 10%
+        (0.25, 0.15),    # peak ≥ +25%  → trail 15%  (runner activation)
+    )
 
     # Exhaustion applied to ALL DTEs (not just 0DTE) — operator:
     # "even for long positions, if in profit cut it immediately."
@@ -540,34 +550,44 @@ class FastExitEvaluator:
 
             # Pick thresholds by DTE
             if dte == 0:
-                t1, t2, t3 = (self.cfg.tier1_pnl_0dte,
-                               self.cfg.tier2_pnl_0dte,
-                               self.cfg.tier3_pnl_0dte)
+                t1, t2 = self.cfg.tier1_pnl_0dte, self.cfg.tier2_pnl_0dte
+                runner_act = self.cfg.runner_activate_0dte
                 dte_tag = "0dte"
             else:
-                t1, t2, t3 = (self.cfg.tier1_pnl_pct,
-                               self.cfg.tier2_pnl_pct,
-                               self.cfg.tier3_pnl_pct)
+                t1, t2 = self.cfg.tier1_pnl_pct, self.cfg.tier2_pnl_pct
+                runner_act = self.cfg.runner_activate_pct
                 dte_tag = "swing" if dte >= 14 else "short"
 
             total_qty = abs(pos.qty)
-            # How many contracts per tier — aim for 3 equal chunks
             per_tier = max(1, total_qty // 3)
 
-            # TIER 3 — last tranche, full close
-            if (pnl >= t3 and not getattr(pos, "tier3_taken", False)):
-                try:
-                    pos.tier3_taken = True
-                except Exception:
-                    pass
-                return ExitDecision(
-                    True,
-                    f"tier3_close_{dte_tag}:pnl={pnl:+.2%}_>={t3:+.0%}"
-                    f"_last_tranche_closing_all",
-                    layer=0,
-                    # full close (no close_qty override)
-                )
-            # TIER 2 — second take-off
+            # ---- RUNNER MODE (the big-move catcher) ----
+            # Once peak pnl has crossed runner_activate_pct, the
+            # remaining contract(s) ride with adaptive trail tightening.
+            # Trail gets TIGHTER as peak climbs higher, so we lock more
+            # of the profit if big-move contracts start reversing.
+            if (peak_pnl_attr is not None
+                    and peak_pnl_attr >= runner_act):
+                # Pick give-back based on peak tier — first-match wins
+                give_back = None
+                matched_tier = None
+                for peak_thresh, gb in self.cfg.runner_trail_schedule:
+                    if peak_pnl_attr >= peak_thresh:
+                        give_back = gb
+                        matched_tier = peak_thresh
+                        break
+                if give_back is not None:
+                    runner_floor = peak_pnl_attr * (1.0 - give_back)
+                    if pnl <= runner_floor and pnl > 0:
+                        return ExitDecision(
+                            True,
+                            f"runner_trail_{dte_tag}:peak={peak_pnl_attr:+.1%}"
+                            f"_now={pnl:+.2%}_tier_at_{matched_tier:+.0%}"
+                            f"_give_back_{give_back:.0%}",
+                            layer=0,
+                        )
+
+            # TIER 2 — second scale-out, leaves 1 runner
             if (pnl >= t2 and not getattr(pos, "tier2_taken", False)
                     and total_qty >= 2):
                 try:
@@ -577,13 +597,13 @@ class FastExitEvaluator:
                 return ExitDecision(
                     True,
                     f"tier2_scale_{dte_tag}:pnl={pnl:+.2%}_>={t2:+.0%}"
-                    f"_closing_{per_tier}of{total_qty}",
+                    f"_closing_{per_tier}of{total_qty}_runner_remains",
                     layer=0,
                     close_qty=per_tier,
                 )
-            # TIER 1 — first safety-net take
+            # TIER 1 — first safety-net scale
             if (pnl >= t1 and not getattr(pos, "tier1_taken", False)
-                    and total_qty >= 3):   # only scale if 3+ contracts
+                    and total_qty >= 3):
                 try:
                     pos.tier1_taken = True
                 except Exception:
