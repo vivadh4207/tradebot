@@ -558,6 +558,46 @@ class TradeBot:
                     ),
                 ))
                 log.info("candle_patterns_signal_enabled")
+            # SRBounceBreak — operator's manual strategy codified.
+            # "I watch SPY/QQQ at key levels and buy calls on bounces
+            # from support, but puts when it drops from support."
+            # Fires ONLY on SPY/QQQ/IWM/DIA with high-confluence setups
+            # (VWAP + prior-day levels + round numbers). Weighted 2x in
+            # ensemble to dominate the noisy kitchen-sink signals.
+            srbb_cfg = settings.raw.get("signals", {}).get(
+                "sr_bounce_break", {}
+            ) or {}
+            if srbb_cfg.get("enabled", True):     # enabled by default
+                from .signals.sr_bounce_break import (
+                    SRBounceBreakSignal, SRBounceBreakConfig,
+                )
+                self.strategies.append(SRBounceBreakSignal(
+                    SRBounceBreakConfig(
+                        min_bars=int(srbb_cfg.get("min_bars", 30)),
+                        support_touch_lookback=int(
+                            srbb_cfg.get("support_touch_lookback", 5),
+                        ),
+                        bounce_rejection_bars=int(
+                            srbb_cfg.get("bounce_rejection_bars", 2),
+                        ),
+                        break_confirmation_bars=int(
+                            srbb_cfg.get("break_confirmation_bars", 1),
+                        ),
+                        level_proximity_pct=float(
+                            srbb_cfg.get("level_proximity_pct", 0.003),
+                        ),
+                        volume_surge_multiple=float(
+                            srbb_cfg.get("volume_surge_multiple", 1.20),
+                        ),
+                        rsi_oversold=float(
+                            srbb_cfg.get("rsi_oversold", 40.0),
+                        ),
+                        rsi_overbought=float(
+                            srbb_cfg.get("rsi_overbought", 60.0),
+                        ),
+                    )
+                ))
+                log.info("sr_bounce_break_signal_enabled")
             # Optional technical-analysis signal — RSI divergence,
             # double top/bottom, median break, Bollinger reclaim,
             # multi-timeframe RSI confluence. Catches the kind of

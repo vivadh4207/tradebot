@@ -510,11 +510,19 @@ options_research:
 # Strategies recommended by the advanced quant review as the highest-
 # Sharpe additions for a $100K retail account on SPY/QQQ.
 credit_spreads:
-  enabled: false                 # set to true to activate — off by default
-                                 # so first live deploy is opt-in
+  # Operator decision 2026-04-23: enabled for pivot experiment.
+  # Directional long-options showed 0 winners today — selling
+  # premium in range-bound tape is structurally better. Safe
+  # defaults: weekly only, SPY+QQQ only, max 2 open positions,
+  # 50% PT, force-close at 21 DTE. Zero-DTE spreads stay OFF
+  # until weekly paper-trades prove out over 30+ days.
+  enabled: true
   weekly_enabled: true           # 30-45 DTE put credit spreads, 0.20 delta
-  zero_dte_enabled: false        # 0DTE support + RSI spreads (enable after
-                                 # weekly has 30+ days of paper track record)
+  zero_dte_enabled: false        # leave off — adds complexity + gamma risk
+  # Regime gate — only SELL premium when vol is low/compressing.
+  # In trend_highvol / high-vol regimes, premium is expensive for
+  # a reason (market pricing real risk). Stand aside there.
+  regime_gate: ["range_lowvol", "range_highvol", "trend_lowvol"]
   universe: [SPY, QQQ]
   weekly:
     dte_min: 30

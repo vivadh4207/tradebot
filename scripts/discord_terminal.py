@@ -148,6 +148,7 @@ COMMAND_MAP: Dict[str, Tuple[str, bool]] = {
     "cleanup":        ("broker-cleanup",  False),    # handled in-process; see _handle_cleanup
     "intel":          ("finnhub-intel",   False),    # handled in-process; see _handle_intel
     "calendars":      ("finnhub-calendars", False),  # handled in-process; see _handle_calendars
+    "analyze":        ("entry-analysis",  False),    # handled in-process; see _handle_analyze
     "reset-paper":   ("reset-paper",     True),       # requires DESTROY confirm
     "wipe":          ("wipe-journal",    True),       # requires DESTROY confirm
 }
@@ -363,6 +364,12 @@ class CommandRunner:
             return await self._handle_intel(parts[1].upper().strip())
         if command == "calendars":
             return await self._handle_calendars()
+        if command == "analyze":
+            parts = (raw_text or "").split()
+            days = 14
+            if len(parts) >= 2 and parts[1].isdigit():
+                days = max(1, min(365, int(parts[1])))
+            return await self._handle_analyze(days)
         if destroyed and subcmd == "reset-paper":
             # reset_paper.py supports --yes to skip its own interactive prompt
             extra_args = ["--yes"]
@@ -612,6 +619,18 @@ class CommandRunner:
             return "\n".join(lines)[:1900]
         except Exception as e:
             return f"intel failed: {type(e).__name__}: {str(e)[:200]}"
+
+    async def _handle_analyze(self, days: int) -> str:
+        """Entry-quality analysis — signal × regime breakdown."""
+        try:
+            from scripts.run_entry_analysis import analyze, _format_discord
+            loop = asyncio.get_event_loop()
+            def _call():
+                d = analyze(since_days=days, min_trades=2)
+                return _format_discord(d)
+            return await loop.run_in_executor(None, _call)
+        except Exception as e:
+            return f"analyze failed: {type(e).__name__}: {str(e)[:200]}"
 
     async def _handle_calendars(self) -> str:
         """Upcoming IPO + FDA advisory calendars — market-moving events."""
