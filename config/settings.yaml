@@ -112,7 +112,7 @@ execution:
   # option, skip — there are always cheaper strikes elsewhere.
   max_spread_pct_etf: 0.03
   max_spread_pct_stock: 0.06
-  min_open_interest: 100
+  min_open_interest:    50
   min_today_option_volume: 100
   max_0dte_per_day: 20
   # Hard per-contract premium cap. Cheap contracts let us diversify

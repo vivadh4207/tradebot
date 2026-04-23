@@ -1752,6 +1752,191 @@ def _build_app():
                     f"premium cap failed: {e}", ephemeral=True,
                 )
 
+        # ---- Row 5: Entry filter tuning (premium + OI + spread) -------
+
+        @discord.ui.button(label="📈 Looser entries",
+                            style=discord.ButtonStyle.success,
+                            custom_id="ta:entries_loose", row=5)
+        async def btn_entries_loose(self, interaction, _):
+            """Bumps premium cap ($3→$4), lowers OI floor (100→50),
+            widens spread cap (ETF 3%→5%, stock 6%→8%). Use when the
+            chain is blocking too many signals as `premium_too_high`
+            or `oi_too_low`."""
+            if not await self._authorized(interaction):
+                return
+            try:
+                from src.core.runtime_overrides import set_override
+                set_override("max_premium_per_contract_usd", 4.00)
+                set_override("min_open_interest", 50)
+                set_override("min_today_option_volume", 25)
+                set_override("max_spread_pct_etf", 0.05)
+                set_override("max_spread_pct_stock", 0.08)
+                _audit({"kind": "entries_loose",
+                        "user": interaction.user.id})
+                await interaction.response.send_message(
+                    "📈 **Looser entries active**\n"
+                    "• Max premium: $3.00 → **$4.00**\n"
+                    "• Min OI: 100 → **50**\n"
+                    "• Min today volume: 100 → **25**\n"
+                    "• Max spread ETF: 3% → **5%**\n"
+                    "• Max spread stock: 6% → **8%**\n"
+                    "_Takes effect next tick — no restart needed._",
+                    ephemeral=True,
+                )
+            except Exception as e:
+                await interaction.response.send_message(
+                    f"loosen failed: {e}", ephemeral=True,
+                )
+
+        @discord.ui.button(label="📊 Balanced",
+                            style=discord.ButtonStyle.secondary,
+                            custom_id="ta:entries_balanced", row=5)
+        async def btn_entries_balanced(self, interaction, _):
+            """Reset entry filters to config defaults."""
+            if not await self._authorized(interaction):
+                return
+            try:
+                from src.core.runtime_overrides import set_override
+                for k in ("max_premium_per_contract_usd",
+                          "min_open_interest",
+                          "min_today_option_volume",
+                          "max_spread_pct_etf",
+                          "max_spread_pct_stock"):
+                    set_override(k, None)
+                _audit({"kind": "entries_balanced",
+                        "user": interaction.user.id})
+                await interaction.response.send_message(
+                    "📊 **Balanced entries** — all filter overrides cleared, "
+                    "config/settings.yaml defaults restored.",
+                    ephemeral=True,
+                )
+            except Exception as e:
+                await interaction.response.send_message(
+                    f"balanced failed: {e}", ephemeral=True,
+                )
+
+        @discord.ui.button(label="🔒 Tight entries",
+                            style=discord.ButtonStyle.danger,
+                            custom_id="ta:entries_tight", row=5)
+        async def btn_entries_tight(self, interaction, _):
+            """Tighten filters — quality over quantity. Only the best
+            confluence + most liquid contracts get through."""
+            if not await self._authorized(interaction):
+                return
+            try:
+                from src.core.runtime_overrides import set_override
+                set_override("max_premium_per_contract_usd", 2.00)
+                set_override("min_open_interest", 200)
+                set_override("min_today_option_volume", 200)
+                set_override("max_spread_pct_etf", 0.02)
+                set_override("max_spread_pct_stock", 0.05)
+                _audit({"kind": "entries_tight",
+                        "user": interaction.user.id})
+                await interaction.response.send_message(
+                    "🔒 **Tight entries active** — only liquid, cheap, "
+                    "high-confluence trades.\n"
+                    "• Max premium: **$2.00**\n"
+                    "• Min OI: **200**\n"
+                    "• Min today volume: **200**\n"
+                    "• Max spread ETF: **2%**  ·  stock: **5%**",
+                    ephemeral=True,
+                )
+            except Exception as e:
+                await interaction.response.send_message(
+                    f"tighten failed: {e}", ephemeral=True,
+                )
+
+        # ---- Row 6: Quantity per entry ------------------------------
+
+        @discord.ui.button(label="📦 Qty = 1",
+                            style=discord.ButtonStyle.secondary,
+                            custom_id="ta:qty_1", row=6)
+        async def btn_qty_1(self, interaction, _):
+            """Default — 1 contract per entry (Kelly-independent)."""
+            if not await self._authorized(interaction):
+                return
+            await self._set_qty(interaction, 1, 3, "Qty=1")
+
+        @discord.ui.button(label="📦📦 Qty = 2",
+                            style=discord.ButtonStyle.primary,
+                            custom_id="ta:qty_2", row=6)
+        async def btn_qty_2(self, interaction, _):
+            """2 contracts per entry — 2× upside, 2× size."""
+            if not await self._authorized(interaction):
+                return
+            await self._set_qty(interaction, 2, 5, "Qty=2")
+
+        @discord.ui.button(label="📦📦📦 Qty = 3",
+                            style=discord.ButtonStyle.primary,
+                            custom_id="ta:qty_3", row=6)
+        async def btn_qty_3(self, interaction, _):
+            """3 contracts per entry — aggressive."""
+            if not await self._authorized(interaction):
+                return
+            await self._set_qty(interaction, 3, 6, "Qty=3")
+
+        @discord.ui.button(label="📦×5 Qty = 5",
+                            style=discord.ButtonStyle.danger,
+                            custom_id="ta:qty_5", row=6)
+        async def btn_qty_5(self, interaction, _):
+            """5 contracts per entry — very aggressive, enable scale-out path."""
+            if not await self._authorized(interaction):
+                return
+            await self._set_qty(interaction, 5, 8, "Qty=5")
+
+        async def _set_qty(self, interaction, default_q: int,
+                            max_strong: int, label: str):
+            try:
+                from src.core.runtime_overrides import set_override
+                set_override("default_qty_per_entry", default_q)
+                set_override("max_qty_if_strong", max_strong)
+                _audit({"kind": "qty_override",
+                        "user": interaction.user.id,
+                        "default": default_q, "max_strong": max_strong})
+                await interaction.response.send_message(
+                    f"📦 **{label}** — each entry now buys **{default_q} "
+                    f"contracts** by default (up to **{max_strong}** on "
+                    "strong momentum: delta 0.40-0.55 + 5-bar move ≥0.5% + "
+                    "volume ≥2× baseline).\n\n"
+                    "⚠️ Reminder — your other safety rails still apply:\n"
+                    "• `max_contracts_0dte: 5` and `max_contracts_multiday: 10`\n"
+                    "• `kelly_hard_cap_pct: 5%` of equity per position\n"
+                    "• `max_risk_per_trade_pct: 1%`\n"
+                    "• `max_premium_per_contract_usd` (currently "
+                    "from overrides or $3.00 default)\n"
+                    "So `Qty=5` × `$4` premium × 100 mult = **$2,000 "
+                    "exposure per entry**. Stay aware.",
+                    ephemeral=True,
+                )
+            except Exception as e:
+                await interaction.response.send_message(
+                    f"qty set failed: {e}", ephemeral=True,
+                )
+
+        @discord.ui.button(label="🔍 Show overrides",
+                            style=discord.ButtonStyle.secondary,
+                            custom_id="ta:show_overrides", row=5)
+        async def btn_show_overrides(self, interaction, _):
+            """Show all active runtime overrides."""
+            if not await self._authorized(interaction):
+                return
+            try:
+                from src.core.runtime_overrides import all_overrides
+                d = all_overrides()
+                if not d:
+                    msg = ("_No active overrides — using "
+                           "`config/settings.yaml` defaults._")
+                else:
+                    lines = ["**Active runtime overrides:**"]
+                    for k, v in sorted(d.items()):
+                        lines.append(f"  · `{k}` = **{v}**")
+                    msg = "\n".join(lines)
+                await interaction.response.send_message(msg, ephemeral=True)
+            except Exception as e:
+                await interaction.response.send_message(
+                    f"show failed: {e}", ephemeral=True,
+                )
+
     class ControlPanel(discord.ui.View):
         """Persistent button panel. `custom_id`s survive bot restart
         when we call client.add_view(ControlPanel()) on_ready."""

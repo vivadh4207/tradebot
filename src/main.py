@@ -2212,8 +2212,22 @@ class TradeBot:
         #   - underlying 5-bar move >= scalp_scale_min_underlying_move
         #   - current bar volume >= scalp_scale_min_volume_multiple × avg
         # Otherwise: buy 1 contract, regardless of Kelly.
-        default_qty = int(self.s.get("execution.default_qty_per_entry", 1))
-        max_strong = int(self.s.get("execution.max_qty_if_strong", 3))
+        # Runtime overrides — Discord autopanel "📦 Qty +N" buttons
+        # write these live so the operator can scale up without editing
+        # settings.yaml. Takes effect on the next entry.
+        try:
+            from .core.runtime_overrides import get_override
+            default_qty = int(get_override(
+                "default_qty_per_entry",
+                self.s.get("execution.default_qty_per_entry", 1),
+            ))
+            max_strong = int(get_override(
+                "max_qty_if_strong",
+                self.s.get("execution.max_qty_if_strong", 3),
+            ))
+        except Exception:
+            default_qty = int(self.s.get("execution.default_qty_per_entry", 1))
+            max_strong = int(self.s.get("execution.max_qty_if_strong", 3))
         delta_lo = float(self.s.get("execution.scalp_delta_scale_min", 0.40))
         delta_hi = float(self.s.get("execution.scalp_delta_scale_max", 0.55))
         mv_min = float(self.s.get("execution.scalp_scale_min_underlying_move", 0.005))

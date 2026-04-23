@@ -166,8 +166,22 @@ class ExecutionChain:
         c = ctx.contract
         if c is None:
             return FilterResult(True, "spread_na_no_contract", advisory=True)
-        cap = (self._s["execution"]["max_spread_pct_etf"] if ctx.is_etf
-               else self._s["execution"]["max_spread_pct_stock"])
+        # Runtime override — Discord "Looser entries" can widen this live.
+        try:
+            from ..core.runtime_overrides import get_override
+            if ctx.is_etf:
+                cap = float(get_override(
+                    "max_spread_pct_etf",
+                    self._s["execution"]["max_spread_pct_etf"],
+                ))
+            else:
+                cap = float(get_override(
+                    "max_spread_pct_stock",
+                    self._s["execution"]["max_spread_pct_stock"],
+                ))
+        except Exception:
+            cap = (self._s["execution"]["max_spread_pct_etf"] if ctx.is_etf
+                   else self._s["execution"]["max_spread_pct_stock"])
         if c.spread_pct > cap:
             return FilterResult(False, f"spread_too_wide: {c.spread_pct:.3f}>{cap}")
         # Expensive-contract gate. Operator: "options bought are very
@@ -196,8 +210,21 @@ class ExecutionChain:
         c = ctx.contract
         if c is None:
             return FilterResult(True, "oi_na_no_contract", advisory=True)
-        min_oi = self._s["execution"]["min_open_interest"]
-        min_vol = self._s["execution"]["min_today_option_volume"]
+        # Honor runtime override so Discord "Looser entries" button can
+        # lower the threshold without a restart.
+        try:
+            from ..core.runtime_overrides import get_override
+            min_oi = int(get_override(
+                "min_open_interest",
+                self._s["execution"]["min_open_interest"],
+            ))
+            min_vol = int(get_override(
+                "min_today_option_volume",
+                self._s["execution"]["min_today_option_volume"],
+            ))
+        except Exception:
+            min_oi = self._s["execution"]["min_open_interest"]
+            min_vol = self._s["execution"]["min_today_option_volume"]
         # Data-availability vs actually-illiquid distinction.
         # Many providers (Alpaca snapshot, Yahoo intraday) return 0 for
         # open_interest when they simply didn't populate it — NOT when
