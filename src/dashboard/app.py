@@ -143,31 +143,46 @@ def trades(days: int = Query(30, ge=1, le=365),
                     qty = float(ev.get("qty", 0))
                     px = float(ev.get("fill_price", 0))
                     ts = ev.get("ts")
-                    amt = float(ev.get("amount", 0))
                     if "buy" in side:
                         open_stack[sym].append({
                             "qty": qty, "price": px, "ts": ts,
-                            "cost": -amt,
                         })
                     elif "sell" in side and open_stack.get(sym):
-                        entry = open_stack[sym].pop(0)
-                        pnl = amt - entry["cost"]
-                        pnl_pct = (pnl / max(entry["cost"], 1e-9)
-                                    if entry["cost"] > 0 else None)
-                        closed.append({
-                            "symbol": sym,
-                            "opened_at": entry["ts"],
-                            "closed_at": ts,
-                            "side": "long", "qty": int(qty),
-                            "entry_price": entry["price"],
-                            "exit_price": px,
-                            "pnl": round(pnl, 2),
-                            "pnl_pct": (round(pnl_pct, 4)
-                                         if pnl_pct is not None else None),
-                            "entry_tag": "", "exit_reason": "tradier_closed",
-                            "is_option": len(sym) >= 15,
-                            "source": "tradier",
-                        })
+                        # FIFO match each SHARE of the sell against the
+                        # earliest opens. If sell_qty > first_open_qty,
+                        # we record ONE closed trade per matched lot
+                        # using the correct per-share P&L. The earlier
+                        # bug was summing amount (whole sell) against
+                        # cost (partial buy) — inflated P&L when the
+                        # sell spanned multiple buys.
+                        remaining = qty
+                        while remaining > 0 and open_stack.get(sym):
+                            lot = open_stack[sym][0]
+                            matched = min(remaining, lot["qty"])
+                            # Per-contract pnl × matched × 100
+                            pnl = (px - lot["price"]) * matched * 100
+                            denom = lot["price"] * matched * 100
+                            pnl_pct = (pnl / denom) if denom > 0 else None
+                            closed.append({
+                                "symbol": sym,
+                                "opened_at": lot["ts"],
+                                "closed_at": ts,
+                                "side": "long", "qty": int(matched),
+                                "entry_price": lot["price"],
+                                "exit_price": px,
+                                "pnl": round(pnl, 2),
+                                "pnl_pct": (round(pnl_pct, 4)
+                                             if pnl_pct is not None else None),
+                                "entry_tag": "",
+                                "exit_reason": "tradier_closed",
+                                "is_option": len(sym) >= 15,
+                                "source": "tradier",
+                            })
+                            remaining -= matched
+                            if matched == lot["qty"]:
+                                open_stack[sym].pop(0)
+                            else:
+                                open_stack[sym][0]["qty"] -= matched
                 if closed:
                     return {"trades": closed[-limit:],
                              "source": "tradier",
@@ -392,14 +407,19 @@ def health():
         tb = build_tradier_broker()
         if tb is not None:
             try:
-                acct = tb.account()
-                c = getattr(acct, "cash", None)
-                e = getattr(acct, "equity", None)
-                d = getattr(acct, "day_pnl", None)
+                acct = tb.account()  # returns dict
+                # Support both dict and dataclass shapes
+                def _pick(obj, key):
+                    if isinstance(obj, dict):
+                        return obj.get(key)
+                    return getattr(obj, key, None)
+                c = _pick(acct, "cash")
+                e = _pick(acct, "equity")
+                d = _pick(acct, "day_pnl")
                 if c is not None: tradier_cash = float(c)
                 if e is not None: tradier_equity = float(e)
                 if d is not None: tradier_day_pnl = float(d)
-            except Exception:
+            except Exception as _ae:                        # noqa: BLE001
                 pass
             try:
                 tradier_positions = len(list(tb.positions()))

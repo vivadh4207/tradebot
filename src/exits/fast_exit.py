@@ -148,6 +148,31 @@ class FastExitConfig:
     zdte_snap_close_pct: float = 0.25     # full at +25%
     zdte_snap_absolute_cap_pct: float = 0.40  # mandatory at +40%
 
+    # ---- TIERED PROFIT SCALE-OUT (safety-net for winners) ----
+    # Operator: "we need safety net to have money come in and not lose
+    # here." Progressive profit-taking so cash is in hand at each
+    # milestone while some contracts still ride for bigger gains.
+    #
+    # For a 3-contract entry:
+    #   +8%  pnl → sell 1 contract (1/3 locked in)
+    #   +15% pnl → sell 1 more (2/3 locked)
+    #   +25% pnl → sell last one (full close)
+    # For 6+ contracts: two contracts per tier.
+    # For 2 contracts:  one per tier.
+    # For 1 contract:   no scale-out, relies on profit-lock + snap-take.
+    #
+    # After each scale-out, the REMAINING contracts ride with profit-lock
+    # trailing → worst case they retrace back to peak×(1-give_back), but
+    # the locked profit is ALREADY in cash so the trade can't go net negative.
+    tiered_scale_out_enabled: bool = True
+    tier1_pnl_pct: float = 0.08           # first take at +8%
+    tier2_pnl_pct: float = 0.15           # second take at +15%
+    tier3_pnl_pct: float = 0.25           # full close at +25%
+    # DTE-specific tightening for 0DTE (take profit much earlier):
+    tier1_pnl_0dte: float = 0.05          # first take at +5% for 0DTE
+    tier2_pnl_0dte: float = 0.10
+    tier3_pnl_0dte: float = 0.18
+
     # Exhaustion applied to ALL DTEs (not just 0DTE) — operator:
     # "even for long positions, if in profit cut it immediately."
     # DTE-aware min profit so swing trades get breathing room but
@@ -499,6 +524,77 @@ class FastExitEvaluator:
                         f"={prior_high:.2f}_pnl={pnl:+.2%}",
                         layer=0,
                     )
+
+        # ---- TIERED PROFIT SCALE-OUT (safety net) ----
+        # Operator: "need safety net to have money come in and not lose."
+        # Scales OUT of positions progressively at profit milestones so
+        # cash is locked at +8% / +15% / +25% (or +5/10/18 for 0DTE).
+        # Remaining contracts keep riding with profit-lock trailing.
+        #
+        # Only fires AFTER entry_grace — we don't want to sell half a
+        # position in the first 60s on spread wash.
+        if (self.cfg.tiered_scale_out_enabled
+                and not _in_grace
+                and pnl > 0
+                and abs(pos.qty) >= 2):    # need 2+ contracts to scale
+
+            # Pick thresholds by DTE
+            if dte == 0:
+                t1, t2, t3 = (self.cfg.tier1_pnl_0dte,
+                               self.cfg.tier2_pnl_0dte,
+                               self.cfg.tier3_pnl_0dte)
+                dte_tag = "0dte"
+            else:
+                t1, t2, t3 = (self.cfg.tier1_pnl_pct,
+                               self.cfg.tier2_pnl_pct,
+                               self.cfg.tier3_pnl_pct)
+                dte_tag = "swing" if dte >= 14 else "short"
+
+            total_qty = abs(pos.qty)
+            # How many contracts per tier — aim for 3 equal chunks
+            per_tier = max(1, total_qty // 3)
+
+            # TIER 3 — last tranche, full close
+            if (pnl >= t3 and not getattr(pos, "tier3_taken", False)):
+                try:
+                    pos.tier3_taken = True
+                except Exception:
+                    pass
+                return ExitDecision(
+                    True,
+                    f"tier3_close_{dte_tag}:pnl={pnl:+.2%}_>={t3:+.0%}"
+                    f"_last_tranche_closing_all",
+                    layer=0,
+                    # full close (no close_qty override)
+                )
+            # TIER 2 — second take-off
+            if (pnl >= t2 and not getattr(pos, "tier2_taken", False)
+                    and total_qty >= 2):
+                try:
+                    pos.tier2_taken = True
+                except Exception:
+                    pass
+                return ExitDecision(
+                    True,
+                    f"tier2_scale_{dte_tag}:pnl={pnl:+.2%}_>={t2:+.0%}"
+                    f"_closing_{per_tier}of{total_qty}",
+                    layer=0,
+                    close_qty=per_tier,
+                )
+            # TIER 1 — first safety-net take
+            if (pnl >= t1 and not getattr(pos, "tier1_taken", False)
+                    and total_qty >= 3):   # only scale if 3+ contracts
+                try:
+                    pos.tier1_taken = True
+                except Exception:
+                    pass
+                return ExitDecision(
+                    True,
+                    f"tier1_scale_{dte_tag}:pnl={pnl:+.2%}_>={t1:+.0%}"
+                    f"_closing_{per_tier}of{total_qty}_safety_net",
+                    layer=0,
+                    close_qty=per_tier,
+                )
 
         # ---- 0DTE SNAP-TAKE — grab profit, don't wait for fade ----
         # Operator: "swing trades are working, but 0dte went up and we

@@ -50,6 +50,9 @@ class PositionRecord:
     peak_price: Optional[float] = None
     peak_pnl_pct: Optional[float] = None
     scaled_out: bool = False
+    tier1_taken: bool = False
+    tier2_taken: bool = False
+    tier3_taken: bool = False
 
 
 @dataclass
@@ -94,6 +97,9 @@ def save_snapshot(path: str | Path, broker) -> None:
                 peak_price=getattr(pos, "peak_price", None),
                 peak_pnl_pct=getattr(pos, "peak_pnl_pct", None),
                 scaled_out=bool(getattr(pos, "scaled_out", False)),
+                tier1_taken=bool(getattr(pos, "tier1_taken", False)),
+                tier2_taken=bool(getattr(pos, "tier2_taken", False)),
+                tier3_taken=bool(getattr(pos, "tier3_taken", False)),
             ))
         acct = broker.account()
         snap = BrokerSnapshot(
@@ -170,6 +176,9 @@ def restore_into_paper_broker(broker, snap: BrokerSnapshot) -> int:
                 peak_pnl_pct=(float(r.peak_pnl_pct)
                                 if r.peak_pnl_pct is not None else None),
                 scaled_out=bool(r.scaled_out),
+                tier1_taken=bool(getattr(r, "tier1_taken", False)),
+                tier2_taken=bool(getattr(r, "tier2_taken", False)),
+                tier3_taken=bool(getattr(r, "tier3_taken", False)),
             )
     _log.info("broker_snapshot_restored n=%d cash=%.2f", len(snap.positions), snap.cash)
     return len(snap.positions)

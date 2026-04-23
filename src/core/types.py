@@ -221,6 +221,12 @@ class Position:
     # persist across restarts or those exits can't fire on long-held
     # positions. Stored as a fraction (0.05 = +5%).
     peak_pnl_pct: Optional[float] = None
+    # Tiered scale-out state: which profit tiers have already fired
+    # on this position. Prevents double-scale-out on the same tier
+    # after a slight pnl bounce. Persists across restart via snapshot.
+    tier1_taken: bool = False
+    tier2_taken: bool = False
+    tier3_taken: bool = False
 
     @property
     def is_long(self) -> bool:

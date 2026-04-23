@@ -285,16 +285,36 @@ class TradierBroker:
         return out
 
     def account(self) -> Dict[str, Any]:
-        """Account snapshot for dashboard / reconcile."""
+        """Account snapshot for dashboard / reconcile. Returns dict with:
+        cash · equity · buying_power · day_pnl (today's realized +
+        unrealized vs last close) · open_pl (total unrealized on open
+        positions)."""
         bal = self._get(f"/v1/accounts/{self._account}/balances") or {}
         b = bal.get("balances") or {}
+        # Tradier balance payload contains `open_pl`, `close_pl`, `total_cash`,
+        # `total_equity`. day_pnl = open_pl + close_pl (today's realized +
+        # unrealized combined).
+        open_pl = float(b.get("open_pl", 0) or 0)
+        close_pl = float(b.get("close_pl", 0) or 0)
+        total_equity = float(b.get("total_equity", 0) or 0)
+        cash = float(
+            b.get("cash", {}).get("cash_available", 0)
+            or b.get("total_cash", 0)
+            or b.get("cash_available", 0)
+            or 0
+        )
         return {
             "account_id": self._account,
-            "cash": float(b.get("cash", {}).get("cash_available", 0)
-                          or b.get("cash_available", 0)),
-            "equity": float(b.get("total_equity", 0)),
-            "buying_power": float(b.get("margin", {}).get("stock_buying_power", 0)
-                                   or b.get("stock_buying_power", 0)),
+            "cash": cash,
+            "equity": total_equity,
+            "open_pl": open_pl,
+            "close_pl": close_pl,
+            "day_pnl": open_pl + close_pl,
+            "buying_power": float(
+                b.get("margin", {}).get("stock_buying_power", 0)
+                or b.get("stock_buying_power", 0)
+                or 0
+            ),
         }
 
     # ------------------------------------------------ submit_combo (not supported)
