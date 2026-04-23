@@ -206,14 +206,16 @@ class TradierBroker:
     def history(self, *, from_date: Optional[str] = None,
                    to_date: Optional[str] = None,
                    limit: int = 100) -> List[Dict[str, Any]]:
-        """Fetch filled-order history from Tradier. Returns list of
-        normalized dicts with symbol, side, qty, fill_price, ts,
-        realized_pnl (if available)."""
+        """Fetch filled-order history. Falls back to /orders endpoint
+        when /history returns nothing (common on Tradier sandbox).
+        Normalized dicts: symbol, side, qty, fill_price, ts, amount."""
         from datetime import datetime as _dt, timedelta as _td
         if not from_date:
             from_date = (_dt.now() - _td(days=7)).strftime("%Y-%m-%d")
         if not to_date:
             to_date = _dt.now().strftime("%Y-%m-%d")
+
+        # Try /history first
         params = {
             "start": from_date, "end": to_date,
             "type": "trade", "limit": int(limit),
@@ -221,12 +223,12 @@ class TradierBroker:
         data = self._get(
             f"/v1/accounts/{self._account}/history", params
         ) or {}
-        hist = data.get("history")
-        if not isinstance(hist, dict):
-            return []
-        events = hist.get("event") or []
-        if isinstance(events, dict):
-            events = [events]
+        hist = data.get("history") or {}
+        events = []
+        if isinstance(hist, dict):
+            ev = hist.get("event")
+            events = [ev] if isinstance(ev, dict) else (ev or [])
+
         out: List[Dict[str, Any]] = []
         for ev in events:
             trade = ev.get("trade") or {}
@@ -241,6 +243,44 @@ class TradierBroker:
                 "commission": float(trade.get("commission", 0) or 0),
                 "description": ev.get("description", ""),
                 "amount": float(ev.get("amount", 0) or 0),
+            })
+        if out:
+            return out
+
+        # Fallback: /orders endpoint — includes filled orders on sandbox
+        _log.info("tradier_history_empty_try_orders")
+        data2 = self._get(
+            f"/v1/accounts/{self._account}/orders",
+            {"includeTags": "true"},
+        ) or {}
+        orders_obj = data2.get("orders") or {}
+        if not isinstance(orders_obj, dict):
+            return []
+        orders = orders_obj.get("order")
+        if orders is None:
+            return []
+        if isinstance(orders, dict):
+            orders = [orders]
+        for o in orders:
+            status = (o.get("status") or "").lower()
+            if status not in ("filled", "partially_filled"):
+                continue
+            avg_fill = float(o.get("avg_fill_price", 0) or 0)
+            if avg_fill <= 0:
+                continue
+            qty = float(o.get("exec_quantity") or o.get("quantity") or 0)
+            side = str(o.get("side", "")).lower()
+            sym = o.get("option_symbol") or o.get("symbol", "")
+            out.append({
+                "ts": o.get("transaction_date") or o.get("create_date"),
+                "symbol": sym,
+                "side": side,
+                "qty": abs(qty),
+                "fill_price": avg_fill,
+                "commission": 0.0,
+                "description": o.get("type", ""),
+                "amount": -(avg_fill * qty * 100) if "buy" in side
+                            else (avg_fill * qty * 100),
             })
         return out
 
