@@ -2574,14 +2574,34 @@ class TradeBot:
                 cal_thread.join(timeout=2)
             # Best-effort flatten on shutdown — fail-soft so a broken broker
             # doesn't hang the exit path.
+            # Shutdown flatten — preserve positions across restart unless
+            # explicitly enabled. Paper broker state is snapshotted to
+            # broker_state.json and restored on next startup, so we DON'T
+            # need to close positions just because the process exits.
+            # Flattening on every restart was causing:
+            #   1. Trades tagged 'eod_force_close' scattered through session
+            #   2. Local ↔ Tradier desync (local closed, Tradier still open)
+            #   3. Losses on spread cross for positions that would have been
+            #      fine after restart
+            # Set `broker.flatten_on_shutdown: true` ONLY for live-trading
+            # where you want to end the session flat regardless.
             try:
-                open_now = list(self.broker.positions())
-                if open_now:
-                    log.warning("shutdown_flatten", n=len(open_now))
-                    mark = self._build_mark_prices(open_now)
-                    self.broker.flatten_all(mark_prices=mark)
+                if bool(self.s.get("broker.flatten_on_shutdown", False)):
+                    open_now = list(self.broker.positions())
+                    if open_now:
+                        log.warning("shutdown_flatten", n=len(open_now))
+                        mark = self._build_mark_prices(open_now)
+                        self.broker.flatten_all(mark_prices=mark,
+                                                 tag="shutdown_flatten")
+                else:
+                    open_now = list(self.broker.positions())
+                    if open_now:
+                        log.info("shutdown_preserve_positions",
+                                 n=len(open_now),
+                                 note="positions saved via snapshot; "
+                                       "will restore on next startup")
             except Exception as e:                    # noqa: BLE001
-                log.error("shutdown_flatten_error", err=str(e))
+                log.error("shutdown_handler_error", err=str(e))
 
 
 def main() -> None:
