@@ -56,6 +56,7 @@ git add \
   src/intelligence/ollama_client.py \
   src/intelligence/breadth_probe.py \
   src/intelligence/options_research.py \
+  src/intelligence/finnhub_intelligence.py \
   src/intelligence/position_advisor.py \
   src/intelligence/saves_tracker.py \
   src/intelligence/strategy_auditor.py \

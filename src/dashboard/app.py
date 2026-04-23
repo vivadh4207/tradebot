@@ -1999,6 +1999,56 @@ def strategy_buckets_api(days: int = Query(7, ge=1, le=365)):
     return {"buckets": out, "window_days": days}
 
 
+@app.get("/api/intel/{symbol}", response_class=JSONResponse)
+def intel_api(symbol: str, heavy: bool = Query(False)):
+    """Deep fundamentals via Finnhub: analyst targets, insider,
+    ownership, filings, dividends, revenue segments. Cached per-
+    endpoint (1-24h TTL depending on update cadence)."""
+    try:
+        from ..intelligence.finnhub_intelligence import build_finnhub_intelligence
+        fh = build_finnhub_intelligence()
+        if fh is None:
+            return {"error": "FINNHUB_KEY not set"}
+        sym = symbol.upper().strip()
+        snap = fh.bundle(sym, include_heavy=heavy)
+        return fh.compact_snapshot(snap)
+    except Exception as e:                                  # noqa: BLE001
+        return {"error": str(e)[:200]}
+
+
+@app.get("/api/calendars", response_class=JSONResponse)
+def calendars_api():
+    """Upcoming IPOs + FDA advisory meetings — market-moving event
+    calendars. Useful for spotting catalysts that aren't ticker-specific
+    news yet but will drive flow."""
+    try:
+        from ..intelligence.finnhub_intelligence import build_finnhub_intelligence
+        fh = build_finnhub_intelligence()
+        if fh is None:
+            return {"error": "FINNHUB_KEY not set"}
+        return {
+            "ipos": (fh.ipo_calendar() or [])[:30],
+            "fda":  (fh.fda_calendar() or [])[:30],
+        }
+    except Exception as e:                                  # noqa: BLE001
+        return {"error": str(e)[:200]}
+
+
+@app.get("/api/sector_metrics", response_class=JSONResponse)
+def sector_metrics_api(region: str = Query("NA", max_length=4)):
+    """Sector-wide metrics (P/E, revenue growth, profit margin) by
+    region — shows which sectors are cheap/expensive and why."""
+    try:
+        from ..intelligence.finnhub_intelligence import build_finnhub_intelligence
+        fh = build_finnhub_intelligence()
+        if fh is None:
+            return {"error": "FINNHUB_KEY not set"}
+        d = fh.sector_metrics(region=region)
+        return d or {"error": "no data"}
+    except Exception as e:                                  # noqa: BLE001
+        return {"error": str(e)[:200]}
+
+
 @app.get("/api/hourly_pnl", response_class=JSONResponse)
 def hourly_pnl_api(days: int = Query(1, ge=1, le=90)):
     """P&L bucketed by ET hour of day. Useful to see which time windows

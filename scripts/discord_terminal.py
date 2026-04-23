@@ -146,6 +146,8 @@ COMMAND_MAP: Dict[str, Tuple[str, bool]] = {
     "close":          ("manual-close",    False),    # handled in-process; see _handle_close
     "trim":           ("manual-trim",     False),    # handled in-process; see _handle_trim
     "cleanup":        ("broker-cleanup",  False),    # handled in-process; see _handle_cleanup
+    "intel":          ("finnhub-intel",   False),    # handled in-process; see _handle_intel
+    "calendars":      ("finnhub-calendars", False),  # handled in-process; see _handle_calendars
     "reset-paper":   ("reset-paper",     True),       # requires DESTROY confirm
     "wipe":          ("wipe-journal",    True),       # requires DESTROY confirm
 }
@@ -354,6 +356,13 @@ class CommandRunner:
             do_close = any(p.lower() in ("--close", "close")
                             for p in parts[1:])
             return await self._handle_cleanup(do_close)
+        if command == "intel":
+            parts = (raw_text or "").split()
+            if len(parts) < 2:
+                return "usage: `!intel SYMBOL` (e.g. `!intel AAPL`)"
+            return await self._handle_intel(parts[1].upper().strip())
+        if command == "calendars":
+            return await self._handle_calendars()
         if destroyed and subcmd == "reset-paper":
             # reset_paper.py supports --yes to skip its own interactive prompt
             extra_args = ["--yes"]
@@ -498,6 +507,145 @@ class CommandRunner:
             return f"✂️ **Trim intent queued** for `{symbol}` (50% close)."
         except Exception as e:
             return f"trim failed: {type(e).__name__}: {str(e)[:200]}"
+
+    async def _handle_intel(self, symbol: str) -> str:
+        """Fundamentals deep-dive for a single symbol via Finnhub.
+        Returns a markdown-formatted report the user can scan quickly.
+        """
+        try:
+            from src.intelligence.finnhub_intelligence import (
+                build_finnhub_intelligence,
+            )
+            fh = build_finnhub_intelligence()
+            if fh is None:
+                return "❌ FINNHUB_KEY not set in .env"
+            loop = asyncio.get_event_loop()
+            def _call():
+                snap = fh.bundle(symbol)
+                return fh.compact_snapshot(snap)
+            d = await loop.run_in_executor(None, _call)
+            lines = [f"**🔬 Intel · {symbol}**", ""]
+            # Analyst
+            a = d.get("analyst") or {}
+            if a.get("target_mean"):
+                lines.append(
+                    f"**📊 Analyst:** target ${a.get('target_mean', 0):.2f} "
+                    f"(high ${a.get('target_high', 0):.2f} · "
+                    f"low ${a.get('target_low', 0):.2f}) · "
+                    f"{a.get('n_analysts', '?')} analysts"
+                )
+            r = d.get("recommendations") or {}
+            if r:
+                lines.append(
+                    f"**📢 Ratings ({r.get('period','')}):** "
+                    f"{r.get('strong_buy',0)} Strong Buy · "
+                    f"{r.get('buy',0)} Buy · "
+                    f"{r.get('hold',0)} Hold · "
+                    f"{r.get('sell',0)} Sell · "
+                    f"{r.get('strong_sell',0)} Strong Sell"
+                )
+            # Fundamentals
+            f = d.get("fundamentals") or {}
+            if f:
+                bits = []
+                if f.get("pe_ttm"):        bits.append(f"P/E {f['pe_ttm']:.1f}")
+                if f.get("market_cap"):    bits.append(f"MCap ${f['market_cap']/1000:.1f}B")
+                if f.get("beta"):          bits.append(f"β {f['beta']:.2f}")
+                if f.get("profit_margin"): bits.append(f"Margin {f['profit_margin']:.1f}%")
+                if f.get("52w_high"):
+                    bits.append(f"52w ${f.get('52w_low', 0):.0f}-${f['52w_high']:.0f}")
+                if bits:
+                    lines.append("**📈 Fundamentals:** " + " · ".join(bits))
+            # Insider
+            ins = d.get("insider_90d") or {}
+            if ins.get("n_tx"):
+                net = ins.get("net_shares", 0)
+                lines.append(
+                    f"**👔 Insider 90d:** {ins.get('buys', 0)} buys · "
+                    f"{ins.get('sells', 0)} sells · "
+                    f"net {'+' if net >= 0 else ''}{net:,.0f} shares"
+                )
+            ism = d.get("insider_sentiment") or {}
+            if ism.get("mspr") is not None:
+                mspr = ism["mspr"]
+                icon = "🟢" if mspr > 20 else "🔴" if mspr < -20 else "⚪"
+                lines.append(
+                    f"**{icon} Insider sentiment (MSPR):** {mspr:.1f} "
+                    f"(−100 bearish · +100 bullish)"
+                )
+            # Top holders
+            th = d.get("top_holders") or []
+            if th:
+                bits = [f"{h.get('name', '?')[:22]} ({h.get('share', 0)*100:.1f}%)"
+                         for h in th[:3]]
+                lines.append(f"**🏦 Top holders:** " + " · ".join(bits))
+            io = d.get("institutional_ownership") or {}
+            if io.get("pct_held"):
+                lines.append(
+                    f"**🏛 Institutional:** {io['pct_held']*100:.1f}% held · "
+                    f"{io.get('n_holders', '?')} institutions"
+                )
+            # Recent filings
+            fl = d.get("recent_filings") or []
+            if fl:
+                lines.append("**📄 Recent filings:**")
+                for f in fl[:3]:
+                    lines.append(
+                        f"  · {f.get('form', '?')} @ {f.get('filed_at', '?')}"
+                    )
+            # Dividend
+            div = d.get("next_dividend") or {}
+            if div.get("ex_date"):
+                lines.append(
+                    f"**💵 Next dividend:** ${div.get('amount', 0):.2f} "
+                    f"ex-date {div['ex_date']}"
+                )
+            # Revenue segments
+            seg = d.get("revenue_segments") or []
+            if seg:
+                bits = [f"{s.get('segment', '?')[:16]} (${s.get('revenue', 0)/1000:.1f}B)"
+                         for s in seg[:4]]
+                lines.append("**🥧 Revenue:** " + " · ".join(bits))
+            if d.get("_errors"):
+                lines.append(f"\n_⚠️ some endpoints failed: "
+                             f"{', '.join(d['_errors'][:3])}_")
+            return "\n".join(lines)[:1900]
+        except Exception as e:
+            return f"intel failed: {type(e).__name__}: {str(e)[:200]}"
+
+    async def _handle_calendars(self) -> str:
+        """Upcoming IPO + FDA advisory calendars — market-moving events."""
+        try:
+            from src.intelligence.finnhub_intelligence import (
+                build_finnhub_intelligence,
+            )
+            fh = build_finnhub_intelligence()
+            if fh is None:
+                return "❌ FINNHUB_KEY not set"
+            loop = asyncio.get_event_loop()
+            def _call():
+                return fh.ipo_calendar() or [], fh.fda_calendar() or []
+            ipos, fdas = await loop.run_in_executor(None, _call)
+            lines = ["**📅 Upcoming calendars**", ""]
+            lines.append(f"**💼 IPOs ({len(ipos)} upcoming):**")
+            for i in ipos[:10]:
+                lines.append(
+                    f"  · {i.get('date', '?')} · "
+                    f"**{i.get('symbol', '?')}** · "
+                    f"{i.get('name', '?')[:36]} · "
+                    f"{i.get('exchange', '?')}"
+                )
+            lines.append("")
+            lines.append(f"**💊 FDA advisory meetings ({len(fdas)} upcoming):**")
+            for f in fdas[:10]:
+                lines.append(
+                    f"  · {f.get('meetingDate', '?')} · "
+                    f"**{f.get('committee', '?')[:30]}** · "
+                    f"{f.get('productName', '?')[:40]}"
+                )
+            return "\n".join(lines)[:1900]
+        except Exception as e:
+            return f"calendars failed: {type(e).__name__}: {str(e)[:200]}"
 
     async def _handle_cleanup(self, do_close: bool) -> str:
         """List positions across local + Tradier + Alpaca, flag any

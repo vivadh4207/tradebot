@@ -468,6 +468,18 @@ class OptionsResearchAgent:
             "headlines": headlines[:40],    # cap
             "bot_state": bot_state,
         }
+        # Add Finnhub fundamentals — analyst targets, insider, ownership,
+        # filings — so the 70B cites deeper context than just price/news.
+        try:
+            from .finnhub_intelligence import build_finnhub_intelligence
+            fh = build_finnhub_intelligence()
+            if fh is not None:
+                fundamentals: Dict[str, Any] = {}
+                for sym in underlyings:
+                    fundamentals[sym] = fh.compact_snapshot(fh.bundle(sym))
+                snapshot["fundamentals"] = fundamentals
+        except Exception as _fe:                           # noqa: BLE001
+            snapshot["_fundamentals_err"] = str(_fe)[:120]
         if extra_context:
             snapshot["extra"] = extra_context
 
