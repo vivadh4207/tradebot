@@ -978,6 +978,60 @@ class TradeBot:
         except Exception:
             pass
 
+    def _dynamic_symbols(self, cfg: Dict[str, Any]) -> List[str]:
+        """Return a cached list of high-activity symbols from the
+        SymbolScanner. Re-scans every 30 min (configurable). Filters:
+          - news_mentions >= min_news_mentions
+          - passes exclude_hard blocklist
+          - max_dynamic_symbols cap
+        """
+        import time as _t
+        import re as _re
+        cache_ttl = 30 * 60   # 30 min
+        now = _t.time()
+        cache = getattr(self, "_dyn_universe_cache", None)
+        if cache and (now - cache[0]) < cache_ttl:
+            return cache[1]
+
+        max_dyn = int(cfg.get("max_dynamic_symbols", 8))
+        min_mentions = int(cfg.get("min_news_mentions", 3))
+        exclude = set(cfg.get("exclude_hard", []) or [])
+        base = set(self.s.universe)
+
+        syms: List[str] = []
+        try:
+            # News-mentions via MultiProvider
+            items = self.mp.news(None, limit=80) or []
+            from .intelligence.symbol_scanner import _extract_tickers_from_text
+            from collections import Counter as _C
+            counter: _C = _C()
+            for item in items:
+                txt = f"{item.headline} {item.summary}"
+                for sym in _extract_tickers_from_text(txt):
+                    counter[sym] += 1
+                for t in (item.tickers or []):
+                    counter[t.upper()] += 2       # provider-native weight
+            # Pick top candidates not already in base/exclude
+            for sym, n in counter.most_common(40):
+                if n < min_mentions:
+                    break
+                if sym in base or sym in exclude:
+                    continue
+                # Sanity-check format: 2-5 uppercase letters
+                if not _re.match(r"^[A-Z]{2,5}$", sym):
+                    continue
+                syms.append(sym)
+                if len(syms) >= max_dyn:
+                    break
+        except Exception as e:                              # noqa: BLE001
+            log.info("dynamic_symbols_scan_err", err=str(e)[:120])
+        # Cache + log
+        self._dyn_universe_cache = (now, syms)
+        if syms:
+            log.info("dynamic_universe_refreshed",
+                     n=len(syms), symbols=syms)
+        return syms
+
     def _post_fade_advisory(self, adv) -> None:
         """Post a richly-formatted position-fade advisory to Discord.
         Includes LLM reasoning, chart signals cited by name, risk/reward
@@ -1582,7 +1636,22 @@ class TradeBot:
                             except Exception:
                                 pass
                     else:
-                        for symbol in self.s.universe:
+                        # Build the effective universe per tick:
+                        #   base universe (from settings.yaml)
+                        #   + dynamic additions from SymbolScanner
+                        #     (high-activity tickers from news/movers)
+                        effective_universe = list(self.s.universe)
+                        dyn_cfg = self.s.raw.get("dynamic_universe", {}) or {}
+                        if dyn_cfg.get("enabled", False):
+                            try:
+                                dyn_syms = self._dynamic_symbols(dyn_cfg)
+                                for s in dyn_syms:
+                                    if s not in effective_universe:
+                                        effective_universe.append(s)
+                            except Exception as _de:         # noqa: BLE001
+                                log.info("dynamic_universe_err",
+                                          err=str(_de)[:120])
+                        for symbol in effective_universe:
                             self._tick_symbol(symbol)
                     # Credit-spread runners tick AFTER directional/wheel.
                     # They have their own time-of-day gates + idempotency

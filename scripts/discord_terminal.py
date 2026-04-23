@@ -1466,27 +1466,6 @@ def _build_app():
                     f"refresh failed: {e}", ephemeral=True,
                 )
 
-        @discord.ui.button(label="⬆ Cap +1", style=discord.ButtonStyle.secondary,
-                            custom_id="ta:cap_up", row=2)
-        async def btn_cap_up(self, interaction, _):
-            if not await self._authorized(interaction):
-                return
-            try:
-                from src.intelligence.llm_autotrade_queue import LLMAutotradeQueue
-                q = LLMAutotradeQueue()
-                new_cap = q.current_cap() + 1
-                applied = q.set_cap_override(new_cap)
-                _audit({"kind": "autopanel_cap_up", "user": interaction.user.id,
-                        "new_cap": applied})
-                await interaction.response.send_message(
-                    f"⬆ Cap raised to **{applied}** trades/day. "
-                    f"(Counter {q.daily_counter()}/{applied})", ephemeral=True,
-                )
-            except Exception as e:
-                await interaction.response.send_message(
-                    f"cap up failed: {e}", ephemeral=True,
-                )
-
         @discord.ui.button(label="⬆⬆ Cap +5", style=discord.ButtonStyle.secondary,
                             custom_id="ta:cap_up5", row=2)
         async def btn_cap_up5(self, interaction, _):
@@ -1563,27 +1542,6 @@ def _build_app():
             except Exception:
                 return 20
 
-        @discord.ui.button(label="🎯 0DTE +1",
-                            style=discord.ButtonStyle.secondary,
-                            custom_id="ta:zdte_up", row=3)
-        async def btn_zdte_up(self, interaction, _):
-            if not await self._authorized(interaction):
-                return
-            try:
-                from src.core.runtime_overrides import set_override
-                new_cap = self._current_zdte_cap() + 1
-                set_override("max_0dte_per_day", new_cap)
-                _audit({"kind": "zdte_cap_up", "user": interaction.user.id,
-                        "new_cap": new_cap})
-                await interaction.response.send_message(
-                    f"🎯 0DTE cap raised to **{new_cap}** trades/day "
-                    "(live, no restart needed).", ephemeral=True,
-                )
-            except Exception as e:
-                await interaction.response.send_message(
-                    f"0DTE +1 failed: {e}", ephemeral=True,
-                )
-
         @discord.ui.button(label="🎯🎯 0DTE +5",
                             style=discord.ButtonStyle.secondary,
                             custom_id="ta:zdte_up5", row=3)
@@ -1603,27 +1561,6 @@ def _build_app():
             except Exception as e:
                 await interaction.response.send_message(
                     f"0DTE +5 failed: {e}", ephemeral=True,
-                )
-
-        @discord.ui.button(label="⬇ 0DTE -1",
-                            style=discord.ButtonStyle.secondary,
-                            custom_id="ta:zdte_down", row=3)
-        async def btn_zdte_down(self, interaction, _):
-            if not await self._authorized(interaction):
-                return
-            try:
-                from src.core.runtime_overrides import set_override
-                new_cap = max(0, self._current_zdte_cap() - 1)
-                set_override("max_0dte_per_day", new_cap)
-                _audit({"kind": "zdte_cap_down", "user": interaction.user.id,
-                        "new_cap": new_cap})
-                await interaction.response.send_message(
-                    f"⬇ 0DTE cap lowered to **{new_cap}** trades/day.",
-                    ephemeral=True,
-                )
-            except Exception as e:
-                await interaction.response.send_message(
-                    f"0DTE -1 failed: {e}", ephemeral=True,
                 )
 
         @discord.ui.button(label="🎯 0DTE=20",

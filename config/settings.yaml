@@ -43,16 +43,51 @@ account:
   drawdown_guard_enabled: false
   max_open_positions: 20
 
-# ===== Universe — locked to SPY + QQQ =====
+# ===== Universe — liquid ETFs + mega-cap tech + dynamic expansion =====
 universe:
-  # Operator decision 2026-04-17 (confirmed): universe is SPY + QQQ
-  # ONLY. No dynamic expansion, no auto-discovery, no alt-symbols.
-  # SPY + QQQ have 10× the options liquidity of anything else and the
-  # cleanest data. Adding symbols adds parameters without adding
-  # information and fractures statistics across a fixed sample budget.
-  # Expand back only after 100+ round-trips prove measurable edge.
-  - SPY
-  - QQQ
+  # Operator decision 2026-04-23: expand to liquid mega-caps so the bot
+  # has more tickers to find opportunities in. All listed here have:
+  #   - $1B+ daily options notional
+  #   - OI > 1000 on near-ATM strikes
+  #   - spread < 5% typical
+  #   - Finnhub + Tradier data coverage
+  # If any turns into a data / spread problem it gets blocked by the
+  # filter chain automatically — no need to prune here.
+  - SPY       # S&P 500 ETF — deepest liquidity
+  - QQQ       # Nasdaq 100 ETF
+  - IWM       # Russell 2000
+  - DIA       # Dow Jones
+  - AAPL
+  - MSFT
+  - NVDA
+  - GOOGL
+  - META
+  - AMZN
+  - TSLA
+  - AMD
+  - AVGO
+  - TSM
+  - NFLX
+  - ORCL
+
+# Dynamic universe expansion (scanner-driven)
+dynamic_universe:
+  # When enabled, SymbolScanner adds high-activity symbols from news +
+  # mover feeds to the trading universe on each scan (every 30 min).
+  # Discovery is ADDITIVE — base universe always traded; dynamic
+  # additions supplement when they show unusual activity.
+  enabled: true
+  max_dynamic_symbols: 8       # cap per-tick additions (prevents scope blow-up)
+  # Require discovered symbols to pass these before being added:
+  min_daily_option_volume: 5000
+  min_news_mentions: 3         # last 24h
+  exclude_hard:                # never trade, regardless of signals
+    - VOO          # too correlated with SPY
+    - SQQQ
+    - TQQQ
+    - UVXY
+    - VIXY
+    - SVXY
 
 
 # ===== Session (US Eastern) =====
@@ -183,14 +218,16 @@ execution:
   scalp_min_contract_volume: 50
 
   # Contract-count policy.
-  #   default_qty = 1 per entry per ticker (operator request: "only buy
-  #                1 contract unless momentum + greeks both favor")
+  #   default_qty = 3 per entry per ticker (operator decision 2026-04-23:
+  #                "buy 3 contracts by default for meaningful upside").
   #   scale-up to max_qty_if_strong ONLY when all THREE conditions:
   #     - delta in sweet spot [scalp_delta_scale_min, scalp_delta_scale_max]
   #     - 5-bar underlying move in signal direction >= 0.5%
   #     - current bar volume >= scalp_min_volume_multiple × 20-bar avg
-  default_qty_per_entry: 1
-  max_qty_if_strong: 3
+  # Safety rails still bind: max_contracts_0dte=5, max_contracts_multiday=10,
+  # kelly_hard_cap_pct=5% equity, max_risk_per_trade_pct=1%.
+  default_qty_per_entry: 3
+  max_qty_if_strong: 6
   # Scale-up to qty>1 requires a COMPOSITE of momentum + volume +
   # delta being simultaneously strong. Delta range widened because
   # high-gamma OTM (delta 0.25–0.35) is exactly where a cheap call
