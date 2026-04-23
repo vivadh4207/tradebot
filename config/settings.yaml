@@ -249,7 +249,10 @@ sizing:
   regime_multipliers:
     trend_lowvol: 1.20
     trend_highvol: 0.90
-    range_lowvol: 1.00
+    range_lowvol: 0.70       # was 1.00 — dampened for chop regimes
+                             # (small moves, theta kills marginal
+                             # winners, spread-cross ate every edge
+                             # in today's session)
     range_highvol: 1.10
     opening: 0.80
     closing: 0.30

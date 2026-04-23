@@ -2151,6 +2151,19 @@ class TradeBot:
             "short": {"dtes": [2, 5, 7],       "weight": 30},
             "swing": {"dtes": [14, 21, 30],    "weight": 50},
         })
+        # Regime-aware bucket tilting. In range_lowvol (choppy, low
+        # premium movement) — bias heavily toward swing. 0DTE in chop
+        # = theta graveyard. Operator feedback: "adjust for
+        # range_lowvol regime."
+        _regime_name = str(regime.value if regime else "").lower()
+        if _regime_name == "range_lowvol":
+            if "0dte" in buckets_cfg:  buckets_cfg["0dte"]["weight"] = 5
+            if "short" in buckets_cfg: buckets_cfg["short"]["weight"] = 20
+            if "swing" in buckets_cfg: buckets_cfg["swing"]["weight"] = 75
+        elif _regime_name == "range_highvol":
+            if "0dte" in buckets_cfg:  buckets_cfg["0dte"]["weight"] = 10
+            if "short" in buckets_cfg: buckets_cfg["short"]["weight"] = 30
+            if "swing" in buckets_cfg: buckets_cfg["swing"]["weight"] = 60
         try:
             from .core.runtime_overrides import get_override
             live_weights = get_override("strategy_bucket_weights", None)
