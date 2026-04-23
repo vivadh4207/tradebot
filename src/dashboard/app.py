@@ -15,8 +15,9 @@ import json
 import os
 from collections import Counter, defaultdict
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Query, Request, HTTPException, Depends
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 import subprocess
 import shlex
 
@@ -35,6 +36,57 @@ def _load_journal():
 
 
 app = FastAPI(title="tradebot dashboard", docs_url=None, redoc_url=None)
+
+
+# --- CORS + bearer auth for remote (Vercel) frontends -----------
+# When DASHBOARD_REMOTE_TOKEN is set, the dashboard ENFORCES a bearer
+# token on /api/* so a tunneled public URL isn't wide open. CORS
+# origins allow-list is configured via DASHBOARD_CORS_ORIGINS env
+# (comma-separated). Leave both unset for local-only usage.
+_REMOTE_TOKEN = (os.getenv("DASHBOARD_REMOTE_TOKEN") or "").strip()
+_CORS_ORIGINS = [o.strip() for o in
+                   (os.getenv("DASHBOARD_CORS_ORIGINS") or "").split(",")
+                   if o.strip()]
+if _CORS_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_CORS_ORIGINS,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["*"],
+        max_age=600,
+    )
+
+
+def _auth_ok(request: Request) -> bool:
+    if not _REMOTE_TOKEN:
+        return True           # auth disabled — local-only default
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        if auth[7:].strip() == _REMOTE_TOKEN:
+            return True
+    # Allow ?token= query param too for simple link-sharing
+    if request.query_params.get("token", "") == _REMOTE_TOKEN:
+        return True
+    return False
+
+
+@app.middleware("http")
+async def _bearer_guard(request: Request, call_next):
+    """Enforce bearer token on /api/* when DASHBOARD_REMOTE_TOKEN is
+    set. Dashboard HTML + favicon stay open (they're served once then
+    the browser calls the API with the token in its requests)."""
+    path = request.url.path
+    needs_auth = path.startswith("/api/") or path.startswith("/webhook/")
+    # Let CORS preflight through without auth
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    if needs_auth and _REMOTE_TOKEN and not _auth_ok(request):
+        return JSONResponse(
+            {"error": "unauthorized — missing or invalid bearer token"},
+            status_code=401,
+        )
+    return await call_next(request)
 
 
 @app.get("/api/equity", response_class=JSONResponse)

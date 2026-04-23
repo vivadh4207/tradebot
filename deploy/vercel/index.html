@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>tradebot · remote dashboard</title>
+<style>
+  :root {
+    --bg: #020617; --fg: #F8FAFC; --accent: #22C55E; --loss: #EF4444;
+    --card: #0E1223; --border: #334155; --muted: #94A3B8;
+  }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg);
+                font-family: -apple-system, 'Inter', system-ui, sans-serif; }
+  .shell { min-height: 100vh; display: flex; align-items: center;
+           justify-content: center; padding: 20px; }
+  .login { background: var(--card); border: 1px solid var(--border);
+            border-radius: 12px; padding: 28px; max-width: 460px;
+            width: 100%; box-shadow: 0 12px 40px rgba(0,0,0,0.5); }
+  h1 { margin: 0 0 4px; font-size: 20px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 22px; }
+  label { display: block; font-size: 11px; text-transform: uppercase;
+           letter-spacing: 0.08em; color: var(--muted); margin: 14px 0 6px;
+           font-weight: 600; }
+  input { width: 100%; background: var(--bg); color: var(--fg);
+           border: 1px solid var(--border); border-radius: 8px;
+           padding: 10px 12px; font-size: 13px; font-family: 'JetBrains Mono', monospace;
+           outline: none; box-sizing: border-box; }
+  input:focus { border-color: var(--accent); }
+  button { width: 100%; background: var(--accent); color: #041410;
+            border: 0; border-radius: 8px; padding: 11px;
+            font-size: 14px; font-weight: 600; cursor: pointer;
+            margin-top: 18px; letter-spacing: 0.01em; }
+  button:hover { filter: brightness(1.1); }
+  .hint { font-size: 11px; color: var(--muted); margin-top: 10px;
+           line-height: 1.5; }
+  .hint code { background: var(--bg); padding: 1px 5px; border-radius: 3px;
+                font-family: 'JetBrains Mono', monospace; font-size: 10px;
+                color: var(--accent); }
+  .err { color: var(--loss); font-size: 12px; margin-top: 8px; display: none; }
+</style>
+</head>
+<body>
+<div class="shell">
+  <div class="login">
+    <h1>tradebot · remote</h1>
+    <div class="sub">Connect to your local bot via Cloudflare Tunnel.</div>
+
+    <label>API base URL</label>
+    <input id="api-base" placeholder="https://tradebot.yourdomain.com"
+           autocomplete="off"/>
+    <div class="hint">The stable URL from Cloudflare Tunnel (or <code>trycloudflare.com</code> hostname).</div>
+
+    <label>Bearer token</label>
+    <input id="api-token" type="password" placeholder="matches DASHBOARD_REMOTE_TOKEN"
+           autocomplete="off"/>
+    <div class="hint">Set in your bot's <code>.env</code> as <code>DASHBOARD_REMOTE_TOKEN</code>.</div>
+
+    <button onclick="connect()">Connect</button>
+    <div class="err" id="err"></div>
+
+    <div class="hint" style="margin-top: 22px">
+      Credentials stay in your browser (localStorage) — Vercel never sees them.
+      Re-open this page anytime and you stay signed in.
+    </div>
+  </div>
+</div>
+
+<script>
+// Pre-fill from stored credentials if present
+const saved_base  = localStorage.getItem('tradebot_api_base')  || '';
+const saved_token = localStorage.getItem('tradebot_api_token') || '';
+if (saved_base)  document.getElementById('api-base').value  = saved_base;
+if (saved_token) document.getElementById('api-token').value = saved_token;
+
+// Auto-connect if both present
+if (saved_base && saved_token) {
+  // Don't auto-redirect — let user explicitly click (prevents loop
+  // if credentials are wrong). But prefill so one click is enough.
+}
+
+async function connect() {
+  const base  = document.getElementById('api-base').value.trim().replace(/\/+$/, '');
+  const token = document.getElementById('api-token').value.trim();
+  const err = document.getElementById('err');
+  err.style.display = 'none';
+
+  if (!base || !token) {
+    err.textContent = 'Both fields required.';
+    err.style.display = 'block';
+    return;
+  }
+
+  // Health-check the API before storing credentials
+  try {
+    const r = await fetch(base + '/api/health', {
+      headers: { 'Authorization': 'Bearer ' + token }
+    });
+    if (!r.ok) {
+      err.textContent = `API responded with ${r.status} — check URL + token.`;
+      err.style.display = 'block';
+      return;
+    }
+    await r.json();
+  } catch (e) {
+    err.textContent = 'Could not reach API: ' + e.message +
+      ' — verify the tunnel is up and the URL is correct.';
+    err.style.display = 'block';
+    return;
+  }
+
+  localStorage.setItem('tradebot_api_base', base);
+  localStorage.setItem('tradebot_api_token', token);
+  window.location.href = 'dashboard.html';
+}
+
+// Hit Enter in either input to submit
+['api-base', 'api-token'].forEach(id => {
+  document.getElementById(id).addEventListener('keydown', e => {
+    if (e.key === 'Enter') connect();
+  });
+});
+</script>
+</body>
+</html>

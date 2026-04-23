@@ -65,7 +65,12 @@ git add \
   src/risk/execution_chain.py \
   deploy/launchd/com.tradebot.scan_premarket.plist \
   deploy/launchd/com.tradebot.scan_postmarket.plist \
-  deploy/launchd/com.tradebot.saves_report.plist
+  deploy/launchd/com.tradebot.saves_report.plist \
+  deploy/vercel/README.md \
+  deploy/vercel/build.sh \
+  deploy/vercel/index.html \
+  deploy/vercel/vercel.json \
+  deploy/gcp/README.md
 
 MSG_FILE="$(mktemp "${TMPDIR:-/tmp}/tradebot_commit_msg.XXXXXX")"
 {

@@ -679,9 +679,20 @@ function toast(msg, isError) {
   setTimeout(() => el.remove(), 3600);
 }
 
+// Remote-host support: when served from Vercel, the HTML points at
+// the Cloudflare Tunnel URL (TRADEBOT_API_BASE) with an auth token
+// (TRADEBOT_API_TOKEN). Both default to empty = use same-origin +
+// no auth for local-only deployments.
+const API_BASE  = (typeof TRADEBOT_API_BASE  !== 'undefined' && TRADEBOT_API_BASE)  || '';
+const API_TOKEN = (typeof TRADEBOT_API_TOKEN !== 'undefined' && TRADEBOT_API_TOKEN) || '';
+
 async function api(url, options) {
   try {
-    const r = await fetch(url, options);
+    const full = url.startsWith('http') ? url : (API_BASE + url);
+    const opts = Object.assign({}, options || {});
+    opts.headers = Object.assign({}, opts.headers || {});
+    if (API_TOKEN) opts.headers['Authorization'] = 'Bearer ' + API_TOKEN;
+    const r = await fetch(full, opts);
     return await r.json();
   } catch (e) { return { error: e.message }; }
 }
