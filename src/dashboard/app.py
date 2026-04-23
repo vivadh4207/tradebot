@@ -109,7 +109,76 @@ def equity(days: int = Query(30, ge=1, le=365)):
 
 
 @app.get("/api/trades", response_class=JSONResponse)
-def trades(days: int = Query(30, ge=1, le=365), limit: int = Query(500, le=5000)):
+def trades(days: int = Query(30, ge=1, le=365),
+            limit: int = Query(500, le=5000),
+            source: str = Query("auto", regex="^(auto|tradier|local)$")):
+    """Closed trades list. `source=tradier` queries Tradier's trade
+    history (the REAL broker fills — what the operator sees on the
+    Tradier dashboard). `source=local` reads local journal (paper
+    simulator, can diverge from reality). `source=auto` prefers
+    Tradier when available.
+
+    Operator case: local journal accumulated 16 phantom losing trades
+    today while Tradier had 7 real profitable ones. Reading from
+    Tradier is the only way the dashboard shows truth."""
+    if source in ("auto", "tradier"):
+        try:
+            from ..brokers.tradier_adapter import build_tradier_broker
+            tb = build_tradier_broker()
+            if tb is not None:
+                from datetime import datetime as _dt, timedelta as _td
+                from_date = (_dt.now() - _td(days=days)).strftime("%Y-%m-%d")
+                to_date = _dt.now().strftime("%Y-%m-%d")
+                events = tb.history(from_date=from_date,
+                                     to_date=to_date, limit=limit) or []
+                # Pair buy-to-open with sell-to-close per symbol for
+                # realized P&L. Walk events chronologically.
+                from collections import defaultdict as _dd
+                open_stack: Dict[str, list] = _dd(list)
+                closed: List[Dict[str, Any]] = []
+                events_sorted = sorted(events, key=lambda e: e.get("ts") or "")
+                for ev in events_sorted:
+                    sym = ev.get("symbol", "")
+                    side = (ev.get("side") or "").lower()
+                    qty = float(ev.get("qty", 0))
+                    px = float(ev.get("fill_price", 0))
+                    ts = ev.get("ts")
+                    amt = float(ev.get("amount", 0))
+                    if "buy" in side:
+                        open_stack[sym].append({
+                            "qty": qty, "price": px, "ts": ts,
+                            "cost": -amt,
+                        })
+                    elif "sell" in side and open_stack.get(sym):
+                        entry = open_stack[sym].pop(0)
+                        pnl = amt - entry["cost"]
+                        pnl_pct = (pnl / max(entry["cost"], 1e-9)
+                                    if entry["cost"] > 0 else None)
+                        closed.append({
+                            "symbol": sym,
+                            "opened_at": entry["ts"],
+                            "closed_at": ts,
+                            "side": "long", "qty": int(qty),
+                            "entry_price": entry["price"],
+                            "exit_price": px,
+                            "pnl": round(pnl, 2),
+                            "pnl_pct": (round(pnl_pct, 4)
+                                         if pnl_pct is not None else None),
+                            "entry_tag": "", "exit_reason": "tradier_closed",
+                            "is_option": len(sym) >= 15,
+                            "source": "tradier",
+                        })
+                if closed:
+                    return {"trades": closed[-limit:],
+                             "source": "tradier",
+                             "total": len(closed)}
+        except Exception as e:                              # noqa: BLE001
+            if source == "tradier":
+                return {"trades": [], "source": "tradier",
+                         "error": str(e)[:200]}
+            # auto — fall through to local
+
+    # local journal fallback
     j = _load_journal()
     try:
         since = datetime.now(tz=timezone.utc) - timedelta(days=days)
@@ -122,9 +191,9 @@ def trades(days: int = Query(30, ge=1, le=365), limit: int = Query(500, le=5000)
              "entry_price": t.entry_price, "exit_price": t.exit_price,
              "pnl": t.pnl, "pnl_pct": t.pnl_pct,
              "entry_tag": t.entry_tag, "exit_reason": t.exit_reason,
-             "is_option": t.is_option}
+             "is_option": t.is_option, "source": "local"}
             for t in ts
-        ]}
+        ], "source": "local"}
     finally:
         j.close()
 

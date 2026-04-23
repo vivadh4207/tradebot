@@ -203,6 +203,47 @@ class TradierBroker:
 
     # ------------------------------------------------ account
 
+    def history(self, *, from_date: Optional[str] = None,
+                   to_date: Optional[str] = None,
+                   limit: int = 100) -> List[Dict[str, Any]]:
+        """Fetch filled-order history from Tradier. Returns list of
+        normalized dicts with symbol, side, qty, fill_price, ts,
+        realized_pnl (if available)."""
+        from datetime import datetime as _dt, timedelta as _td
+        if not from_date:
+            from_date = (_dt.now() - _td(days=7)).strftime("%Y-%m-%d")
+        if not to_date:
+            to_date = _dt.now().strftime("%Y-%m-%d")
+        params = {
+            "start": from_date, "end": to_date,
+            "type": "trade", "limit": int(limit),
+        }
+        data = self._get(
+            f"/v1/accounts/{self._account}/history", params
+        ) or {}
+        hist = data.get("history")
+        if not isinstance(hist, dict):
+            return []
+        events = hist.get("event") or []
+        if isinstance(events, dict):
+            events = [events]
+        out: List[Dict[str, Any]] = []
+        for ev in events:
+            trade = ev.get("trade") or {}
+            if not trade:
+                continue
+            out.append({
+                "ts": ev.get("date"),
+                "symbol": trade.get("symbol", ""),
+                "side": trade.get("trade_type") or trade.get("side", ""),
+                "qty": abs(float(trade.get("quantity", 0))),
+                "fill_price": float(trade.get("price", 0)),
+                "commission": float(trade.get("commission", 0) or 0),
+                "description": ev.get("description", ""),
+                "amount": float(ev.get("amount", 0) or 0),
+            })
+        return out
+
     def account(self) -> Dict[str, Any]:
         """Account snapshot for dashboard / reconcile."""
         bal = self._get(f"/v1/accounts/{self._account}/balances") or {}
