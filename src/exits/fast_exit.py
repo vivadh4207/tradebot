@@ -20,6 +20,10 @@ class FastExitConfig:
     pt_multi_pct: float = 0.50
     sl_short_pct: float = 0.20
     sl_multi_pct: float = 0.30
+    # Entry grace — no fade/SL exits inside this window. Only a PANIC
+    # floor at -30% (catastrophic) fires in grace. Prevents bid/ask
+    # spread-wash on fresh entries from triggering instant exits.
+    entry_grace_sec: float = 60.0
     # Force-close same-day expiry positions after this many minutes of
     # being held. 0DTE options decay fast — holding past the scalp
     # window just donates premium to theta.
@@ -311,9 +315,29 @@ class FastExitEvaluator:
         if pnl >= self.cfg.hard_cap_pct:
             return ExitDecision(True, f"fast_hard_cap:{pnl:.2%}", layer=0)
 
-        # Stop loss always fires first.
-        if pnl <= -sl:
-            return ExitDecision(True, f"fast_sl_hit:{pnl:.2%}", layer=0)
+        # Stop loss — respect entry grace period so bid/ask spread
+        # wash on fresh fills doesn't instant-kill us. Operator case:
+        # NFLX 4/24 put filled at $0.55 with spread $0.02 (3.6%),
+        # hit SL at -12.79% within 27 seconds just from the spread
+        # crossing + minor tick movement. entry_grace_sec=60 means SL
+        # won't fire inside the first minute. Hard cap still works
+        # (that's a RUNAWAY, not noise), and genuine big drawdowns
+        # past -30% still fire (caught by a looser "panic SL" below).
+        import time as _t_sl
+        _entry_age_sl = _t_sl.time() - float(pos.entry_ts or 0)
+        _grace_sl = getattr(self.cfg, "entry_grace_sec", 60.0)
+        if _entry_age_sl < _grace_sl:
+            # Panic floor inside grace — only fires on CATASTROPHIC
+            # drawdown (e.g. ticker gaps against us immediately, not
+            # spread wash). Fixed at -30% to let normal spread cross
+            # through but catch real underwater trades.
+            if pnl <= -0.30:
+                return ExitDecision(True,
+                    f"fast_sl_panic_in_grace:{pnl:.2%}", layer=0)
+        else:
+            # Post-grace — normal fixed SL
+            if pnl <= -sl:
+                return ExitDecision(True, f"fast_sl_hit:{pnl:.2%}", layer=0)
 
         # Momentum/volume exit — close when the underlying trend reverses
         # even if we haven't hit the fixed PT. Only fires when already

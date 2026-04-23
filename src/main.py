@@ -466,6 +466,7 @@ class TradeBot:
             sl_short_pct=settings.get("exits.stop_loss_short_dte_pct", 0.20),
             sl_multi_pct=settings.get("exits.stop_loss_multi_dte_pct", 0.30),
             zero_dte_max_hold_minutes=_zero_dte_max_hold,
+            entry_grace_sec=float(settings.get("exits.entry_grace_sec", 60.0)),
         ))
         # Position-fade advisor: LLM + chart review -> Discord with
         # action buttons when a winner starts fading. Runs alongside
