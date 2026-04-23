@@ -1429,10 +1429,28 @@ class TradeBot:
                             if adv is not None:
                                 self._post_fade_advisory(adv)
                                 # AUTO-EXECUTE urgent close recommendations
-                                # — operator: "it set signal in discord but
-                                # didn't close itself."
-                                if (adv.recommendation == "close"
-                                        and adv.urgency == "urgent"):
+                                # ONLY when the position had meaningful
+                                # peak (≥ +5% for swing, ≥ +3% for short,
+                                # ≥ +2% for 0DTE) AND has given back
+                                # >=50%. Prevents LLM-closing a +1%
+                                # winner on a −2% dip. Operator case:
+                                # NVDA closed at peak +1.03% → −2.23%
+                                # which is just noise, not a fade.
+                                _peak = float(adv.peak_pnl_pct or 0)
+                                _now = float(adv.current_pnl_pct or 0)
+                                _dte_pos = pos.dte() if hasattr(pos, "dte") else 7
+                                _min_peak = (0.02 if _dte_pos == 0
+                                             else 0.05 if _dte_pos >= 14
+                                             else 0.03)
+                                _gave_back = ((_peak - _now) / max(_peak, 1e-9)
+                                               if _peak > 0 else 0.0)
+                                _llm_execute = (
+                                    adv.recommendation == "close"
+                                    and adv.urgency == "urgent"
+                                    and _peak >= _min_peak
+                                    and _gave_back >= 0.50
+                                )
+                                if _llm_execute:
                                     from .exits.fast_exit import (
                                         ExitDecision as _ED,
                                     )
