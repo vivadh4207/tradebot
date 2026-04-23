@@ -265,6 +265,23 @@ def _build_prompt(adv: FadeAdvisory, bars) -> str:
     # Fail-open — missing pieces are omitted from the snapshot.
     session_ctx = _gather_session_context()
 
+    # Add Finnhub fundamentals for the underlying — insider flow +
+    # analyst targets give the LLM extra signal for close/hold call.
+    fundamentals_ctx = None
+    try:
+        from .finnhub_intelligence import build_finnhub_intelligence
+        fh = build_finnhub_intelligence()
+        if fh is not None:
+            # Infer underlying from OCC symbol if needed
+            import re as _re2
+            und = adv.symbol
+            m_occ = _re2.match(r"^([A-Z]{1,6})\d{6}[CP]\d{8}$", und)
+            if m_occ:
+                und = m_occ.group(1)
+            fundamentals_ctx = fh.compact_snapshot(fh.bundle(und))
+    except Exception:
+        pass
+
     snap = {
         "symbol": adv.symbol,
         "direction": adv.direction,
@@ -282,6 +299,7 @@ def _build_prompt(adv: FadeAdvisory, bars) -> str:
         "recent_underlying_bars": recent_bars,
         "chart_metrics": computed,
         "session_context": session_ctx,
+        "fundamentals": fundamentals_ctx,
     }
     return (
         "You are a senior options-desk risk manager reviewing a FADING "

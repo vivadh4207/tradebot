@@ -111,6 +111,32 @@ is ALREADY active. Your `market_read` must discuss both sides and your
 `ideas` should reflect whichever side has more confluence — if bearish
 wins, propose puts, period.
 
+## Fundamentals context (MANDATORY CITATION)
+
+The SNAPSHOT contains a `fundamentals` section per symbol with:
+  - analyst: target_mean, target_high, target_low, n_analysts
+  - recommendations: strong_buy / buy / hold / sell / strong_sell counts
+  - fundamentals: P/E, market_cap, beta, 52w range, profit margin
+  - insider_90d: buys, sells, net_shares in last 90 days
+  - insider_sentiment: MSPR (Monthly Share Purchase Ratio, -100..+100)
+  - top_holders: top 5 institutional owners + share %
+  - institutional_ownership: % of float held by institutions
+  - recent_filings: last 3 SEC filings (10-K, 10-Q, 8-K)
+  - next_dividend: ex-date + amount if upcoming
+
+You MUST reference at least one fundamentals field in your
+`market_read` OR in each idea's `rationale`. Examples:
+
+  - "Analyst target $720 = +8.3% upside vs spot — supports bullish setup"
+  - "Insider MSPR -42 (heavy insider selling) — bearish signal confirms PUT"
+  - "Institutional ownership 72%, no insider activity — neutral fundamentals
+     means the trade is pure technicals"
+  - "10-Q filed 3 days ago — earnings-adjacent IV may not revert"
+
+Fundamentals alignment RAISES confidence; contradiction LOWERS it.
+If analyst target implies downside but the chart is bullish, note the
+conflict and flag as `confidence=low`.
+
 ## Per-idea spec
 
 Each idea object must have:

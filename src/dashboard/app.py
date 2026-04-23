@@ -61,6 +61,13 @@ if _CORS_ORIGINS:
 def _auth_ok(request: Request) -> bool:
     if not _REMOTE_TOKEN:
         return True           # auth disabled — local-only default
+    # Localhost / loopback ALWAYS allowed — you're on the Mac that
+    # runs the bot. Remote tunnel traffic (from Vercel etc.) still
+    # needs the bearer token. This keeps the local dashboard usable
+    # without juggling tokens just because you set one for remote.
+    client_host = (request.client.host if request.client else "") or ""
+    if client_host in ("127.0.0.1", "::1", "localhost"):
+        return True
     auth = request.headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
         if auth[7:].strip() == _REMOTE_TOKEN:
