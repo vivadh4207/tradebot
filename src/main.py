@@ -289,7 +289,13 @@ class TradeBot:
                 log.info("tradier_mirror_init_skipped", err=str(e))
                 tradier_mirror_broker = None
 
-        if alpaca_mirror_broker is not None:
+        # MirrorAlpacaBroker is the multi-mirror wrapper — build it
+        # whenever EITHER Alpaca or Tradier mirror is active. Earlier
+        # logic only built it when Alpaca was set, which meant disabling
+        # Alpaca silently disabled Tradier mirror too (trades fired
+        # locally but never reached Tradier). This is the bug that let
+        # kind=paper show up on logs after switching to Tradier-only.
+        if alpaca_mirror_broker is not None or tradier_mirror_broker is not None:
             from .brokers.mirror_alpaca import MirrorAlpacaBroker
             self.broker = MirrorAlpacaBroker(
                 starting_equity=settings.paper_equity,
@@ -300,14 +306,13 @@ class TradeBot:
                 alpaca_broker=alpaca_mirror_broker,
                 tradier_broker=tradier_mirror_broker,
             )
-            # Inject a quote callback so reconcile can fetch live option
-            # bid/ask before sending close orders. Prevents blind $0.01
-            # closes that either don't fill or dump positions at garbage
-            # prices.
             self.broker._close_quote_fn = self._option_quote_for_close
-            kind = "paper+alpaca_mirror"
+            parts = ["paper"]
+            if alpaca_mirror_broker is not None:
+                parts.append("alpaca_mirror")
             if tradier_mirror_broker is not None:
-                kind += "+tradier_mirror"
+                parts.append("tradier_mirror")
+            kind = "+".join(parts)
             log.info("broker", kind=kind)
         else:
             self.broker = PaperBroker(
