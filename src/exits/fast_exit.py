@@ -387,7 +387,8 @@ class FastExitEvaluator:
             elif dte >= 14:
                 arm_pct = 0.04     # swing: arm at +4% (let it breathe)
 
-        if (self.cfg.profit_lock_enabled
+        if (not _in_grace
+                and self.cfg.profit_lock_enabled
                 and peak_pnl_attr is not None
                 and peak_pnl_attr >= arm_pct):
             # Adaptive give-back: bigger winners get tighter protection.
@@ -459,7 +460,8 @@ class FastExitEvaluator:
         # the close (support lost). Long put thesis breaks when it
         # makes a higher high. Only fires when in profit — we don't
         # cut losers on one red bar.
-        if (self.cfg.support_break_enabled
+        if (not _in_grace
+                and self.cfg.support_break_enabled
                 and bars is not None and len(bars) >= 5
                 and pnl >= self.cfg.support_break_min_profit):
             is_bullish = (pos.right == OptionRight.CALL)
@@ -541,7 +543,8 @@ class FastExitEvaluator:
                 exhaustion_min = self.cfg.all_dte_exhaustion_swing_min_profit
             else:
                 exhaustion_min = self.cfg.all_dte_exhaustion_short_min_profit
-        if (exhaustion_min is not None
+        if (not _in_grace
+                and exhaustion_min is not None
                 and bars is not None and len(bars) >= 15
                 and pnl >= exhaustion_min):
             is_bullish = (pos.right == OptionRight.CALL)
@@ -604,17 +607,47 @@ class FastExitEvaluator:
             ])
 
             if upside_signals_present == 0:
-                # No continuation signal while in profit = take it
-                dte_tag = ("0dte" if dte == 0 else
-                             "swing" if dte >= 14 else "short")
-                return ExitDecision(
-                    True,
-                    (f"exhaustion_{dte_tag}:pnl={pnl:+.2%}_no_upside_signal"
-                     f"_(new_hi={signal_a_new_extreme},"
-                     f"vol_rising={signal_b_volume_rising},"
-                     f"vwap_exp={signal_c_vwap_expanding})_dte={dte}"),
-                    layer=0,
-                )
+                # No continuation signal while in profit = take it.
+                # BUT: skip if the round-trip spread would turn our
+                # small profit into a loss. Operator case: SPY at
+                # +1.91% mark with a 0.8%-1.2% spread = crossing back
+                # eats 2× spread ≈ 2-3%, realized would be negative.
+                # Only take the profit if pnl exceeds 2× spread cost.
+                try:
+                    rt_cost = getattr(pos, "spread_pct", None)
+                    if rt_cost is None and pos.avg_price > 0:
+                        # Approximate from last bar's typical spread
+                        rt_cost = 0.015   # 1.5% one-way default
+                    if pnl < (rt_cost * 2.0):
+                        # Profit too small to cross spread on exit; hold
+                        pass
+                    else:
+                        dte_tag = ("0dte" if dte == 0 else
+                                     "swing" if dte >= 14 else "short")
+                        return ExitDecision(
+                            True,
+                            (f"exhaustion_{dte_tag}:pnl={pnl:+.2%}"
+                             "_no_upside_signal"
+                             f"_(new_hi={signal_a_new_extreme},"
+                             f"vol_rising={signal_b_volume_rising},"
+                             f"vwap_exp={signal_c_vwap_expanding})"
+                             f"_dte={dte}"),
+                            layer=0,
+                        )
+                except Exception:
+                    pass
+
+        # ---- UNIVERSAL ENTRY-GRACE GATE for all fade-based exits ----
+        # Operator case: SPY 711C filled at $2.54, exited 15s later on a
+        # single-bar "lower high" pattern while still +1.91% on mark.
+        # The spread cross to sell turned that into a −$6.94 loss.
+        # One bar is NOT a pattern. Fade exits that rely on bar-shape
+        # signals (active_downside, chart_reversal, exhaustion, profit_lock)
+        # all skip inside the grace window.
+        import time as _t_ag
+        _entry_age_ag = _t_ag.time() - float(pos.entry_ts or 0)
+        _grace_ag = getattr(self.cfg, "entry_grace_sec", 60.0)
+        _in_grace = _entry_age_ag < _grace_ag
 
         # ---- Active-downside detector ----
         # Operator: "if it shows downside, sell it asap and if you find
@@ -625,7 +658,8 @@ class FastExitEvaluator:
         #   (i)   Last close below VWAP AND distance growing
         #   (ii)  2+ consecutive red bars with volume > 1.2× baseline
         #   (iii) Most recent bar put in a lower high vs prior 3 bars
-        if (self.cfg.active_downside_enabled
+        if (not _in_grace
+                and self.cfg.active_downside_enabled
                 and bars is not None and len(bars) >= 10):
             # DTE-aware minimum profit
             if dte == 0:
@@ -680,12 +714,22 @@ class FastExitEvaluator:
                     if sig_ii_red_volume: which.append("red_vol_surge")
                     if sig_iii_lower_high: which.append("lower_high")
                     if which:
-                        return ExitDecision(
-                            True,
-                            (f"active_downside:{','.join(which)}"
-                             f"_pnl={pnl:+.2%}_dte={dte}"),
-                            layer=0,
-                        )
+                        # Require MULTIPLE signals when profit is thin
+                        # (less than 2× round-trip spread) — one weak
+                        # bar shouldn't kill a +1% position that would
+                        # realize as a loss after spread cross.
+                        rt_cost = getattr(pos, "spread_pct", None) or 0.015
+                        threshold = rt_cost * 2.0
+                        if pnl < threshold and len(which) < 2:
+                            # Profit too thin + only 1 signal → hold
+                            pass
+                        else:
+                            return ExitDecision(
+                                True,
+                                (f"active_downside:{','.join(which)}"
+                                 f"_pnl={pnl:+.2%}_dte={dte}"),
+                                layer=0,
+                            )
                 else:
                     # Long put — mirror logic
                     cur_gap = vwap - closes[-1]
@@ -724,7 +768,8 @@ class FastExitEvaluator:
         # profit." Two new layers:
         #   (1) Lower-high / higher-low sequence — trend change
         #   (2) VWAP break — institutional value line lost
-        if (self.cfg.chart_reversal_enabled
+        if (not _in_grace
+                and self.cfg.chart_reversal_enabled
                 and bars is not None
                 and len(bars) >= max(self.cfg.lower_high_bars + 1, 10)
                 and pnl >= self.cfg.chart_reversal_min_profit):
