@@ -283,6 +283,16 @@ class FastExitEvaluator:
         dte = pos.dte()
         pnl = pos.unrealized_pnl_pct(current_price)
         short_dte = dte <= 1
+        # Universal entry-grace flag — computed once per call, used by
+        # every fade-based exit layer below to suppress spread-wash
+        # instant-kills. Only panic-floor exits fire in grace.
+        import time as _t_top
+        try:
+            _entry_age_ag = _t_top.time() - float(pos.entry_ts or 0)
+        except Exception:
+            _entry_age_ag = 9999.0
+        _grace_ag = getattr(self.cfg, "entry_grace_sec", 60.0)
+        _in_grace = _entry_age_ag < _grace_ag
         # 0DTE scalp-window timeout — fires BEFORE PT/SL so it reliably
         # caps the hold time on same-day contracts. Timeout is DYNAMIC:
         # contracts faster when the trade is moving against you, expands
@@ -636,18 +646,6 @@ class FastExitEvaluator:
                         )
                 except Exception:
                     pass
-
-        # ---- UNIVERSAL ENTRY-GRACE GATE for all fade-based exits ----
-        # Operator case: SPY 711C filled at $2.54, exited 15s later on a
-        # single-bar "lower high" pattern while still +1.91% on mark.
-        # The spread cross to sell turned that into a −$6.94 loss.
-        # One bar is NOT a pattern. Fade exits that rely on bar-shape
-        # signals (active_downside, chart_reversal, exhaustion, profit_lock)
-        # all skip inside the grace window.
-        import time as _t_ag
-        _entry_age_ag = _t_ag.time() - float(pos.entry_ts or 0)
-        _grace_ag = getattr(self.cfg, "entry_grace_sec", 60.0)
-        _in_grace = _entry_age_ag < _grace_ag
 
         # ---- Active-downside detector ----
         # Operator: "if it shows downside, sell it asap and if you find
