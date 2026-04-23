@@ -354,13 +354,20 @@ def _settings():
 
 @app.get("/api/health", response_class=JSONResponse)
 def health():
-    """Liveness + last-tick freshness. Essential for ops."""
+    """Liveness + account snapshot. Prefers TRADIER (truth) for
+    cash/equity/day_pnl/positions; falls through to local snapshot
+    only when Tradier is unreachable.
+
+    Operator: "dashboard should get real time update from Tradier not
+    hardcoded." Fix: query Tradier account + positions on every
+    /api/health call. Adds a `source` field so UI can label it.
+    """
     s, root = _settings()
     j = _load_journal()
     try:
+        # Local snapshot (fallback only)
         snap = load_snapshot(s.get("broker.snapshot_path",
                                      str(root / "logs" / "broker_state.json")))
-        # Derive "last tick" from the most recent equity_curve entry if present
         from datetime import datetime, timedelta, timezone
         since = datetime.now(tz=timezone.utc) - timedelta(hours=48)
         eq = j.equity_series(since=since, limit=1)
@@ -373,23 +380,69 @@ def health():
     log_path = root / "logs" / "tradebot.out"
     log_size = log_path.stat().st_size if log_path.exists() else 0
 
-    snap_saved = snap.saved_at if snap else None
-    snap_positions = len(snap.positions) if snap else 0
-    snap_cash = snap.cash if snap else None
-    snap_day_pnl = snap.day_pnl if snap else None
+    # ---- TRADIER first (the real broker) ----
+    tradier_cash: Optional[float] = None
+    tradier_equity: Optional[float] = None
+    tradier_day_pnl: Optional[float] = None
+    tradier_positions: Optional[int] = None
+    account_source = "local"
+    ok = True
+    try:
+        from ..brokers.tradier_adapter import build_tradier_broker
+        tb = build_tradier_broker()
+        if tb is not None:
+            try:
+                acct = tb.account()
+                c = getattr(acct, "cash", None)
+                e = getattr(acct, "equity", None)
+                d = getattr(acct, "day_pnl", None)
+                if c is not None: tradier_cash = float(c)
+                if e is not None: tradier_equity = float(e)
+                if d is not None: tradier_day_pnl = float(d)
+            except Exception:
+                pass
+            try:
+                tradier_positions = len(list(tb.positions()))
+            except Exception:
+                pass
+            if tradier_cash is not None or tradier_positions is not None:
+                account_source = "tradier"
+    except Exception:
+        pass
+
+    # Fall through to local snapshot where Tradier didn't answer
+    if tradier_cash is None and snap:
+        tradier_cash = snap.cash
+    if tradier_positions is None and snap:
+        tradier_positions = len(snap.positions)
+    if tradier_day_pnl is None and snap:
+        tradier_day_pnl = snap.day_pnl
+    if tradier_equity is None and tradier_cash is not None:
+        tradier_equity = tradier_cash
+    if tradier_cash is None:
+        ok = False
 
     return {
+        "ok": ok,
+        "source": account_source,               # "tradier" or "local"
         "backend": s.get("storage.backend", "sqlite"),
         "universe": s.get("universe", []),
         "ensemble_enabled": s.get("ensemble.enabled", True),
         "lstm_enabled": s.get("ml.lstm_enabled", True),
         "live_trading": s.live_trading,
+        "mode": "paper" if not s.live_trading else "live",
         "last_equity_snapshot": last_tick,
         "last_trade_close": last_trade,
-        "broker_snapshot_saved_at": snap_saved,
-        "broker_open_positions": snap_positions,
-        "broker_cash": snap_cash,
-        "broker_day_pnl": snap_day_pnl,
+        "broker_snapshot_saved_at": snap.saved_at if snap else None,
+        "broker_open_positions": tradier_positions or 0,
+        "broker_cash": tradier_cash,
+        "broker_day_pnl": tradier_day_pnl,
+        "broker_equity": tradier_equity,
+        # Legacy fields the HTML reads directly:
+        "cash": tradier_cash,
+        "equity": tradier_equity,
+        "day_pnl": tradier_day_pnl,
+        "open_positions": tradier_positions or 0,
         "log_size_bytes": log_size,
     }
 

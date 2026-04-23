@@ -721,7 +721,17 @@ async function refreshTopBar() {
   if (health.equity != null)   document.getElementById('qs-equity').textContent = '$' + health.equity.toFixed(0);
   if (health.cash != null)     document.getElementById('qs-cash').textContent   = '$' + health.cash.toFixed(0);
   if (health.open_positions != null) document.getElementById('qs-open').textContent = health.open_positions;
-  if (health.mode)             document.getElementById('mode-pill').textContent = health.mode;
+  // Show account source as the mode pill — "tradier" / "local"
+  const pill = document.getElementById('mode-pill');
+  if (health.source === 'tradier') {
+    pill.textContent = 'tradier · ' + (health.mode || 'paper');
+    pill.style.background = 'rgba(34,197,94,0.15)';
+    pill.style.color = 'var(--profit)';
+  } else {
+    pill.textContent = 'LOCAL · ' + (health.mode || 'paper');
+    pill.style.background = 'rgba(245,158,11,0.15)';
+    pill.style.color = 'var(--warning)';
+  }
   updateDayPnl(health.day_pnl);
 
   const reg = await api('/api/regime_now');
