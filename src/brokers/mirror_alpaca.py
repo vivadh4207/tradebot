@@ -70,6 +70,14 @@ def _order_from_dict(d: dict) -> Order:
     )
 
 
+class _NullLock:
+    """Context-manager no-op. Used when the underlying PaperBroker
+    doesn't expose a `_lock` — we still want the `with ...` block in
+    the reconcile path to run without a special-case branch."""
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
 class MirrorAlpacaBroker(PaperBroker):
     """PaperBroker + best-effort mirror of every submit to Alpaca paper."""
 
@@ -103,6 +111,16 @@ class MirrorAlpacaBroker(PaperBroker):
         self._backlog_threshold = int(backlog_alert_threshold)
         self._backlog_alerted = False
         self._retry_lock = threading.Lock()
+        # In-flight order lock — prevents the race condition where
+        # 3 signals fire on the same symbol within seconds, each
+        # checks dedup before any fill registers, all 3 submit, all
+        # 3 fill, ending up with 3x intended size. Today (2026-04-29)
+        # this happened on IWM 271P (3 buys qty=2 → qty=6, lost $234)
+        # and TSLA 375C (qty=6 instead of qty=2). Lock holds for
+        # ~10s after each submit; signals 2/3 see lock and skip.
+        self._inflight_lock_until: Dict[str, float] = {}
+        self._inflight_lock_ttl_sec = 10.0
+        self._inflight_lock_mu = threading.Lock()
         if self._alpaca is not None:
             # Drain persisted queue on startup — trades that didn't
             # make it during the last run get replayed now.
@@ -126,13 +144,344 @@ class MirrorAlpacaBroker(PaperBroker):
             )
             tt.start()
             self._tradier_thread = tt
+            # Cooldown table — symbols recently closed locally. Prevents
+            # the auto-reconcile thread from re-adopting a position
+            # that fast_exit just closed, which would trigger another
+            # close attempt on the next tick → spam loop. Today's bug.
+            self._recent_close_ts: Dict[str, float] = {}
+            self._recent_close_ttl_sec = 300.0   # 5 min
+
+            # Circuit breaker — track per-symbol reject timestamps.
+            # If 3 rejects hit within 60 seconds, pause that symbol
+            # for 30 min (no submits at all). Architect's rec:
+            # prevents repeat-reject thrash during sandbox throttling
+            # or persistent OCC validation failures.
+            self._reject_log: Dict[str, list] = {}     # sym -> [ts]
+            self._symbol_pause_until: Dict[str, float] = {}  # sym -> ts
+            # Auto-reconcile thread: every ~60s, pull Tradier-only
+            # positions into the local PaperBroker so existing exit
+            # logic (fast_exit tiers, profit-lock, trailing) manages
+            # them. Prevents the NFLX-ghost scenario where DNS flap +
+            # broken mirror = Tradier has a position the bot can't see.
+            rt = threading.Thread(
+                target=self._tradier_reconcile_loop,
+                name="tradier-reconcile",
+                daemon=True,
+            )
+            rt.start()
+            self._tradier_reconcile_thread = rt
         else:
             self._tradier_thread = None
+            self._tradier_reconcile_thread = None
+            self._recent_close_ts = {}
+            self._recent_close_ttl_sec = 300.0
+
+    def _tradier_reconcile_loop(self) -> None:
+        """Periodically adopt Tradier-only positions into local state.
+
+        Runs every 60s. For each Tradier symbol not in the local book,
+        copies it into PaperBroker's in-memory positions with the
+        Tradier-reported avg_price, strike, expiry, right. fast_exit
+        picks it up on the next tick and manages it like any other
+        entry. Tagged `auto_adopted_from_tradier` so the journal +
+        dashboard show where it came from.
+        """
+        import time as _time
+        RECONCILE_INTERVAL = 60.0
+        # Sleep a bit on startup so the initial broker_state_restored
+        # finishes before we start comparing.
+        _time.sleep(15.0)
+        while not self._mirror_stop.is_set():
+            try:
+                self._reconcile_tradier_once()
+            except Exception as e:                          # noqa: BLE001
+                _log.warning("tradier_reconcile_loop_err err=%s",
+                              str(e)[:160])
+            self._mirror_stop.wait(RECONCILE_INTERVAL)
+
+    def _reconcile_tradier_once(self) -> int:
+        """One reconcile pass. Returns # positions adopted this pass.
+
+        OPERATOR DECISION 2026-05-01: phantom-adoption flow caused
+        more problems than it solved (phantom-close storms, broken
+        OCC metadata, Discord notification spam). Adoption is now
+        DISABLED by default; this loop only computes drift for the
+        alarm, never modifies local state.
+
+        To re-enable adoption, set runtime override:
+          tradier_reconcile_adopt_enabled = true
+        """
+        from ..core.types import Position as _Pos, OptionRight as _OR
+        if self._tradier is None:
+            return 0
+        try:
+            tr_positions = list(self._tradier.positions())
+        except Exception as e:                              # noqa: BLE001
+            _log.info("tradier_reconcile_fetch_failed err=%s", str(e)[:120])
+            return 0
+
+        # Read adoption flag — default OFF
+        try:
+            from ..core.runtime_overrides import get_override
+            adopt_enabled = bool(get_override(
+                "tradier_reconcile_adopt_enabled", False
+            ))
+        except Exception:
+            adopt_enabled = False
+
+        # Always compute drift for alarm visibility
+        adopted = 0
+        if not adopt_enabled:
+            # Read-only mode — only run the drift alarm at the end
+            try:
+                tradier_cost_basis = sum(
+                    abs(int(p.qty)) * float(p.avg_price)
+                    * float(p.multiplier or (100 if p.is_option else 1))
+                    for p in tr_positions
+                )
+                with getattr(self, "_lock", _NullLock()):
+                    local_cost_basis = sum(
+                        abs(int(p.qty)) * float(p.avg_price)
+                        * float(p.multiplier or (100 if p.is_option else 1))
+                        for p in self._positions.values()
+                    )
+                drift = abs(local_cost_basis - tradier_cost_basis)
+                try:
+                    from ..core.runtime_overrides import get_override
+                    drift_alarm = float(get_override(
+                        "reconcile_drift_alarm_usd", 200.0
+                    ))
+                except Exception:
+                    drift_alarm = 200.0
+                if drift >= drift_alarm:
+                    _log.warning(
+                        "reconcile_drift_alarm local=$%.2f tradier=$%.2f "
+                        "drift=$%.2f >= $%.0f_threshold "
+                        "(adoption DISABLED — operator must reconcile manually)",
+                        local_cost_basis, tradier_cost_basis,
+                        drift, drift_alarm,
+                    )
+            except Exception:
+                pass
+            return 0
+
+        # ---- ADOPTION PATH (disabled by default) ----
+        if not tr_positions:
+            return 0
+        # Acquire broker lock the PaperBroker uses for _positions
+        lock = getattr(self, "_lock", None)
+        import time as _t
+        ctx = lock if lock is not None else _NullLock()
+        with ctx:
+            local = dict(self._positions)
+            for tp in tr_positions:
+                # Cooldown check: skip symbols recently closed locally
+                # ONLY when local agrees they should be closed (qty=0
+                # locally). If Tradier has a fresh BUY of the same
+                # symbol, local needs to know about it — bug today
+                # was reconcile blocked the IWM re-adopt because
+                # bot had recently closed an IWM put, while Tradier
+                # had a NEW IWM call on the books.
+                now_t = _t.time()
+                last_close = self._recent_close_ts.get(tp.symbol, 0.0)
+                in_cooldown = (
+                    now_t - last_close < self._recent_close_ttl_sec
+                )
+                # If Tradier shows a position AND local has zero/none,
+                # it's either a phantom we want to skip OR a fresh
+                # buy we want to adopt. Disambiguate by checking
+                # entry timestamp: if Tradier `date_acquired` is
+                # AFTER our last close, it's a fresh buy → adopt.
+                if in_cooldown:
+                    # Best-effort: pull date_acquired from raw if avail.
+                    # Conservative default: ALLOW adopt if local has
+                    # NO position on this symbol (genuine orphan).
+                    if tp.symbol in local:
+                        # Local thinks it's closed but Tradier still
+                        # has it. This is the phantom-spam case —
+                        # honor the cooldown.
+                        age = now_t - last_close
+                        _log.info(
+                            "tradier_reconcile_cooldown_skip symbol=%s "
+                            "closed_%.0fs_ago",
+                            tp.symbol, age,
+                        )
+                        continue
+                    # Local has no position → this is a fresh buy bot
+                    # didn't track. Adopt it.
+                    _log.info(
+                        "tradier_reconcile_cooldown_override symbol=%s "
+                        "fresh_buy_after_close_window",
+                        tp.symbol,
+                    )
+                if tp.symbol in local:
+                    # Already tracked locally — qty mismatch is a
+                    # separate concern; log once per occurrence to let
+                    # the operator notice without spamming.
+                    lp = local[tp.symbol]
+                    if int(lp.qty) != int(tp.qty):
+                        _log.warning(
+                            "tradier_reconcile_qty_mismatch symbol=%s "
+                            "local_qty=%d tradier_qty=%d",
+                            tp.symbol, int(lp.qty), int(tp.qty),
+                        )
+                    continue
+                # Orphan on Tradier — but verify the symbol is priceable
+                # before adopting. Sandbox sometimes returns positions
+                # whose OCC symbology is rejected by Alpaca / Yahoo as
+                # "invalid symbol", leaving the adopted position
+                # unmanageable. Use Tradier's OWN quotes endpoint for
+                # the priceability check (the data feed used to fetch
+                # bars during fast_exit might fail, but if Tradier
+                # returns a valid bid/ask we can manage it).
+                try:
+                    test_q = None
+                    if hasattr(self._tradier, "_get"):
+                        try:
+                            data = self._tradier._get(
+                                "/v1/markets/quotes",
+                                {"symbols": tp.symbol},
+                            ) or {}
+                            rows = (data.get("quotes") or {}
+                                      ).get("quote") or {}
+                            if isinstance(rows, list):
+                                rows = rows[0] if rows else {}
+                            ask = float(rows.get("ask") or 0)
+                            bid = float(rows.get("bid") or 0)
+                            if ask > 0 or bid > 0:
+                                test_q = True
+                        except Exception:
+                            test_q = None
+                    if test_q is None:
+                        _log.warning(
+                            "tradier_reconcile_skip_unpriceable symbol=%s "
+                            "qty=%d — Tradier quote returned no bid/ask, "
+                            "leaving on Tradier for manual handling",
+                            tp.symbol, int(tp.qty),
+                        )
+                        continue
+                except Exception as _e:                     # noqa: BLE001
+                    _log.info(
+                        "tradier_reconcile_quote_check_err symbol=%s err=%s",
+                        tp.symbol, str(_e)[:120],
+                    )
+
+                right = tp.right if isinstance(tp.right, _OR) else (
+                    _OR(tp.right) if tp.right else None
+                )
+                adopted_pos = _Pos(
+                    symbol=tp.symbol,
+                    qty=int(tp.qty),
+                    avg_price=float(tp.avg_price),
+                    is_option=bool(tp.is_option),
+                    underlying=tp.underlying,
+                    strike=tp.strike,
+                    expiry=tp.expiry,
+                    right=right,
+                    multiplier=int(tp.multiplier or (100 if tp.is_option else 1)),
+                    entry_ts=_t.time(),
+                    entry_tags={"tag": "auto_adopted_from_tradier"},
+                    auto_profit_target=None,
+                    auto_stop_loss=None,
+                )
+                self._positions[tp.symbol] = adopted_pos
+                adopted += 1
+                _log.warning(
+                    "tradier_reconcile_adopted symbol=%s qty=%d "
+                    "avg=%.4f right=%s — exit logic now manages it",
+                    tp.symbol, int(tp.qty), float(tp.avg_price),
+                    right.value if right else "stock",
+                )
+        if adopted:
+            # Persist the snapshot so a restart preserves adoptions.
+            try:
+                from ..storage.position_snapshot import save_snapshot
+                from ..core.data_paths import data_path
+                save_snapshot(data_path("logs/broker_state.json"), self)
+            except Exception as e:                          # noqa: BLE001
+                _log.info("tradier_reconcile_snap_save_failed err=%s",
+                           str(e)[:120])
+
+        # ---- Drift invariant alarm (architect's recommendation) ----
+        # Every reconcile pass, compare cumulative cost basis on
+        # Tradier vs local. If they diverge by more than the alarm
+        # threshold ($200 default), log warning + Discord alert. This
+        # is the canary for a brewing phantom-position problem.
+        try:
+            tradier_cost_basis = sum(
+                abs(int(p.qty)) * float(p.avg_price)
+                * float(p.multiplier or (100 if p.is_option else 1))
+                for p in tr_positions
+            )
+            with ctx:
+                local_cost_basis = sum(
+                    abs(int(p.qty)) * float(p.avg_price)
+                    * float(p.multiplier or (100 if p.is_option else 1))
+                    for p in self._positions.values()
+                )
+            drift = abs(local_cost_basis - tradier_cost_basis)
+            try:
+                from ..core.runtime_overrides import get_override
+                drift_alarm = float(get_override(
+                    "reconcile_drift_alarm_usd", 200.0
+                ))
+            except Exception:
+                drift_alarm = 200.0
+            if drift >= drift_alarm:
+                _log.warning(
+                    "reconcile_drift_alarm local=$%.2f tradier=$%.2f "
+                    "drift=$%.2f >= $%.0f_threshold "
+                    "(check for phantom positions)",
+                    local_cost_basis, tradier_cost_basis,
+                    drift, drift_alarm,
+                )
+        except Exception as _e:                             # noqa: BLE001
+            _log.info("reconcile_drift_check_err err=%s",
+                        str(_e)[:120])
+        return adopted
+
+    def _mark_recently_touched(self, symbol: str) -> None:
+        """Tell reconcile not to adopt this symbol for the cooldown
+        window. Called after every local submit so the reconcile
+        thread doesn't race with a just-opened or just-closed
+        position. Race that bit us today: reconcile read Tradier qty=3,
+        then bot fast-traded another qty=3 before reconcile wrote
+        local → local qty=6, Tradier qty=3 → 'sell 6 > long 3' loop."""
+        try:
+            self._recent_close_ts[symbol] = time.time()
+        except Exception:
+            pass
 
     def submit(self, order: Order, *,
                 contract: Optional[OptionContract] = None,
                 auto_profit_target: Optional[float] = None,
                 auto_stop_loss: Optional[float] = None) -> Optional[Fill]:
+        # ---- IN-FLIGHT ORDER LOCK (race-condition prevention) ----
+        # Prevents 3 simultaneous signals from each opening qty=2,
+        # ending with qty=6. Only applies to BUY-to-open (entries).
+        # Exits (sells) bypass — same reason as circuit-breaker.
+        from ..core.types import Side as _Side
+        side_l = (order.side.value or "").lower()
+        is_open = (
+            order.side == _Side.BUY and order.is_option
+            and "to_close" not in side_l
+        )
+        if is_open:
+            with self._inflight_lock_mu:
+                now = time.time()
+                lock_until = self._inflight_lock_until.get(order.symbol, 0)
+                if now < lock_until:
+                    _log.info(
+                        "entry_skip_inflight_lock symbol=%s "
+                        "lock_remaining=%.1fs (race-condition guard)",
+                        order.symbol, lock_until - now,
+                    )
+                    return None
+                # Acquire lock for this symbol
+                self._inflight_lock_until[order.symbol] = (
+                    now + self._inflight_lock_ttl_sec
+                )
+
         # Primary: our local paper broker (source of truth for journal,
         # positions, P&L, exits). Must not be bypassed.
         fill = super().submit(
@@ -144,6 +493,10 @@ class MirrorAlpacaBroker(PaperBroker):
         # Mirror: only if paper actually filled (no point mirroring a
         # rejected-order path) AND at least one mirror is configured.
         if fill is not None:
+            # Lock reconcile out of this symbol for cooldown window
+            # so it doesn't read Tradier's stale snapshot and
+            # double-count the just-opened/closed position.
+            self._mark_recently_touched(order.symbol)
             self._tee_to_queue(order, self._mirror_queue, "alpaca") \
                 if self._alpaca is not None else None
             self._tee_to_queue(order, self._tradier_queue, "tradier") \
@@ -423,18 +776,84 @@ class MirrorAlpacaBroker(PaperBroker):
                     self._backlog_alerted = True
 
     def _tradier_worker(self) -> None:
-        """Independent worker for Tradier mirroring. Simpler than the
-        Alpaca worker (no persistent retry file yet — sandbox failures
-        are rare). Logs first-success banner, warns on each failure
-        with rate-limited alerts."""
+        """Independent worker for Tradier mirroring.
+
+        Submit returns `None` on network/HTTP failure or rejection (see
+        TradierBroker.submit). Treat that as a failed submission —
+        re-enqueue with exponential backoff so transient DNS flaps or
+        gateway timeouts don't silently create ghost positions on the
+        local PaperBroker that Tradier never acknowledged. Only log
+        `tradier_mirror_ok` / `tradier_mirror_submitted` when submit
+        actually returns a Fill.
+
+        Max retries cap = 6 (roughly 2 min of backoff). After that, log
+        a fatal mirror_drop so the operator can reconcile manually.
+        """
         import time as _time
+        backoff_schedule = [1.0, 2.0, 5.0, 10.0, 30.0, 60.0]
+        max_retries = len(backoff_schedule)
         while not self._mirror_stop.is_set():
             try:
-                order = self._tradier_queue.get(timeout=0.5)
+                item = self._tradier_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
+            # Items may be either a raw Order (first submit) or a
+            # (Order, retry_count) tuple for requeued orders.
+            if isinstance(item, tuple):
+                order, retry = item
+            else:
+                order, retry = item, 0
+
+            # Circuit-breaker check: is this symbol currently paused?
+            # CRITICAL EXEMPTION: sell-to-close orders are EXITS, not
+            # entries. Blocking them would let positions bleed past the
+            # hard $-cap (today's IWM 271P bug — cap fired but breaker
+            # blocked the close, position bled $324 → $348 → final
+            # close at -$234 only after timeout expired).
+            #
+            # The breaker exists to prevent ENTRY thrash during sandbox
+            # throttling. Exits must always be allowed through.
+            now_ts = _time.time()
+            paused_until = self._symbol_pause_until.get(order.symbol, 0)
+            if now_ts < paused_until:
+                # Check if this is a close order — those bypass.
+                _side_l = (order.side.value or "").lower()
+                _is_close = (
+                    "sell" in _side_l
+                    or "to_close" in _side_l
+                    or getattr(order, "is_close", False)
+                )
+                if _is_close:
+                    _log.info(
+                        "tradier_circuit_bypass_close symbol=%s "
+                        "(close order EXEMPT from circuit pause)",
+                        order.symbol,
+                    )
+                    # Continue to submit — don't skip
+                else:
+                    _log.warning(
+                        "tradier_symbol_circuit_open symbol=%s "
+                        "paused_for=%.0fs_more (entry blocked, "
+                        "closes still allowed)",
+                        order.symbol, paused_until - now_ts,
+                    )
+                    continue
+
+            result = None
+            caught: Optional[Exception] = None
             try:
-                self._tradier.submit(order)
+                result = self._tradier.submit(order)
+            except Exception as e:                      # noqa: BLE001
+                caught = e
+
+            if result is not None and caught is None:
+                # Genuine success — Tradier confirmed terminal status
+                # = filled (with poll). Note the cooldown for closes.
+                side_val = order.side.value
+                is_close = ("sell" in side_val.lower()
+                              or "to_close" in side_val.lower())
+                if is_close:
+                    self._recent_close_ts[order.symbol] = _time.time()
                 if not self._tradier_first_ok_logged:
                     _log.info("tradier_mirror_ok first_post symbol=%s qty=%d",
                               order.symbol, order.qty)
@@ -442,13 +861,146 @@ class MirrorAlpacaBroker(PaperBroker):
                 else:
                     _log.info(
                         "tradier_mirror_submitted symbol=%s qty=%d side=%s",
-                        order.symbol, order.qty, order.side.value,
+                        order.symbol, order.qty, side_val,
                     )
-            except Exception as e:                      # noqa: BLE001
-                _log.warning(
-                    "tradier_mirror_failed symbol=%s err=%s",
-                    order.symbol, e,
+                continue
+
+            # Failure path: either an exception or submit returned None
+            # (rejection / HTTP fail / DNS fail). Both are unsafe to
+            # treat as success.
+            err_desc = str(caught) if caught else "submit_returned_none"
+
+            # ---- IMMEDIATE PHANTOM PRUNE (simplified) ----
+            # If a sell-to-close order fails (Tradier rejected, expired,
+            # or pending-at-timeout), local PaperBroker has a position
+            # Tradier doesn't. PRUNE IMMEDIATELY — no retry, no Discord
+            # notify. The original phantom-detect-by-querying-Tradier
+            # approach was racy (the orders endpoint hadn't yet logged
+            # the new rejection by the time we polled). Simpler logic:
+            # if a close failed, it's a phantom. Risk: rare false-prune
+            # on transient broker error, but drift alarm catches that.
+            try:
+                _side_l = (order.side.value or "").lower()
+                _is_close = (
+                    "sell" in _side_l or "to_close" in _side_l
                 )
+                if _is_close:
+                    with getattr(self, "_lock", _NullLock()):
+                        if order.symbol in self._positions:
+                            del self._positions[order.symbol]
+                            self._recent_close_ts[order.symbol] = (
+                                _time.time()
+                            )
+                            _log.warning(
+                                "tradier_phantom_pruned_immediate "
+                                "symbol=%s side=%s — close failed "
+                                "(rejected/expired/timeout), local "
+                                "pruned without retry/notify",
+                                order.symbol, _side_l,
+                            )
+                            try:
+                                from ..storage.position_snapshot import (
+                                    save_snapshot,
+                                )
+                                from ..core.data_paths import data_path
+                                save_snapshot(
+                                    data_path("logs/broker_state.json"),
+                                    self,
+                                )
+                            except Exception:
+                                pass
+                    # Skip retry — close failed = phantom = done
+                    continue
+            except Exception as _e:                          # noqa: BLE001
+                _log.info("phantom_prune_check_err err=%s",
+                            str(_e)[:120])
+
+            # Circuit-breaker bookkeeping: log the reject, prune older
+            # than 60s, trip if >= 3 within window.
+            try:
+                rejs = self._reject_log.setdefault(order.symbol, [])
+                rejs.append(_time.time())
+                # Prune > 60s
+                cutoff = _time.time() - 60.0
+                rejs[:] = [t for t in rejs if t >= cutoff]
+                if len(rejs) >= 3:
+                    pause_for_sec = 30 * 60   # 30 min
+                    self._symbol_pause_until[order.symbol] = (
+                        _time.time() + pause_for_sec
+                    )
+                    rejs.clear()
+                    _log.warning(
+                        "tradier_circuit_breaker_tripped symbol=%s "
+                        "paused_for=%ds reason=3_rejects_in_60s",
+                        order.symbol, pause_for_sec,
+                    )
+            except Exception:
+                pass
+
+            # PHANTOM-POSITION HEAL: if this was a sell-to-close that
+            # Tradier rejected with "not closing a long position", local
+            # PaperBroker is desynced — has a position Tradier doesn't.
+            # Remove it from local so fast_exit stops firing on a ghost.
+            # Otherwise the close-reject loop runs every tick forever.
+            try:
+                side_l = (order.side.value or "").lower()
+                is_close = ("sell" in side_l or "to_close" in side_l)
+                # Best-effort: query the most recent rejection for this
+                # symbol from Tradier's order log to see the reason.
+                # Cheaper heuristic: any close-reject after retry=2 we
+                # treat as phantom and prune locally. After 2 retries
+                # over backoff (1s + 2s = 3s) Tradier has had time to
+                # settle; persistent reject = phantom local position.
+                if is_close and retry >= 2:
+                    with getattr(self, "_lock", _NullLock()):
+                        if order.symbol in self._positions:
+                            del self._positions[order.symbol]
+                            self._recent_close_ts[order.symbol] = (
+                                _time.time()
+                            )
+                            _log.warning(
+                                "tradier_phantom_position_pruned "
+                                "symbol=%s reason=close_keeps_rejecting "
+                                "(local thought we owned it; Tradier "
+                                "didn't) — removed from local book",
+                                order.symbol,
+                            )
+                            # Persist immediately so a restart sees clean state
+                            try:
+                                from ..storage.position_snapshot import (
+                                    save_snapshot,
+                                )
+                                from ..core.data_paths import data_path
+                                save_snapshot(
+                                    data_path("logs/broker_state.json"),
+                                    self,
+                                )
+                            except Exception:
+                                pass
+                            continue
+            except Exception:
+                pass
+            if retry >= max_retries:
+                _log.warning(
+                    "tradier_mirror_drop symbol=%s qty=%d side=%s "
+                    "retries=%d err=%s RECONCILE_REQUIRED",
+                    order.symbol, order.qty, order.side.value,
+                    retry, err_desc[:160],
+                )
+                continue
+            _log.warning(
+                "tradier_mirror_failed symbol=%s qty=%d side=%s "
+                "retry=%d/%d err=%s",
+                order.symbol, order.qty, order.side.value,
+                retry + 1, max_retries, err_desc[:160],
+            )
+            # Re-queue with backoff. Sleep here blocks this worker
+            # thread only; main bot keeps trading locally.
+            _time.sleep(backoff_schedule[retry])
+            try:
+                self._tradier_queue.put((order, retry + 1))
+            except Exception:
+                pass
 
     # --- persistent retry queue helpers ---
     def _persist_retry(self, order: Order, retry_count: int) -> None:

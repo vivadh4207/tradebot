@@ -67,15 +67,37 @@ def _have_alpaca_creds() -> tuple[str, str]:
 
 
 def _build_data_adapter(settings: Settings) -> MarketDataAdapter:
-    """Use Alpaca if credentials are present, else synthetic fallback."""
+    """Use Alpaca if credentials are present, else synthetic fallback.
+
+    If a Tradier token is also present, wrap the primary adapter with a
+    `RoutedDataAdapter` so cash-settled index symbols (SPX, VIX, NDX,
+    RUT) flow through Tradier (Alpaca doesn't carry indexes), while
+    stocks/ETFs continue to use Alpaca."""
     key, secret = _have_alpaca_creds()
     if key and secret:
         log.info("data_adapter", kind="alpaca")
-        return AlpacaDataAdapter(api_key=key, api_secret=secret,
-                                 fallback=SyntheticDataAdapter())
-    log.info("data_adapter", kind="synthetic",
-             reason="ALPACA_API_KEY_ID/SECRET not set")
-    return SyntheticDataAdapter()
+        primary: MarketDataAdapter = AlpacaDataAdapter(
+            api_key=key, api_secret=secret,
+            fallback=SyntheticDataAdapter(),
+        )
+    else:
+        log.info("data_adapter", kind="synthetic",
+                  reason="ALPACA_API_KEY_ID/SECRET not set")
+        primary = SyntheticDataAdapter()
+
+    # Tradier index router — only enabled if token is present
+    try:
+        if (os.getenv("TRADIER_TOKEN") or "").strip():
+            from .data.tradier_index_bars import (
+                TradierIndexBarsAdapter, RoutedDataAdapter,
+            )
+            idx = TradierIndexBarsAdapter()
+            log.info("data_adapter_index_router",
+                      kind="tradier", indexes="SPX,VIX,NDX,RUT")
+            return RoutedDataAdapter(primary=primary, index_adapter=idx)
+    except Exception as e:                              # noqa: BLE001
+        log.warning("data_adapter_index_router_skipped", err=str(e)[:120])
+    return primary
 
 
 # ETF universe classification. Used by f09_volume_confirmation to pick the
@@ -944,6 +966,56 @@ class TradeBot:
                 mark = c.bid if p.qty > 0 else c.ask
                 if mark and mark > 0:
                     marks[p.symbol] = float(mark)
+
+        # ---- Tradier-quote fallback for any positions still unpriced ----
+        # CRITICAL today: 0DTE option OCC symbols (e.g. TSLA260427C00380000)
+        # are rejected by Alpaca's data feed as "invalid symbol", so the
+        # chain lookup above silently skips them. Without a mark,
+        # fast_exit can't compute pnl → never fires SL → position bleeds
+        # invisibly. Tradier's /v1/markets/quotes accepts OCC symbols
+        # directly and HAS 0DTE data. Use it as a last-resort price
+        # source for any option position we couldn't price above.
+        unpriced = [p for p in positions
+                     if p.is_option and p.symbol not in marks]
+        if unpriced:
+            try:
+                tb = getattr(self.broker, "_tradier", None)
+                if tb is not None and hasattr(tb, "_get"):
+                    syms = ",".join(p.symbol for p in unpriced[:20])
+                    data = tb._get(
+                        "/v1/markets/quotes", {"symbols": syms}
+                    ) or {}
+                    rows = (data.get("quotes") or {}).get("quote") or []
+                    if isinstance(rows, dict):
+                        rows = [rows]
+                    by_sym = {}
+                    for r in rows:
+                        s = r.get("symbol", "")
+                        if s:
+                            by_sym[s] = r
+                    for p in unpriced:
+                        r = by_sym.get(p.symbol)
+                        if not r:
+                            continue
+                        bid = float(r.get("bid") or 0)
+                        ask = float(r.get("ask") or 0)
+                        last = float(r.get("last") or 0)
+                        # Long position closes at bid; if bid<=0 fall
+                        # back to last, then to ask (worst case).
+                        if p.qty > 0:
+                            mark = bid if bid > 0 else (last or ask)
+                        else:
+                            mark = ask if ask > 0 else (last or bid)
+                        if mark and mark > 0:
+                            marks[p.symbol] = float(mark)
+                            log.info(
+                                "mark_tradier_fallback",
+                                symbol=p.symbol,
+                                mark=round(mark, 4),
+                            )
+            except Exception as e:                          # noqa: BLE001
+                log.warning("mark_tradier_fallback_err",
+                              err=str(e)[:120])
         return marks
 
     def _process_manual_close_intents(self, open_pos) -> None:
@@ -1045,18 +1117,68 @@ class TradeBot:
         base = set(self.s.universe)
 
         syms: List[str] = []
+
+        # Pre-market picks from scripts/run_morning_scan.py have
+        # priority — the morning scanner runs at 08:30 ET (before
+        # open) and writes its top symbols here. The bot reads them
+        # immediately so the day's hot names are tradable from
+        # 09:30 ET, not after the in-bot 30-min news rescan.
         try:
-            # News-mentions via MultiProvider
-            items = self.mp.news(None, limit=80) or []
+            import json as _json
+            from pathlib import Path as _P
+            picks_path = _P(__file__).resolve().parents[1] / "logs" / "morning_picks.json"
+            if picks_path.exists():
+                stat = picks_path.stat()
+                age_h = (now - stat.st_mtime) / 3600.0
+                if age_h <= 24.0:                  # only use today's picks
+                    payload = _json.loads(picks_path.read_text())
+                    picks = payload.get("symbols") or []
+                    for sym in picks:
+                        sym = str(sym).upper().strip()
+                        if not sym or sym in base or sym in exclude:
+                            continue
+                        if not _re.match(r"^[A-Z]{1,5}$", sym):
+                            continue
+                        if sym not in syms:
+                            syms.append(sym)
+                        if len(syms) >= max_dyn:
+                            break
+                    if syms:
+                        log.info(
+                            "morning_picks_loaded",
+                            n=len(syms), session=payload.get("session", ""),
+                            age_hours=round(age_h, 1),
+                            symbols=syms,
+                        )
+        except Exception as e:                              # noqa: BLE001
+            log.info("morning_picks_load_err", err=str(e)[:120])
+
+        try:
+            # Aggregate news-mentions by pulling headlines for each base
+            # universe ticker via the configured NewsProvider (Alpaca
+            # when creds exist, Static otherwise). No fantasy attrs —
+            # NewsItem is (symbol, headline, source, published_at, url).
+            news_wrap = getattr(self, "news", None)
+            provider = getattr(news_wrap, "_provider", None) if news_wrap else None
+            if provider is None:
+                # Nothing to scan; skip silently.
+                self._dyn_universe_cache = (now, syms)
+                return syms
+
             from .intelligence.symbol_scanner import _extract_tickers_from_text
             from collections import Counter as _C
             counter: _C = _C()
-            for item in items:
-                txt = f"{item.headline} {item.summary}"
-                for sym in _extract_tickers_from_text(txt):
-                    counter[sym] += 1
-                for t in (item.tickers or []):
-                    counter[t.upper()] += 2       # provider-native weight
+            seed = list(base)[:16]          # cap to avoid API spam
+            for seed_sym in seed:
+                try:
+                    items = provider.fetch(seed_sym) or []
+                except Exception:
+                    items = []
+                for item in items:
+                    for sym in _extract_tickers_from_text(
+                        getattr(item, "headline", "") or ""
+                    ):
+                        counter[sym] += 1
             # Pick top candidates not already in base/exclude
             for sym, n in counter.most_common(40):
                 if n < min_mentions:
@@ -1303,14 +1425,24 @@ class TradeBot:
         # QQQ 654 call to sit unexited for 24 min (bot process alive,
         # fast_loop thread wedged or blocked on a network call).
         import time as _t
-        _hb_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "logs", "fast_loop_heartbeat.txt",
-        )
+        _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _hb_path = os.path.join(_repo_root, "logs", "fast_loop_heartbeat.txt")
+        # Also touch the main watchdog heartbeat (logs/heartbeat.txt)
+        # from this 5s thread so a slow main_loop tick (LLM call, broker
+        # hang) doesn't trip the 300s stale-heartbeat SIGTERM. If the
+        # fast_loop itself wedges, heartbeat still goes stale and the
+        # watchdog correctly kills us.
+        _watchdog_hb_path = os.path.join(_repo_root, "logs", "heartbeat.txt")
         def _write_heartbeat():
             try:
                 with open(_hb_path, "w") as f:
                     f.write(str(_t.time()))
+            except Exception:
+                pass
+            try:
+                from datetime import datetime as _dt, timezone as _tz
+                with open(_watchdog_hb_path, "w", encoding="utf-8") as f:
+                    f.write(_dt.now(tz=_tz.utc).isoformat())
             except Exception:
                 pass
         while not self._stop.is_set():
@@ -2071,7 +2203,235 @@ class TradeBot:
                                 if c.direction == decision.dominant_direction])
         self._try_enter(decision.signal, bars, or_hi, or_lo, spot, vwap)
 
+    def _daily_pnl_lock_state(self) -> Dict[str, Any]:
+        """Daily P&L circuit breakers (day trader's recommendation).
+        Returns {'allow_entries': bool, 'size_mult': float, 'reason': str}.
+
+        Defaults: at +$500 day_pnl, scale future size 50%; at +$1000
+        or -$1500, halt new entries entirely. Tunable via overrides.
+        """
+        try:
+            day_pnl = float(self.broker.account().day_pnl or 0)
+        except Exception:
+            return {"allow_entries": True, "size_mult": 1.0,
+                     "reason": "pnl_unknown"}
+        try:
+            from .core.runtime_overrides import get_override
+            scale_at = float(get_override("daily_pnl_scale_at_usd", 500.0))
+            stop_win = float(get_override("daily_pnl_stop_win_usd", 1000.0))
+            stop_loss = float(get_override("daily_pnl_stop_loss_usd", -1500.0))
+            scale_mult = float(get_override("daily_pnl_scale_mult", 0.50))
+        except Exception:
+            scale_at, stop_win, stop_loss, scale_mult = (
+                500.0, 1000.0, -1500.0, 0.50
+            )
+        if day_pnl >= stop_win:
+            return {"allow_entries": False, "size_mult": 0.0,
+                     "reason": f"daily_profit_lock_${day_pnl:+.0f}_>=_${stop_win:.0f}"}
+        if day_pnl <= stop_loss:
+            return {"allow_entries": False, "size_mult": 0.0,
+                     "reason": f"daily_loss_stop_${day_pnl:+.0f}_<=_${stop_loss:.0f}"}
+        if day_pnl >= scale_at:
+            return {"allow_entries": True, "size_mult": scale_mult,
+                     "reason": f"day_pnl_${day_pnl:+.0f}_size_x{scale_mult:.1f}"}
+        return {"allow_entries": True, "size_mult": 1.0,
+                 "reason": f"day_pnl_${day_pnl:+.0f}_normal_size"}
+
+    def _check_daily_budget(self, projected_cost_usd: float) -> bool:
+        """True if the projected entry fits within today's daily-buy
+        budget. False blocks the entry. Operator: real-world T+1
+        settlement means cash from closed trades ISN'T redeployable
+        same-day — so the bot must respect a hard cumulative-buy cap
+        per day, regardless of how much cash recycled through trades.
+
+        Default budget: \$5,000/day. Override via runtime key
+        `daily_buy_budget_usd`.
+        """
+        from datetime import date as _d
+        today = _d.today().isoformat()
+        # In-memory tracker, reset on date change.
+        st = getattr(self, "_daily_budget_state", None)
+        if st is None or st.get("date") != today:
+            st = {"date": today, "deployed_usd": 0.0}
+            self._daily_budget_state = st
+        try:
+            from .core.runtime_overrides import get_override
+            budget = float(get_override("daily_buy_budget_usd", 5000.0))
+        except Exception:
+            budget = 5000.0
+        used = float(st.get("deployed_usd", 0.0))
+        remaining = budget - used
+        if projected_cost_usd > remaining:
+            log.info(
+                "entry_skip_daily_budget",
+                projected_usd=round(projected_cost_usd, 2),
+                used_usd=round(used, 2),
+                budget_usd=round(budget, 2),
+                remaining_usd=round(remaining, 2),
+            )
+            return False
+        # Pre-commit the budget. If the order fails downstream, we'll
+        # not roll it back; the budget is conservative — better to
+        # under-deploy by a rejection than re-fire and exceed.
+        st["deployed_usd"] = used + projected_cost_usd
+        return True
+
     def _try_enter(self, sig: Signal, bars, or_hi, or_lo, spot, vwap) -> None:
+        # ----- intraday-regime gate -----
+        # CRASH detection: SPY drops sharply → bias bearish entries,
+        # override session floors, scale size up on bearish puts.
+        # CHOP detection: SPY range too tight → halve size or skip.
+        # See src/intelligence/intraday_regime.py for thresholds.
+        try:
+            from .intelligence.intraday_regime import (
+                evaluate_intraday_state,
+            )
+            from .core.runtime_overrides import get_override
+            spy_bars = self.data.get_bars("SPY", limit=60)
+            ir_state = evaluate_intraday_state(
+                spy_bars,
+                crash_5m_pct=float(get_override(
+                    "crash_5m_pct", -0.008,
+                )),
+                crash_30m_pct=float(get_override(
+                    "crash_30m_pct", -0.020,
+                )),
+                rush_5m_pct=float(get_override(
+                    "rush_5m_pct", 0.008,
+                )),
+                rush_30m_pct=float(get_override(
+                    "rush_30m_pct", 0.020,
+                )),
+                chop_60m_range_pct=float(get_override(
+                    "chop_60m_range_pct", 0.003,
+                )),
+            )
+            self._intraday_state = ir_state
+
+            # Skip CHOP entries unless the signal is exceptional
+            if ir_state.label == "chop":
+                # only let A+ (score >= 2.5, 4+ contributors) through
+                meta = sig.meta or {}
+                n_contrib = int(meta.get("n_contributors", 1))
+                score = float(sig.confidence or 0.0)
+                if not (score >= 2.5 and n_contrib >= 4):
+                    log.info(
+                        "entry_skip_chop",
+                        symbol=sig.symbol,
+                        regime_state=ir_state.label,
+                        spy_60m_range_pct=round(
+                            ir_state.realized_range_60m, 4
+                        ),
+                        reason=ir_state.reason,
+                    )
+                    return
+
+            # Crash bias: skip BULLISH entries during crash
+            sig_dir = ((sig.meta or {}).get("direction") or "").lower()
+            if ir_state.bearish_bias and sig_dir == "bullish":
+                log.info(
+                    "entry_skip_crash_bias",
+                    symbol=sig.symbol,
+                    direction=sig_dir,
+                    regime_state="crash",
+                    reason=("market crashing — only bearish entries "
+                             "during crash regime"),
+                )
+                return
+            if ir_state.bullish_bias and sig_dir == "bearish":
+                log.info(
+                    "entry_skip_rush_bias",
+                    symbol=sig.symbol, direction=sig_dir,
+                    regime_state="rush",
+                    reason="market rushing up — only bullish entries",
+                )
+                return
+
+            # Stash size mult for downstream qty_policy.
+            self._intraday_size_mult = float(ir_state.size_mult_bias)
+            self._intraday_override_floors = bool(ir_state.override_floors)
+        except Exception as _e:                              # noqa: BLE001
+            log.info("intraday_regime_err", err=str(_e)[:120])
+            self._intraday_size_mult = 1.0
+            self._intraday_override_floors = False
+
+        # ----- daily P&L lock (day-trader discipline) -----
+        # Halt entries at +$1000 (lock the day) or -$1500 (stop bleeding).
+        # Scale size 50% past +$500 to protect existing gains.
+        _pnl_state = self._daily_pnl_lock_state()
+        if not _pnl_state["allow_entries"]:
+            log.info(
+                "entry_skip_daily_pnl_lock",
+                reason=_pnl_state["reason"], symbol=sig.symbol,
+            )
+            return
+        # Stash size-mult for downstream qty_policy to use
+        try:
+            self._daily_size_mult = float(_pnl_state.get("size_mult", 1.0))
+        except Exception:
+            self._daily_size_mult = 1.0
+
+        # ----- per-underlying-direction dedup -----
+        # Operator: "MSFT 425C qty=9 -22% was the biggest loss — bot
+        # kept stacking the same contract every time the signal
+        # re-fired." Fix: if we already hold ANY long position on the
+        # same underlying in the same direction (bullish-call /
+        # bearish-put), skip the new entry. Prevents both same-contract
+        # stacking AND multi-expiry stacking on the same name.
+        try:
+            from .core.types import OptionRight as _OR
+            meta_dir = (sig.meta.get("direction")
+                          if isinstance(sig.meta, dict) else None) or ""
+            new_dir = "bullish" if meta_dir.lower() == "bullish" else "bearish"
+            for p in self.broker.positions():
+                if not p.is_option:
+                    continue
+                if (p.underlying or "") != sig.symbol:
+                    continue
+                if p.right is None:
+                    continue
+                pos_dir = ("bullish" if p.right == _OR.CALL
+                            else "bearish")
+                if pos_dir == new_dir and p.qty > 0:
+                    log.info(
+                        "entry_skip_already_holding",
+                        symbol=sig.symbol, direction=new_dir,
+                        existing=p.symbol, existing_qty=int(p.qty),
+                    )
+                    return
+        except Exception as _e:
+            log.warning("dedup_check_err", err=str(_e)[:120])
+
+        # ----- per-runtime cap on concurrent positions per underlying
+        # (e.g. multiple bearish puts at different strikes/expiries).
+        # Default: same direction = 1 per underlying (the dedup above
+        # already covers it). This is for OPPOSITE-direction or same-
+        # direction-different-expiry hedge plays — capped at 2 per
+        # name max so we can't accumulate more than today's ORCL pile.
+        try:
+            n_same_under = sum(
+                1 for p in self.broker.positions()
+                if p.is_option and (p.underlying or "") == sig.symbol
+                and p.qty > 0
+            )
+            cap_per_under = 2
+            try:
+                from .core.runtime_overrides import get_override
+                cap_per_under = int(get_override(
+                    "max_open_positions_per_underlying", cap_per_under
+                ))
+            except Exception:
+                pass
+            if n_same_under >= cap_per_under:
+                log.info(
+                    "entry_skip_per_underlying_cap",
+                    symbol=sig.symbol,
+                    n_open=n_same_under, cap=cap_per_under,
+                )
+                return
+        except Exception:
+            pass
+
         acct = self.broker.account()
         news_score, news_label, news_rationale = 0.0, "neutral", ""
         if self.news is not None:
@@ -2204,7 +2564,17 @@ class TradeBot:
         # premium movement) — bias heavily toward swing. 0DTE in chop
         # = theta graveyard. Operator feedback: "adjust for
         # range_lowvol regime."
-        _regime_name = str(regime.value if regime else "").lower()
+        # Pull regime from the signal meta (set by the ensemble emit).
+        # Using a stand-alone name avoids UnboundLocalError from the
+        # `regime = sig.meta.get("regime")` assignment further down,
+        # which would otherwise make `regime` a local read here.
+        _regime_name = ""
+        try:
+            _rmeta = sig.meta.get("regime") if isinstance(sig.meta, dict) else None
+            if _rmeta is not None:
+                _regime_name = str(getattr(_rmeta, "value", _rmeta)).lower()
+        except Exception:
+            _regime_name = ""
         if _regime_name == "range_lowvol":
             if "0dte" in buckets_cfg:  buckets_cfg["0dte"]["weight"] = 5
             if "short" in buckets_cfg: buckets_cfg["short"]["weight"] = 20
@@ -2412,6 +2782,66 @@ class TradeBot:
             n = default_qty
             qty_reason = (f"default_1: delta={delta_val:.2f} "
                            f"move={move_pct:+.2%} vol={vol_ratio:.1f}x")
+
+        # ---- Conviction-based size scaling ----
+        # Operator: "put bigger size on better setups, not same small
+        # bet on noise." Today's META 4-contributor 2.58 had qty=3
+        # (~$700 entry). With qty=6 it would have been ~$1,400 entry
+        # and +$642 win instead of +$321. Apply a multiplier based on
+        # ensemble score + contributor count so high-conviction
+        # setups get sized up automatically. Tunable via overrides.
+        try:
+            from .core.runtime_overrides import get_override
+            sig_score = float(sig.confidence or 0.0)
+            n_contrib = int(
+                (sig.meta or {}).get("n_contributors", 1)
+                if isinstance(sig.meta, dict) else 1
+            )
+            # Contributor count is the key signal of "multiple
+            # strategies agree" — heaviest weight.
+            mult = 1.0
+            if n_contrib >= 4 and sig_score >= 2.5:
+                mult = float(get_override("conviction_mult_aplus", 2.0))
+                tier = "A+"
+            elif n_contrib >= 3 and sig_score >= 2.0:
+                mult = float(get_override("conviction_mult_a", 1.5))
+                tier = "A"
+            elif n_contrib >= 2 and sig_score >= 1.5:
+                mult = float(get_override("conviction_mult_b", 1.0))
+                tier = "B"
+            else:
+                mult = float(get_override("conviction_mult_c", 0.7))
+                tier = "C"
+            n_pre = n
+            n = max(1, int(round(n * mult)))
+            qty_reason += (
+                f" | conviction={tier}_({n_contrib}c/{sig_score:.2f}s)"
+                f"_x{mult:.1f}_{n_pre}->{n}"
+            )
+        except Exception:
+            pass
+
+        # Apply daily P&L size-mult (banked-day protection).
+        # Scales DOWN existing qty when the day is already won.
+        try:
+            day_mult = float(getattr(self, "_daily_size_mult", 1.0))
+            if abs(day_mult - 1.0) > 0.01:
+                n_pre = n
+                n = max(1, int(round(n * day_mult)))
+                qty_reason += f" | daily_pnl_x{day_mult:.2f}_{n_pre}->{n}"
+        except Exception:
+            pass
+
+        # Apply intraday-regime size mult (crash boost / chop reduce).
+        try:
+            ir_mult = float(getattr(self, "_intraday_size_mult", 1.0))
+            if abs(ir_mult - 1.0) > 0.01:
+                n_pre = n
+                n = max(1, int(round(n * ir_mult)))
+                qty_reason += f" | intraday_x{ir_mult:.2f}_{n_pre}->{n}"
+        except Exception:
+            pass
+
         log.info("qty_policy", symbol=sig.symbol, qty=n, reason=qty_reason)
 
         if n <= 0:
@@ -2507,8 +2937,22 @@ class TradeBot:
         entry_px = limit  # the order's limit; fill may differ slightly
         auto_pt = round(entry_px * (1 + pt_pct), 4)
         auto_sl = round(max(0.01, entry_px * (1 - sl_pct)), 4)
+
+        # ---- Daily-buy budget check (T+1 settlement awareness) ----
+        # Operator: "real-world trades don't settle same day — we need
+        # \$5K start each day on balance and bot should respect it."
+        # Block this entry if it would exceed today's cumulative buy
+        # budget regardless of how much cash recycled through trades.
+        order_to_submit = v.adjusted_order or order
+        projected_cost = (
+            float(order_to_submit.qty) * float(entry_px)
+            * (100 if order_to_submit.is_option else 1)
+        )
+        if not self._check_daily_budget(projected_cost):
+            return  # entry skipped, log already emitted
+
         fill = self.broker.submit(
-            v.adjusted_order or order,
+            order_to_submit,
             contract=contract,
             auto_profit_target=auto_pt,
             auto_stop_loss=auto_sl,

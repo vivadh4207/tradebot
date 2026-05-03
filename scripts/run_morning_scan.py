@@ -430,6 +430,32 @@ def main() -> int:
             title=_SESSION_TITLE.get(session, "llm_ideas"),
             meta=meta,
         )
+
+    # Persist top picks to JSON so the live bot reads them BEFORE the
+    # 09:30 ET open and adds them to the day's tradable universe — no
+    # waiting for the 30-min in-bot news rescan that wouldn't fire
+    # until ~10:00 ET. main.py._dynamic_symbols() merges this file
+    # into base_universe with priority.
+    try:
+        picks_path = ROOT / "logs" / "morning_picks.json"
+        picks_path.parent.mkdir(parents=True, exist_ok=True)
+        top_n = int(args.limit)
+        picks_payload = {
+            "saved_at": datetime.now(tz=timezone.utc).isoformat(),
+            "session": session,
+            "symbols": [r.symbol for r in results[:top_n]],
+            "scores":  {r.symbol: round(r.composite_score, 3)
+                        for r in results[:top_n]},
+            "rationale": {
+                r.symbol: getattr(r, "rationale", "")[:200]
+                for r in results[:top_n]
+            },
+        }
+        picks_path.write_text(json.dumps(picks_payload, indent=2,
+                                            default=str))
+        print(f"[scan] wrote {top_n} picks to {picks_path}")
+    except Exception as e:                                  # noqa: BLE001
+        print(f"[!] picks_write_failed: {e}")
     return 0
 
 

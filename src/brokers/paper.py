@@ -111,9 +111,19 @@ class PaperBroker(BrokerAdapter):
     def cancel_all(self) -> None:
         return
 
-    def flatten_all(self, mark_prices: Optional[Dict[str, float]] = None) -> None:
+    def flatten_all(self, mark_prices: Optional[Dict[str, float]] = None,
+                     *, tag: str = "eod_force_close") -> None:
         """Close every open position. Uses `mark_prices[symbol]` if provided,
         else falls back to avg_price (zero-slippage close).
+
+        The `tag` parameter lets callers distinguish WHY they flattened:
+          - 'eod_force_close' (default) — end-of-session flatten
+          - 'shutdown_flatten' — process restart/SIGTERM
+          - 'halt_flatten' — emergency kill switch
+          - 'manual_flatten' — operator explicit action
+        Without this, every caller produced misleading 'eod_force_close'
+        journal entries (happens to look like EOD but is actually a
+        restart, confusing post-hoc analysis).
 
         Thread-safe: snapshots positions atomically, then submits sequentially.
         """
@@ -126,7 +136,7 @@ class PaperBroker(BrokerAdapter):
             closing = Order(
                 symbol=sym, side=side, qty=abs(pos.qty),
                 is_option=pos.is_option,
-                limit_price=px, tif="IOC", tag="eod_force_close",
+                limit_price=px, tif="IOC", tag=tag,
             )
             self.submit(closing)
 

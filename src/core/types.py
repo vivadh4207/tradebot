@@ -227,6 +227,11 @@ class Position:
     tier1_taken: bool = False
     tier2_taken: bool = False
     tier3_taken: bool = False
+    # Timestamp of the last time peak_pnl_pct made a new high. Used
+    # by fade-aware scale-out — only fires if stalled at a profit
+    # level for >N seconds. Strong runners that keep advancing skip
+    # the tiers and capture full PT.
+    last_peak_ts: Optional[float] = None
 
     @property
     def is_long(self) -> bool:

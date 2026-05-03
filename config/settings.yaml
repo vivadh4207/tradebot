@@ -53,10 +53,13 @@ universe:
   #   - Finnhub + Tradier data coverage
   # If any turns into a data / spread problem it gets blocked by the
   # filter chain automatically — no need to prune here.
+  - SPX       # S&P 500 cash index — bigger moves, theta-efficient.
+              # Routes through Tradier (Alpaca doesn't carry it).
   - SPY       # S&P 500 ETF — deepest liquidity
   - QQQ       # Nasdaq 100 ETF
   - IWM       # Russell 2000
-  - DIA       # Dow Jones
+  # DIA removed 2026-04-24 — SPY+QQQ+IWM cover Dow exposure;
+  # DIA was duplicative without adding signal quality.
   - AAPL
   - MSFT
   - NVDA
@@ -69,6 +72,19 @@ universe:
   - TSM
   - NFLX
   - ORCL
+  - HOOD       # Robinhood — added 2026-04-27 per operator request
+
+# Monitor-only universe — used by the intraday Discord recap to publish
+# market-context updates every 20 min. NOT traded by the bot until the
+# data adapter has a quote/bar feed for the symbol. SPX is the
+# cash-settled S&P 500 INDEX (not the SPY ETF) — Alpaca bars don't
+# carry it; Tradier has it via /v1/markets/quotes.
+monitor_universe:
+  - SPX        # S&P 500 index (cash-settled)
+  - SPY        # SPDR S&P 500 ETF (1:10 of SPX)
+  - QQQ        # Invesco Nasdaq 100 ETF
+  - IWM        # iShares Russell 2000 ETF
+  - DIA        # SPDR Dow Jones ETF
 
 # Dynamic universe expansion (scanner-driven)
 dynamic_universe:
@@ -88,6 +104,10 @@ dynamic_universe:
     - UVXY
     - VIXY
     - SVXY
+    - WMT          # operator-excluded 2026-04-24
+    # Add more tickers here to block them from auto-discovery.
+    # The bot WILL skip even if news mentions surge or dynamic
+    # scanner picks them up.
 
 
 # ===== Session (US Eastern) =====
@@ -141,7 +161,12 @@ execution:
   min_volume_confirmation_etf: 0.25   # SPY, QQQ, IWM, XLF, etc. — loosened
                                         # after operator noted 0.55 still blocked
                                         # trades during active-but-thin sessions
-  min_volume_confirmation_stock: 1.20 # individual stocks
+  min_volume_confirmation_stock: 1.00 # individual stocks — dropped from
+                                      # 1.20 on 2026-04-24 after that
+                                      # threshold blocked 49 of 51 signals
+                                      # on a range-lowvol day. At 1.00 the
+                                      # bar just needs to be >= average;
+                                      # real momentum still stands out.
   # Spread gates. Operator: bid/ask-cross on wide-spread contracts is
   # a tax we can't afford. If the spread is >3% of mid on an ETF
   # option, skip — there are always cheaper strikes elsewhere.
@@ -150,10 +175,20 @@ execution:
   min_open_interest:    50
   min_today_option_volume: 100
   max_0dte_per_day: 20
-  # Hard per-contract premium cap. Cheap contracts let us diversify
-  # within the same $-risk budget. $3.00 × 100 × 5 qty = $1,500 max
-  # exposure per entry — below 1% of a $100k account.
-  max_premium_per_contract_usd: 3.00
+  # Hard per-contract premium cap. ETFs need a much higher cap because
+  # their ATM contracts inherently cost more (QQQ ATM 7DTE = $5-20)
+  # while their moves are reliable and spreads tight. The original $3
+  # cap forced the contract-picker into far-OTM strikes that needed
+  # massive moves to pay off — on 2026-04-24 it blocked QQQ 2.39 ($16),
+  # SPY 2.26 ($9.95), IWM 1.07 ($6.51), DIA 0.7 ($6.80) bullish
+  # signals on a day QQQ calls went +100%.
+  #
+  # Split: ETFs get a generous cap (covers ATM+slight-ITM); stocks
+  # keep a tighter cap because individual-name premium reflects tail
+  # risk we don't want full-size exposure to.
+  max_premium_per_contract_usd:        8.00   # legacy single-value fallback
+  max_premium_per_contract_usd_etf:   25.00   # SPY/QQQ/IWM/DIA + sector ETFs
+  max_premium_per_contract_usd_stock:  8.00   # individual stocks
   order_ttl_seconds: 5
   # DTE strategy. Fixed (target_dte) OR diversified (target_dte_pool).
   # If target_dte_pool is a non-empty list, each entry randomly picks

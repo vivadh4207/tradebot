@@ -87,6 +87,15 @@ CHANNEL_IDS: Set[int] = (
     | _parse_id_set(os.getenv("DISCORD_TERMINAL_CHANNEL_ID") or "")
 )
 
+# Channels in this set still get message processing (LLM Q&A, !commands)
+# but never receive the on_ready hello banner / button panels. Use for
+# news / alerts channels that should stay clean. Configurable via env
+# OR hardcoded fallback for known IDs the operator wants silent.
+NO_BANNER_CHANNEL_IDS: Set[int] = (
+    _parse_id_set(os.getenv("DISCORD_NO_BANNER_CHANNEL_IDS") or "")
+    | {1495672180023885895}     # news-bot channel
+)
+
 # Channels whose free-form chat should use the 70B model for detailed
 # answers instead of the 8B default. These must ALSO be in CHANNEL_IDS.
 CHAT_70B_CHANNEL_IDS: Set[int] = _parse_id_set(
@@ -2051,6 +2060,28 @@ def _build_app():
                 # name. Fall through to a minimal hello for unknown
                 # channels.
                 posted = False
+
+                # No-banner channels: silent on startup. LLM Q&A still
+                # works because the on_message handler checks
+                # CHANNEL_IDS only — we just don't post a hello banner
+                # or buttons here. Three ways to mark silent:
+                # (a) channel name contains any of: news, alerts,
+                #     market, recap, scan, headline, fills, trades,
+                # (b) channel ID is in NO_BANNER_CHANNEL_IDS,
+                # (c) DISCORD_QUIET_STARTUP=1 — silent on every channel
+                #     EXCEPT control-panel admin channels.
+                quiet_keywords = ("news", "alert", "market", "recap",
+                                    "scan", "headline", "fills", "trades")
+                quiet_global = (os.getenv("DISCORD_QUIET_STARTUP", "")
+                                  .strip() in ("1", "true", "yes"))
+                is_admin = any(k in name for k in (
+                    "control-panel", "sagarbot", "dashboard-control",
+                ))
+                if (cid in NO_BANNER_CHANNEL_IDS
+                        or any(k in name for k in quiet_keywords)
+                        or (quiet_global and not is_admin)):
+                    sent_any = True
+                    continue
 
                 # Control / admin channels get the button panels.
                 if any(k in name for k in ("control-panel", "sagarbot",

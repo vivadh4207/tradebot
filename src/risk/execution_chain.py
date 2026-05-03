@@ -184,24 +184,56 @@ class ExecutionChain:
                    else self._s["execution"]["max_spread_pct_stock"])
         if c.spread_pct > cap:
             return FilterResult(False, f"spread_too_wide: {c.spread_pct:.3f}>{cap}")
-        # Expensive-contract gate. Operator: "options bought are very
-        # expensive, hard to make big money when entry is higher".
-        # A $6 contract needs +50% just to hit PT; a $2 contract hits
-        # the same $ profit at +150% and lets us diversify. Skip
-        # contracts where the ask exceeds max_premium_per_contract_usd.
+        # Expensive-contract gate. ETFs and stocks have separate caps:
+        # ETF ATM contracts (QQQ ATM 7DTE = $5-20) need a generous
+        # ceiling or the picker is forced into far-OTM strikes that
+        # don't pay even on big moves. Stocks keep a tighter cap.
+        # Legacy `max_premium_per_contract_usd` is a shared fallback.
+        ex = self._s["execution"]
+        legacy = float(ex.get("max_premium_per_contract_usd", 0.0) or 0.0)
+        if ctx.is_etf:
+            cap_key = "max_premium_per_contract_usd_etf"
+            default_cap = 25.00
+        else:
+            cap_key = "max_premium_per_contract_usd_stock"
+            default_cap = legacy if legacy > 0 else 8.00
         try:
             from ..core.runtime_overrides import get_override
             max_prem = float(get_override(
-                "max_premium_per_contract_usd",
-                self._s["execution"].get("max_premium_per_contract_usd", 0.0),
+                cap_key, ex.get(cap_key, default_cap)
             ) or 0.0)
         except Exception:
-            max_prem = float(self._s["execution"].get(
-                "max_premium_per_contract_usd", 0.0) or 0.0)
+            max_prem = float(ex.get(cap_key, default_cap) or 0.0)
+        # ---- VIX-aware cap scaling ----
+        # On volatile mornings option premium spikes — a $3 cap blocks
+        # every reasonable strike when VIX is 25+. Scale the cap with
+        # VIX so the bot can capture volatile-session edge.
+        try:
+            vix = float(getattr(ctx, "vix", None) or 0.0)
+            if vix >= 30:
+                vix_mult = 2.5
+            elif vix >= 25:
+                vix_mult = 2.0
+            elif vix >= 20:
+                vix_mult = 1.5
+            else:
+                vix_mult = 1.0
+            try:
+                from ..core.runtime_overrides import get_override
+                vix_mult_override = get_override("vix_premium_cap_mult", None)
+                if vix_mult_override is not None:
+                    vix_mult = float(vix_mult_override)
+            except Exception:
+                pass
+            if vix_mult > 1.0:
+                max_prem = max_prem * vix_mult
+        except Exception:
+            pass
         if max_prem > 0 and (c.ask or 0) > max_prem:
+            kind = "etf" if ctx.is_etf else "stock"
             return FilterResult(
                 False,
-                f"premium_too_high: ${c.ask:.2f}>${max_prem:.2f}_cap"
+                f"premium_too_high[{kind}]: ${c.ask:.2f}>${max_prem:.2f}_cap"
                 " (pick cheaper strike)",
             )
         return FilterResult(True, "ok")
@@ -516,13 +548,17 @@ class ExecutionChain:
             self.f19_price_action_liveness,
         ]
         results: List[FilterResult] = []
+        sym = getattr(ctx.signal, "symbol", "?")
+        src = getattr(ctx.signal, "source", "?")
         for f in filters:
             r = f(ctx)
             results.append(r)
             if not r.passed and not r.advisory:
-                log.info("exec_chain_block", filter=f.__name__, reason=r.reason)
+                log.info("exec_chain_block",
+                          filter=f.__name__, reason=r.reason,
+                          symbol=sym, signal=src)
                 return results
-        log.info("exec_chain_pass", signal=ctx.signal.source)
+        log.info("exec_chain_pass", signal=src, symbol=sym)
         return results
 
     @staticmethod

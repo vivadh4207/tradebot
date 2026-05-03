@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  20-minute intraday market recap. Posts branded embed to
+  DISCORD_WEBHOOK_URL_NEWS during market hours (skips overnight).
+
+  Install:  scripts/tradebotctl.sh recap-install
+  Status:   launchctl list | grep tradebot.intraday_recap
+  Logs:     logs/recap.out / .err
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.tradebot.intraday_recap</string>
+
+  <key>WorkingDirectory</key>
+  <string>__TRADEBOT_ROOT__</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__TRADEBOT_PY__</string>
+    <string>__TRADEBOT_ROOT__/scripts/intraday_recap.py</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    <key>TZ</key>
+    <string>America/New_York</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>StandardOutPath</key>
+  <string>__TRADEBOT_ROOT__/logs/recap.out</string>
+  <key>StandardErrorPath</key>
+  <string>__TRADEBOT_ROOT__/logs/recap.err</string>
+</dict>
+</plist>

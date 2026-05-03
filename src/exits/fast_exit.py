@@ -18,8 +18,8 @@ from ..core.types import Position, ExitDecision, OptionRight
 class FastExitConfig:
     pt_short_pct: float = 0.35
     pt_multi_pct: float = 0.50
-    sl_short_pct: float = 0.20
-    sl_multi_pct: float = 0.30
+    sl_short_pct: float = 0.15      # was 0.20 — tightened 2026-04-27
+    sl_multi_pct: float = 0.20      # was 0.30 — tightened 2026-04-27
     # Entry grace — no fade/SL exits inside this window. Only a PANIC
     # floor at -30% (catastrophic) fires in grace. Prevents bid/ask
     # spread-wash on fresh entries from triggering instant exits.
@@ -148,39 +148,38 @@ class FastExitConfig:
     zdte_snap_close_pct: float = 0.25     # full at +25%
     zdte_snap_absolute_cap_pct: float = 0.40  # mandatory at +40%
 
-    # ---- TIERED PROFIT SCALE-OUT + RUNNER (safety-net + upside) ----
-    # Operator: "we need safety net to have money come in and not lose"
-    # AND "what if it rides more than 18% how do we plan on taking care
-    # of that?" Answer: scale out progressively to secure cash, then
-    # keep ONE "runner" contract that rides indefinitely with adaptive
-    # trailing stops that TIGHTEN as peak pnl climbs higher.
+    # ---- FADE-AWARE TIERED SCALE-OUT (safety net + upside) ----
+    # Operator: "we need safety net to have money come in" AND "on PT
+    # winners we want to get more like before, not less."
     #
-    # For a 3-contract entry:
-    #   +8%  → sell 1 (1/3 in cash, 2 left)
-    #   +15% → sell 1 (2/3 in cash, 1 "runner" left)
-    #   +25% → DON'T close — activate runner-mode with 15% give-back
-    #   +40% → tighten runner trail to 10% give-back
-    #   +60% → tighten to 8%
-    #   +100%+ → tighten to 5% (lock 95% of peak)
-    # If peak hits +200%, a 5% retrace = still +190% net.
-    # No hard ceiling → big moves captured fully.
+    # Two changes from naive tiers:
+    # 1. Tiers only fire when the position STALLS at a profit level
+    #    (no new high for `tier_stall_sec` seconds). Strong runners
+    #    that keep advancing skip the tiers entirely — the fixed PT
+    #    catches them at +35%/+50%, same as the old system.
+    # 2. Runner mode only activates PAST the fixed PT. At or below
+    #    PT, the old behavior (close all at PT) applies — you get
+    #    back the full $210 on a +35% winner on 3 contracts.
     #
-    # This replaces the old "close all at +25%" with "keep 1 riding."
+    # Result: slow grinders → scale-out locks cash tier by tier.
+    # Fast breakouts → full PT capture + runner for further upside.
     tiered_scale_out_enabled: bool = True
     tier1_pnl_pct: float = 0.08
     tier2_pnl_pct: float = 0.15
-    runner_activate_pct: float = 0.25     # past this, enter runner-mode
-    # DTE-specific tighter tiers for 0DTE (theta kills fast):
+    # Stall window — tier fires ONLY after this long with no new peak
+    tier_stall_sec: float = 45.0
+    # DTE-specific tighter tiers for 0DTE (theta kills faster)
     tier1_pnl_0dte: float = 0.05
     tier2_pnl_0dte: float = 0.10
-    runner_activate_0dte: float = 0.18
-    # Runner trail tightening schedule — as peak pnl climbs, give-back
-    # shrinks. Format: [(peak_threshold, give_back_pct), ...]
+    tier_stall_sec_0dte: float = 20.0   # 0DTE: stall trigger in 20s
+    # Runner mode activates when pnl exceeds FIXED PT (+35% short,
+    # +50% multi, +25% 0DTE). Past that, adaptive trail takes over
+    # and the last contracts ride for bigger moves.
     runner_trail_schedule: tuple = (
-        (1.00, 0.05),    # peak ≥ +100% → trail 5% from peak
+        (2.00, 0.04),    # peak ≥ +200% → trail 4%
+        (1.00, 0.05),    # peak ≥ +100% → trail 5%
         (0.60, 0.08),    # peak ≥ +60%  → trail 8%
-        (0.40, 0.10),    # peak ≥ +40%  → trail 10%
-        (0.25, 0.15),    # peak ≥ +25%  → trail 15%  (runner activation)
+        (0.40, 0.12),    # peak ≥ +40%  → trail 12%
     )
 
     # Exhaustion applied to ALL DTEs (not just 0DTE) — operator:
@@ -368,14 +367,47 @@ class FastExitEvaluator:
         # won't fire inside the first minute. Hard cap still works
         # (that's a RUNAWAY, not noise), and genuine big drawdowns
         # past -30% still fire (caught by a looser "panic SL" below).
+        # ---- HARD DOLLAR-LOSS CAP (operator: "never let it get to -38%")
+        # Absolute floor: any position whose unrealized USD loss exceeds
+        # `max_loss_per_position_usd` exits IMMEDIATELY, regardless of
+        # entry grace or %-SL. Works as a circuit breaker for cases the
+        # %-based SL misses (data feed blind spots, gap-downs, etc.).
+        # Tunable via runtime override `max_loss_per_position_usd`.
+        try:
+            from ..core.runtime_overrides import get_override
+            max_loss_usd = float(get_override(
+                "max_loss_per_position_usd", 100.0
+            ))
+        except Exception:
+            max_loss_usd = 100.0
+        if max_loss_usd > 0 and pos.avg_price > 0:
+            unrealized_usd = (
+                (current_price - pos.avg_price)
+                * abs(pos.qty)
+                * (pos.multiplier or 100)
+            )
+            if pos.qty < 0:
+                unrealized_usd = -unrealized_usd
+            if unrealized_usd <= -max_loss_usd:
+                return ExitDecision(
+                    True,
+                    f"hard_dollar_sl:loss=${-unrealized_usd:.2f}"
+                    f"_>=_{max_loss_usd:.0f}_cap",
+                    layer=0,
+                )
+
         import time as _t_sl
         _entry_age_sl = _t_sl.time() - float(pos.entry_ts or 0)
         _grace_sl = getattr(self.cfg, "entry_grace_sec", 60.0)
         if _entry_age_sl < _grace_sl:
-            # Panic floor inside grace — only fires on CATASTROPHIC
-            # drawdown (e.g. ticker gaps against us immediately, not
-            # spread wash). Fixed at -30% to let normal spread cross
-            # through but catch real underwater trades.
+            # Panic floor inside grace — kept at -30% because the
+            # spread cross on cheap options ($0.50-$2 premium with
+            # $0.05-$0.15 spread) routinely makes new entries show
+            # -10% to -20% on the very first mark, even with no real
+            # underlying movement. A tighter floor false-positives on
+            # spread wash. The hard dollar cap (`max_loss_per_position
+            # _usd`, default $100) is the actual catastrophe gate;
+            # this -30% is a backstop for genuine 60-second gaps.
             if pnl <= -0.30:
                 return ExitDecision(True,
                     f"fast_sl_panic_in_grace:{pnl:.2%}", layer=0)
@@ -410,17 +442,18 @@ class FastExitEvaluator:
         # but the next uptick will properly update peak. Guarantees the
         # green-to-red killswitch arms even on long-held positions.
         peak_pnl_attr = getattr(pos, "peak_pnl_pct", None)
+        import time as _t_pk
         if peak_pnl_attr is None:
-            # Seed with max(current pnl, 0) so we don't falsely arm on
-            # negative pnl; a trade underwater isn't "at peak."
             peak_pnl_attr = max(pnl, 0.0)
             try:
                 pos.peak_pnl_pct = peak_pnl_attr
+                pos.last_peak_ts = _t_pk.time()
             except Exception:
                 pass
         elif pnl > peak_pnl_attr:
             try:
                 pos.peak_pnl_pct = pnl
+                pos.last_peak_ts = _t_pk.time()
                 peak_pnl_attr = pnl
             except Exception:
                 peak_pnl_attr = pnl
@@ -548,26 +581,37 @@ class FastExitEvaluator:
                 and pnl > 0
                 and abs(pos.qty) >= 2):    # need 2+ contracts to scale
 
-            # Pick thresholds by DTE
+            # Pick thresholds + stall window by DTE
             if dte == 0:
                 t1, t2 = self.cfg.tier1_pnl_0dte, self.cfg.tier2_pnl_0dte
-                runner_act = self.cfg.runner_activate_0dte
+                stall_thresh = self.cfg.tier_stall_sec_0dte
                 dte_tag = "0dte"
             else:
                 t1, t2 = self.cfg.tier1_pnl_pct, self.cfg.tier2_pnl_pct
-                runner_act = self.cfg.runner_activate_pct
+                stall_thresh = self.cfg.tier_stall_sec
                 dte_tag = "swing" if dte >= 14 else "short"
 
             total_qty = abs(pos.qty)
             per_tier = max(1, total_qty // 3)
 
-            # ---- RUNNER MODE (the big-move catcher) ----
-            # Once peak pnl has crossed runner_activate_pct, the
-            # remaining contract(s) ride with adaptive trail tightening.
-            # Trail gets TIGHTER as peak climbs higher, so we lock more
-            # of the profit if big-move contracts start reversing.
+            # Seconds since last new pnl peak (set by profit-lock block
+            # above). If missing (legacy snapshot), treat as fresh peak
+            # so we don't fire the first time we see the position.
+            import time as _t_tier
+            last_peak_ts = getattr(pos, "last_peak_ts", None)
+            if last_peak_ts is None:
+                stalled_sec = 0.0
+            else:
+                stalled_sec = max(0.0, _t_tier.time() - float(last_peak_ts))
+            is_stalled = stalled_sec >= stall_thresh
+
+            # ---- RUNNER MODE (big-move catcher, past fixed PT) ----
+            # Once peak pnl has crossed the fixed PT, the remaining
+            # contract(s) ride with adaptive trail tightening. Trail
+            # gets TIGHTER as peak climbs higher, so big winners lock
+            # more if they start reversing.
             if (peak_pnl_attr is not None
-                    and peak_pnl_attr >= runner_act):
+                    and peak_pnl_attr >= pt):
                 # Pick give-back based on peak tier — first-match wins
                 give_back = None
                 matched_tier = None
@@ -587,8 +631,12 @@ class FastExitEvaluator:
                             layer=0,
                         )
 
-            # TIER 2 — second scale-out, leaves 1 runner
-            if (pnl >= t2 and not getattr(pos, "tier2_taken", False)
+            # TIER 2 — fires only when stalled (no new peak for N sec).
+            # Strong runners that keep printing new highs skip this and
+            # reach the fixed PT intact — full capture, same as old sys.
+            if (is_stalled
+                    and pnl >= t2
+                    and not getattr(pos, "tier2_taken", False)
                     and total_qty >= 2):
                 try:
                     pos.tier2_taken = True
@@ -597,12 +645,14 @@ class FastExitEvaluator:
                 return ExitDecision(
                     True,
                     f"tier2_scale_{dte_tag}:pnl={pnl:+.2%}_>={t2:+.0%}"
-                    f"_closing_{per_tier}of{total_qty}_runner_remains",
+                    f"_stall={stalled_sec:.0f}s_closing_{per_tier}of{total_qty}",
                     layer=0,
                     close_qty=per_tier,
                 )
-            # TIER 1 — first safety-net scale
-            if (pnl >= t1 and not getattr(pos, "tier1_taken", False)
+            # TIER 1 — first safety-net scale, stall-gated
+            if (is_stalled
+                    and pnl >= t1
+                    and not getattr(pos, "tier1_taken", False)
                     and total_qty >= 3):
                 try:
                     pos.tier1_taken = True
@@ -611,7 +661,7 @@ class FastExitEvaluator:
                 return ExitDecision(
                     True,
                     f"tier1_scale_{dte_tag}:pnl={pnl:+.2%}_>={t1:+.0%}"
-                    f"_closing_{per_tier}of{total_qty}_safety_net",
+                    f"_stall={stalled_sec:.0f}s_closing_{per_tier}of{total_qty}_safety",
                     layer=0,
                     close_qty=per_tier,
                 )

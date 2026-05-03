@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re as _re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib import parse, request, error
@@ -82,6 +83,8 @@ class TradierBroker:
     # ------------------------------------------------ positions
 
     def positions(self) -> List[Position]:
+        from datetime import date as _d
+        from ..core.types import OptionRight as _OR
         data = self._get(f"/v1/accounts/{self._account}/positions") or {}
         # Tradier quirk: when the account has no positions, this is
         # the literal string "null" rather than JSON null or an empty
@@ -102,13 +105,38 @@ class TradierBroker:
                 # OCC-format options: 15+ chars
                 is_option = len(sym) >= 15 and any(c.isdigit() for c in sym)
                 multiplier = 100 if is_option else 1
+                # Parse OCC symbol into underlying / expiry / right /
+                # strike. Without this, fast_exit can't classify the
+                # position (no `right` → can't tell call vs put, no
+                # `expiry` → dte() returns 9999, no auto-exit logic
+                # fires). Format:
+                #   SPY260515C00280000
+                #   = ticker (1-6 chars) + YYMMDD + C|P + 8-digit
+                #     strike × 1000 (e.g. 280000 = $280.00)
+                underlying = sym
+                strike = None
+                expiry = None
+                right = None
+                if is_option:
+                    try:
+                        # The 6-digit date precedes a single C or P.
+                        m = _re.search(
+                            r"^([A-Z]+)(\d{6})([CP])(\d{8})$", sym
+                        )
+                        if m:
+                            underlying = m.group(1)
+                            yy = int(m.group(2)[0:2])
+                            mm = int(m.group(2)[2:4])
+                            dd = int(m.group(2)[4:6])
+                            full_year = 2000 + yy
+                            expiry = _d(full_year, mm, dd)
+                            right = (_OR.CALL if m.group(3) == "C"
+                                       else _OR.PUT)
+                            strike = float(m.group(4)) / 1000.0
+                    except Exception:
+                        pass
                 # Tradier returns `cost_basis` as TOTAL dollars paid
-                # (qty × price × multiplier). For options that means
-                # $75 for a single 1-lot of a $0.75 option. Divide by
-                # qty * multiplier for per-share price. Before fix the
-                # adapter was returning prices 100× too large for
-                # options, which broke mark-to-market + P&L math and
-                # left the user unable to reconcile with Tradier UI.
+                # (qty × price × multiplier). Divide for per-share px.
                 cost_basis = float(r.get("cost_basis", 0))
                 avg = cost_basis / max(1, abs(qty) * multiplier)
                 out.append(Position(
@@ -116,6 +144,10 @@ class TradierBroker:
                     qty=qty,
                     avg_price=round(avg, 4),
                     is_option=is_option,
+                    underlying=underlying,
+                    strike=strike,
+                    expiry=expiry,
+                    right=right,
                     multiplier=multiplier,
                     entry_ts=0.0,
                 ))
@@ -126,9 +158,31 @@ class TradierBroker:
     # ------------------------------------------------ submit
 
     def submit(self, order: Order, **_ignored) -> Optional[Fill]:
-        """Submit an order to Tradier. Returns a Fill on accepted (not
-        necessarily filled — Tradier's sandbox fills asynchronously).
-        Caller treats None as 'rejected / network error'."""
+        """Submit an order to Tradier. Returns a Fill ONLY if Tradier
+        confirms terminal status `filled` (or partial fill with non-zero
+        exec_quantity). Returns None on rejection, expiry, or network
+        error. Caller treats None as failure and may retry / log.
+
+        Critical pre-submit step for sell_to_close orders: cancel any
+        existing pending order for the SAME option_symbol first.
+        Tradier counts pending qty against your long position, so a
+        stale pending sell makes the new sell get rejected with
+        'Sell order is for more shares than current long position.'
+        Today's bug-storm root cause."""
+        # Cancel pending sells on the same contract before submitting
+        # a new sell_to_close. Buy_to_open paths skip this — opens
+        # don't conflict.
+        is_close = (
+            order.is_option
+            and self._map_side(order.side, is_option=True)
+            in ("sell_to_close", "buy_to_close")
+        )
+        if is_close:
+            try:
+                self.cancel_pending_for_symbol(order.symbol)
+            except Exception:
+                pass
+
         params: Dict[str, str] = {
             "class": "option" if order.is_option else "equity",
             "symbol": (self._underlying_from_occ(order.symbol)
@@ -155,25 +209,60 @@ class TradierBroker:
             )
             return None
         order_id = o.get("id")
-        _log.info(
-            "tradier_submit_ok order_id=%s symbol=%s side=%s qty=%d",
-            order_id, order.symbol, order.side.value, order.qty,
+        if not order_id:
+            _log.warning(
+                "tradier_submit_no_id symbol=%s resp=%s",
+                order.symbol, str(o)[:200],
+            )
+            return None
+
+        # POLL until terminal (filled / rejected / cancelled / expired
+        # / timeout). Sandbox fills usually within 1-3 seconds; give
+        # 8s to be safe. This is THE critical change: previously the
+        # bot returned a placeholder Fill on accept (status=ok) and
+        # never re-checked. If Tradier later rejected at routing,
+        # PaperBroker still thought the trade filled → phantom
+        # positions → reconcile loop → close storm. Now we wait.
+        final = self.poll_until_terminal(str(order_id), timeout_sec=8.0)
+        final_status = (final.get("status") or "").lower()
+
+        if final_status == "filled":
+            fill_price = float(final.get("avg_fill_price")
+                                 or order.limit_price or 0.0)
+            exec_qty = int(float(final.get("exec_quantity") or order.qty))
+            _log.info(
+                "tradier_filled order_id=%s symbol=%s side=%s "
+                "qty=%d price=%.4f",
+                order_id, order.symbol, order.side.value,
+                exec_qty, fill_price,
+            )
+            try:
+                order.tag = (getattr(order, "tag", "") or "") + \
+                    f"|tradier_oid={order_id}"
+            except Exception:
+                pass
+            return Fill(order=order, price=fill_price, qty=exec_qty)
+
+        if final_status in ("rejected", "canceled", "cancelled",
+                              "expired", "error"):
+            _log.warning(
+                "tradier_terminal_reject order_id=%s symbol=%s "
+                "side=%s qty=%d status=%s reason=%s",
+                order_id, order.symbol, order.side.value, order.qty,
+                final_status,
+                str(final.get("reason_description") or "")[:160],
+            )
+            return None
+
+        # Still open / pending at timeout — treat as soft-failure so
+        # the caller retries instead of accruing a phantom fill.
+        # Sandbox occasionally takes >8s on options; the order ID is
+        # stashed so a follow-up reconcile can pick up the late fill.
+        _log.warning(
+            "tradier_pending_at_timeout order_id=%s symbol=%s status=%s",
+            order_id, order.symbol, final_status,
         )
-        # Sandbox fills are asynchronous; we return a placeholder Fill
-        # with the LIMIT price (or 0 for market, operator monitors via
-        # positions() call). Fill dataclass takes (order, price, qty)
-        # plus optional fee/ts — stash order_id via the order's tag
-        # since Fill itself doesn't carry one.
-        try:
-            order.tag = (getattr(order, "tag", "") or "") + \
-                f"|tradier_oid={order_id or ''}"
-        except Exception:
-            pass
-        return Fill(
-            order=order,
-            price=float(order.limit_price or 0.0),
-            qty=int(order.qty),
-        )
+        return None
 
     # ------------------------------------------------ cancel
 
@@ -200,6 +289,64 @@ class TradierBroker:
             oid = o.get("id")
             if oid and o.get("status") in ("open", "pending"):
                 self.cancel(str(oid))
+
+    def cancel_pending_for_symbol(self, option_symbol: str) -> int:
+        """Cancel every open/pending order for `option_symbol`.
+
+        This is critical before sending a sell_to_close: Tradier
+        counts pending sell qty against your long position, so a stale
+        pending sell makes new sells get rejected with "Sell order is
+        for more shares than current long position." Returns # cancels."""
+        if not option_symbol:
+            return 0
+        data = self._get(f"/v1/accounts/{self._account}/orders") or {}
+        orders_obj = data.get("orders")
+        if not orders_obj or not isinstance(orders_obj, dict):
+            return 0
+        rows = orders_obj.get("order") or []
+        if isinstance(rows, dict):
+            rows = [rows]
+        n = 0
+        for o in rows:
+            sym = (o.get("option_symbol") or o.get("symbol") or "")
+            if (sym == option_symbol
+                    and o.get("status") in ("open", "pending")):
+                if self.cancel(str(o.get("id"))):
+                    n += 1
+        if n:
+            _log.info("tradier_cancelled_pending symbol=%s n=%d",
+                        option_symbol, n)
+        return n
+
+    def get_order_status(self, order_id: str) -> Optional[Dict[str, Any]]:
+        """Returns the current order record (status, fill price, etc.)
+        or None on error."""
+        data = self._get(
+            f"/v1/accounts/{self._account}/orders/{order_id}"
+        )
+        if not data:
+            return None
+        return data.get("order") or {}
+
+    def poll_until_terminal(self, order_id: str,
+                              timeout_sec: float = 8.0,
+                              interval_sec: float = 1.0) -> Dict[str, Any]:
+        """Poll order status until it reaches a terminal state
+        (filled / rejected / canceled / expired) or timeout.
+        Returns the final order dict (with status field set, possibly
+        'open' / 'pending' if still in flight at timeout)."""
+        import time as _t
+        deadline = _t.time() + float(timeout_sec)
+        last: Dict[str, Any] = {}
+        while _t.time() < deadline:
+            o = self.get_order_status(order_id) or {}
+            last = o
+            status = (o.get("status") or "").lower()
+            if status in ("filled", "rejected", "canceled",
+                            "cancelled", "expired", "error"):
+                return o
+            _t.sleep(interval_sec)
+        return last
 
     # ------------------------------------------------ account
 
